@@ -65,12 +65,6 @@ async function main() {
         if (pathname === "/mcp") {
           const auth = req.headers.authorization;
           const apiKeyFromHeader = auth?.startsWith("Bearer ") ? auth.slice(7).trim() : undefined;
-          if (!apiKeyFromHeader) {
-            res.writeHead(401, { "Content-Type": "application/json" }).end(
-              JSON.stringify({ jsonrpc: "2.0", error: { code: -32001, message: "Authorization: Bearer <api-key> required" }, id: null }),
-            );
-            return;
-          }
 
           const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
           const mcpServer = createMcpServer(apiKeyFromHeader);

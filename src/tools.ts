@@ -39,6 +39,14 @@ function formatCreditFooter(creditInfo: CreditInfo | null): string {
   return `\n---\nTokeny API: ${creditInfo.balance} pozostało (koszt zapytania: ${creditInfo.cost})`;
 }
 
+function requireApiKey(apiKey: string | undefined): asserts apiKey is string {
+  if (!apiKey) {
+    throw new Error(
+      "Authorization: Bearer <api-key> required. Get your free API key at https://cenogram.pl/api",
+    );
+  }
+}
+
 async function withErrorHandling(
   fn: () => Promise<{ content: { type: "text"; text: string }[] }>,
 ) {
@@ -91,6 +99,7 @@ Example: search for apartments in Mokotów sold in 2024 above 500,000 PLN.`,
   { readOnlyHint: true },
   async (params) =>
     withErrorHandling(async () => {
+      requireApiKey(apiKey);
       const txParams = {
         district: params.location,
         propertyType: mapPropertyType(params.propertyType),
@@ -132,6 +141,7 @@ For Warsaw: use district names (Mokotów, Wola) - 'Warszawa' won't match any res
   { readOnlyHint: true },
   async (params) =>
     withErrorHandling(async () => {
+      requireApiKey(apiKey);
       const { data: allRows, creditInfo } = await getPricePerM2(apiKey);
       let rows = allRows;
       if (params.location) {
@@ -158,6 +168,7 @@ Useful for understanding the overall market price structure in Poland.`,
   { readOnlyHint: true },
   async (params) =>
     withErrorHandling(async () => {
+      requireApiKey(apiKey);
       const { data: bins, creditInfo } = await getPriceHistogram(params.bins, params.maxPrice, apiKey);
       return textResponse(formatHistogram(bins) + formatCreditFooter(creditInfo));
     }),
@@ -191,6 +202,7 @@ Example: find apartment sales within 2km of Warsaw's Palace of Culture (lat 52.2
   { readOnlyHint: true },
   async (params) =>
     withErrorHandling(async () => {
+      requireApiKey(apiKey);
       const bbox = radiusKmToBbox(params.latitude, params.longitude, params.radiusKm);
       const txParams = {
         bbox: bbox.join(","),
@@ -222,6 +234,7 @@ Returns: total transaction count, date range, breakdown by property type and mar
   { readOnlyHint: true },
   async () =>
     withErrorHandling(async () => {
+      requireApiKey(apiKey);
       const { data: stats, creditInfo } = await getStats(apiKey);
       return textResponse(formatMarketOverview(stats) + formatCreditFooter(creditInfo));
     }),
@@ -244,6 +257,7 @@ Use the search parameter to filter by name.`,
   { readOnlyHint: true },
   async (params) =>
     withErrorHandling(async () => {
+      requireApiKey(apiKey);
       const { data: allDistricts, creditInfo } = await getDistricts(apiKey);
       let districts = allDistricts;
       if (params.search) {
@@ -286,6 +300,7 @@ Example: search for parcels starting with '146518_8.01'.`,
   { readOnlyHint: true },
   async (params) =>
     withErrorHandling(async () => {
+      requireApiKey(apiKey);
       const { data, creditInfo } = await searchParcels(params.q, params.limit, apiKey);
       return textResponse(formatParcelResults(data, params.q) + formatCreditFooter(creditInfo));
     }),
@@ -324,6 +339,7 @@ Example: {"type":"Polygon","coordinates":[[[21.0,52.2],[21.01,52.2],[21.01,52.21
   { readOnlyHint: true },
   async (params) =>
     withErrorHandling(async () => {
+      requireApiKey(apiKey);
       const { data, creditInfo } = await searchByPolygon({
         polygon: params.polygon as { type: "Polygon"; coordinates: number[][][] },
         propertyType: mapPropertyType(params.propertyType),
@@ -370,6 +386,7 @@ Example: compare Mokotów, Wola, Ursynów for apartments.`,
   { readOnlyHint: true },
   async (params) =>
     withErrorHandling(async () => {
+      requireApiKey(apiKey);
       const { data, creditInfo } = await compareLocations({
         districts: params.districts,
         propertyType: mapPropertyType(params.propertyType),
