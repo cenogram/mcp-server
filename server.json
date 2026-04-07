@@ -3,7 +3,7 @@
   "name": "pl.cenogram/mcp-server",
   "title": "Cenogram - Polish Real Estate Data",
   "description": "7M+ real estate transactions from Poland's RCN registry. Search, compare, and analyze prices.",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "websiteUrl": "https://cenogram.pl",
   "repository": {
     "url": "https://github.com/cenogram/mcp-server",
@@ -13,7 +13,7 @@
     {
       "registryType": "npm",
       "identifier": "@cenogram/mcp-server",
-      "version": "0.1.2",
+      "version": "0.1.3",
       "transport": {
         "type": "stdio"
       },

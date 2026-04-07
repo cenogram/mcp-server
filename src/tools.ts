@@ -24,6 +24,8 @@ import {
 import {
   mapPropertyType,
   mapMarketType,
+  mapUnitFunction,
+  mapBuildingType,
   radiusKmToBbox,
   filterByLocation,
 } from "./mappings.js";
@@ -78,6 +80,12 @@ Example: search for apartments in Mokotów sold in 2024 above 500,000 PLN.`,
       .describe("Property type filter"),
     marketType: z.enum(["primary", "secondary"]).optional()
       .describe("Market type: primary (developer) or secondary (resale)"),
+    unitFunction: z.enum(["residential", "commercial", "office", "production", "garage", "other"]).optional()
+      .describe("Unit/apartment function filter"),
+    buildingType: z.enum(["residential", "commercial", "industrial", "transport", "office", "warehouse", "education_sports", "farm_utility", "hospital", "other_nonresidential"]).optional()
+      .describe("Building type filter (PKOB classification)"),
+    mpzpDesignation: z.string().optional()
+      .describe("MPZP zoning designation filter (exact match, e.g. 'budownictwoMieszkanioweWielorodzinne', 'terenObiektowProdukcyjnychSkladowIMagazynow')"),
     minPrice: z.number().optional().describe("Minimum price in PLN"),
     maxPrice: z.number().optional().describe("Maximum price in PLN"),
     dateFrom: z.string().optional().describe("Start date (YYYY-MM-DD)"),
@@ -104,6 +112,9 @@ Example: search for apartments in Mokotów sold in 2024 above 500,000 PLN.`,
         district: params.location,
         propertyType: mapPropertyType(params.propertyType),
         marketType: mapMarketType(params.marketType),
+        unitFunction: mapUnitFunction(params.unitFunction),
+        buildingType: mapBuildingType(params.buildingType),
+        mpzpDesignation: params.mpzpDesignation,
         minPrice: params.minPrice,
         maxPrice: params.maxPrice,
         dateFrom: params.dateFrom,
@@ -192,6 +203,10 @@ Example: find apartment sales within 2km of Warsaw's Palace of Culture (lat 52.2
       .describe("Property type filter"),
     marketType: z.enum(["primary", "secondary"]).optional()
       .describe("Market type filter"),
+    unitFunction: z.enum(["residential", "commercial", "office", "production", "garage", "other"]).optional()
+      .describe("Unit/apartment function filter"),
+    buildingType: z.enum(["residential", "commercial", "industrial", "transport", "office", "warehouse", "education_sports", "farm_utility", "hospital", "other_nonresidential"]).optional()
+      .describe("Building type filter (PKOB classification)"),
     minPrice: z.number().optional().describe("Minimum price in PLN"),
     maxPrice: z.number().optional().describe("Maximum price in PLN"),
     dateFrom: z.string().optional().describe("Start date (YYYY-MM-DD)"),
@@ -208,6 +223,8 @@ Example: find apartment sales within 2km of Warsaw's Palace of Culture (lat 52.2
         bbox: bbox.join(","),
         propertyType: mapPropertyType(params.propertyType),
         marketType: mapMarketType(params.marketType),
+        unitFunction: mapUnitFunction(params.unitFunction),
+        buildingType: mapBuildingType(params.buildingType),
         minPrice: params.minPrice,
         maxPrice: params.maxPrice,
         dateFrom: params.dateFrom,
@@ -325,6 +342,12 @@ Example: {"type":"Polygon","coordinates":[[[21.0,52.2],[21.01,52.2],[21.01,52.21
       .describe("Property type filter"),
     marketType: z.enum(["primary", "secondary"]).optional()
       .describe("Market type filter"),
+    unitFunction: z.enum(["residential", "commercial", "office", "production", "garage", "other"]).optional()
+      .describe("Unit/apartment function filter"),
+    buildingType: z.enum(["residential", "commercial", "industrial", "transport", "office", "warehouse", "education_sports", "farm_utility", "hospital", "other_nonresidential"]).optional()
+      .describe("Building type filter (PKOB classification)"),
+    mpzpDesignation: z.string().optional()
+      .describe("MPZP zoning designation filter (exact match)"),
     minPrice: z.number().optional().describe("Minimum price in PLN"),
     maxPrice: z.number().optional().describe("Maximum price in PLN"),
     dateFrom: z.string().optional().describe("Start date (YYYY-MM-DD)"),
@@ -344,6 +367,9 @@ Example: {"type":"Polygon","coordinates":[[[21.0,52.2],[21.01,52.2],[21.01,52.21
         polygon: params.polygon as { type: "Polygon"; coordinates: number[][][] },
         propertyType: mapPropertyType(params.propertyType),
         marketType: mapMarketType(params.marketType),
+        unitFunction: mapUnitFunction(params.unitFunction),
+        buildingType: mapBuildingType(params.buildingType),
+        mpzpDesignation: params.mpzpDesignation,
         minPrice: params.minPrice,
         maxPrice: params.maxPrice,
         dateFrom: params.dateFrom,
@@ -375,6 +401,10 @@ Example: compare Mokotów, Wola, Ursynów for apartments.`,
       .describe("Property type filter (recommended - API requires at least one filter)"),
     marketType: z.enum(["primary", "secondary"]).optional()
       .describe("Market type filter"),
+    unitFunction: z.enum(["residential", "commercial", "office", "production", "garage", "other"]).optional()
+      .describe("Unit/apartment function filter"),
+    buildingType: z.enum(["residential", "commercial", "industrial", "transport", "office", "warehouse", "education_sports", "farm_utility", "hospital", "other_nonresidential"]).optional()
+      .describe("Building type filter (PKOB classification)"),
     minPrice: z.number().optional().describe("Minimum price in PLN"),
     maxPrice: z.number().optional().describe("Maximum price in PLN"),
     dateFrom: z.string().optional().describe("Start date (YYYY-MM-DD)"),
@@ -391,6 +421,8 @@ Example: compare Mokotów, Wola, Ursynów for apartments.`,
         districts: params.districts,
         propertyType: mapPropertyType(params.propertyType),
         marketType: mapMarketType(params.marketType),
+        unitFunction: mapUnitFunction(params.unitFunction),
+        buildingType: mapBuildingType(params.buildingType),
         minPrice: params.minPrice,
         maxPrice: params.maxPrice,
         dateFrom: params.dateFrom,

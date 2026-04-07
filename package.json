@@ -1,6 +1,6 @@
 {
   "name": "@cenogram/mcp-server",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "MCP Server for Polish real estate transaction data (7M+ transactions from RCN)",
   "type": "module",
   "bin": {
@@ -23,7 +23,7 @@
     "@types/node": "^22.0.0",
     "tsx": "^4.19.0",
     "typescript": "^5.6.0",
-    "vitest": "^3.0.0"
+    "vitest": "^3.0.4"
   },
   "mcpName": "pl.cenogram/mcp-server",
   "keywords": ["mcp", "real-estate", "poland", "rcn", "nieruchomosci", "property", "transactions"],

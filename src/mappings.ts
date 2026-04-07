@@ -34,6 +34,64 @@ export function mapMarketType(value: string | undefined): number | undefined {
   return MARKET_TYPE_MAP[value];
 }
 
+// ── Unit function enum maps ─────────────────────────────────────────
+
+export const UNIT_FUNCTIONS: Record<number, string> = {
+  1: "Residential (Mieszkalna)",
+  2: "Commercial (Handlowo-usługowa)",
+  3: "Office (Biurowa)",
+  4: "Production (Produkcyjna)",
+  5: "Garage (Garaż)",
+  6: "Other (Inne)",
+};
+
+const UNIT_FUNCTION_MAP: Record<string, number> = {
+  residential: 1,
+  commercial: 2,
+  office: 3,
+  production: 4,
+  garage: 5,
+  other: 6,
+};
+
+export function mapUnitFunction(value: string | undefined): number | undefined {
+  if (!value) return undefined;
+  return UNIT_FUNCTION_MAP[value];
+}
+
+// ── Building type enum maps ─────────────────────────────────────────
+
+export const BUILDING_TYPES: Record<number, string> = {
+  110: "Residential (Mieszkalny)",
+  121: "Commercial (Handlowo-usługowy)",
+  122: "Industrial (Przemysłowy)",
+  123: "Transport (Transportu i łączności)",
+  124: "Office (Biurowy)",
+  125: "Warehouse (Zbiorniki/Silosy/Magazyny)",
+  126: "Education/Sports (Oświaty i sportu)",
+  127: "Farm/Utility (Gospodarczy)",
+  128: "Hospital (Szpitale)",
+  129: "Other non-residential (Pozostałe niemieszkalne)",
+};
+
+const BUILDING_TYPE_MAP: Record<string, number> = {
+  residential: 110,
+  commercial: 121,
+  industrial: 122,
+  transport: 123,
+  office: 124,
+  warehouse: 125,
+  education_sports: 126,
+  farm_utility: 127,
+  hospital: 128,
+  other_nonresidential: 129,
+};
+
+export function mapBuildingType(value: string | undefined): number | undefined {
+  if (!value) return undefined;
+  return BUILDING_TYPE_MAP[value];
+}
+
 // ── Bbox conversion ─────────────────────────────────────────────────
 
 /** Convert lat/lng/radius to bbox [minLng, minLat, maxLng, maxLat] (lng-first!) */

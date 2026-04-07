@@ -196,6 +196,9 @@ export interface TransactionParams {
   parcelId?: string;
   propertyType?: number;
   marketType?: number;
+  unitFunction?: number;
+  buildingType?: number;
+  mpzpDesignation?: string;
   minPrice?: number;
   maxPrice?: number;
   dateFrom?: string;
@@ -217,6 +220,9 @@ export function getTransactions(p: TransactionParams, apiKey?: string): Promise<
     parcelId: p.parcelId,
     propertyType: p.propertyType,
     marketType: p.marketType,
+    unitFunction: p.unitFunction,
+    buildingType: p.buildingType,
+    mpzpDesignation: p.mpzpDesignation,
     minPrice: p.minPrice,
     maxPrice: p.maxPrice,
     dateFrom: p.dateFrom,
@@ -237,6 +243,9 @@ export function getTransactionsSummary(p: TransactionParams, apiKey?: string): P
     street: p.street,
     propertyType: p.propertyType,
     marketType: p.marketType,
+    unitFunction: p.unitFunction,
+    buildingType: p.buildingType,
+    mpzpDesignation: p.mpzpDesignation,
     minPrice: p.minPrice,
     maxPrice: p.maxPrice,
     dateFrom: p.dateFrom,
@@ -291,6 +300,9 @@ export interface SpatialSearchParams {
   polygon: { type: "Polygon"; coordinates: number[][][] };
   propertyType?: number;
   marketType?: number;
+  unitFunction?: number;
+  buildingType?: number;
+  mpzpDesignation?: string;
   minPrice?: number;
   maxPrice?: number;
   dateFrom?: string;
@@ -339,6 +351,9 @@ export function searchByPolygon(
   const body: Record<string, unknown> = { polygon: p.polygon };
   if (p.propertyType != null) body.propertyType = p.propertyType;
   if (p.marketType != null) body.marketType = p.marketType;
+  if (p.unitFunction != null) body.unitFunction = p.unitFunction;
+  if (p.buildingType != null) body.buildingType = p.buildingType;
+  if (p.mpzpDesignation) body.mpzpDesignation = p.mpzpDesignation;
   if (p.minPrice != null) body.minPrice = p.minPrice;
   if (p.maxPrice != null) body.maxPrice = p.maxPrice;
   if (p.dateFrom) body.dateFrom = p.dateFrom;
@@ -368,6 +383,9 @@ export interface CompareParams {
   districts: string;
   propertyType?: number;
   marketType?: number;
+  unitFunction?: number;
+  buildingType?: number;
+  mpzpDesignation?: string;
   minPrice?: number;
   maxPrice?: number;
   dateFrom?: string;
@@ -385,6 +403,9 @@ export function compareLocations(
     districts: p.districts,
     propertyType: p.propertyType,
     marketType: p.marketType,
+    unitFunction: p.unitFunction,
+    buildingType: p.buildingType,
+    mpzpDesignation: p.mpzpDesignation,
     minPrice: p.minPrice,
     maxPrice: p.maxPrice,
     dateFrom: p.dateFrom,
