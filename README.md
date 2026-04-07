@@ -20,12 +20,12 @@ Manage your keys at [cenogram.pl/ustawienia](https://cenogram.pl/ustawienia).
 
 ## Installation
 
-Pick your client. All options below use the hosted server — no local install needed (except npx/stdio).
+Pick your client. All options below use the hosted server - no local install needed (except npx/stdio).
 
 <details open>
 <summary><strong>Claude Code</strong></summary>
 
-One command — zero config files:
+One command - zero config files:
 
 ```bash
 claude mcp add cenogram https://mcp.cenogram.pl/mcp \
@@ -77,7 +77,7 @@ Add to your config file:
 }
 ```
 
-**Stdio fallback** (older versions — requires Node.js >= 18):
+**Stdio fallback** (older versions - requires Node.js >= 18):
 ```json
 {
   "mcpServers": {
@@ -159,7 +159,7 @@ In VS Code: Settings > Cline > MCP Servers. Add:
 </details>
 
 <details>
-<summary><strong>npx (stdio) — local/offline</strong></summary>
+<summary><strong>npx (stdio) - local/offline</strong></summary>
 
 Requires **Node.js >= 18**. Use this if you want to run the server locally instead of connecting to the hosted one.
 
@@ -191,7 +191,7 @@ Requires **Node.js >= 18**. Use this if you want to run the server locally inste
 
 | Env Variable | Required | Default | Description |
 |---|---|---|---|
-| `CENOGRAM_API_KEY` | **Yes** (stdio) | — | API key from [cenogram.pl/api](https://cenogram.pl/api) |
+| `CENOGRAM_API_KEY` | **Yes** (stdio) | - | API key from [cenogram.pl/api](https://cenogram.pl/api) |
 | `CENOGRAM_API_URL` | No | `https://cenogram.pl` | API base URL |
 | `MCP_TRANSPORT` | No | `stdio` | Set to `http` for Streamable HTTP mode |
 | `MCP_PORT` | No | `3002` | HTTP server port (HTTP mode only) |
@@ -235,7 +235,7 @@ You can also use the `--http` CLI flag instead of `MCP_TRANSPORT=http`.
 
 - Most cities: use the city name directly (e.g., "Gdansk", "Lublin")
 - Warsaw: use district names ("Mokotow", "Srodmiescie", "Wola") -- "Warszawa" won't match
-- Krakow: use sub-districts ("Krakow-Podgorze", "Krakow-Srodmiescie") — plain "Krakow" won't match
+- Krakow: use sub-districts ("Krakow-Podgorze", "Krakow-Srodmiescie") - plain "Krakow" won't match
 - Use `list_locations` to find valid names
 
 ### Property types
@@ -269,13 +269,13 @@ This mimics how a property appraiser finds comparable transactions for valuation
 
 ## Troubleshooting
 
-**"Error: CENOGRAM_API_KEY is required"** — This only applies to stdio mode. Make sure `CENOGRAM_API_KEY` is set in the `env` block of your MCP config. For HTTP remote, the key goes in the `Authorization` header instead.
+**"Error: CENOGRAM_API_KEY is required"** - This only applies to stdio mode. Make sure `CENOGRAM_API_KEY` is set in the `env` block of your MCP config. For HTTP remote, the key goes in the `Authorization` header instead.
 
-**npx hangs or fails** — Check your Node.js version with `node -v`. The stdio mode requires Node.js >= 18. If you're on an older version, use the HTTP remote option instead (no Node.js needed).
+**npx hangs or fails** - Check your Node.js version with `node -v`. The stdio mode requires Node.js >= 18. If you're on an older version, use the HTTP remote option instead (no Node.js needed).
 
-**"Warszawa" returns 0 results** — Warsaw uses district names (Mokotow, Wola, Srodmiescie, Bemowo, etc.). Use `list_locations(search="warsz")` to find valid names. Same applies to Krakow (use "Krakow-Podgorze", "Krakow-Srodmiescie", etc.).
+**"Warszawa" returns 0 results** - Warsaw uses district names (Mokotow, Wola, Srodmiescie, Bemowo, etc.). Use `list_locations(search="warsz")` to find valid names. Same applies to Krakow (use "Krakow-Podgorze", "Krakow-Srodmiescie", etc.).
 
-**401 Unauthorized (HTTP mode)** — The `Authorization` header must be `Bearer cngrm_...` (with the `Bearer` prefix). Double-check that the full API key is included, not just the prefix.
+**401 Unauthorized (HTTP mode)** - The `Authorization` header must be `Bearer cngrm_...` (with the `Bearer` prefix). Double-check that the full API key is included, not just the prefix.
 
 ## Development
 

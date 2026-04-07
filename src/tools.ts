@@ -64,7 +64,7 @@ Use list_locations first to find valid location names.
 Example: search for apartments in Mokotów sold in 2024 above 500,000 PLN.`,
   {
     location: z.string().optional().describe(
-      "Location name — city (e.g. 'Kraków', 'Gdańsk') or district (e.g. 'Mokotów', 'Śródmieście'). For Warsaw, use district names (Mokotów, Wola, etc.) — 'Warszawa' won't match. Use list_locations to find valid names.",
+      "Location name - city (e.g. 'Kraków', 'Gdańsk') or district (e.g. 'Mokotów', 'Śródmieście'). For Warsaw, use district names (Mokotów, Wola, etc.) - 'Warszawa' won't match. Use list_locations to find valid names.",
     ),
     propertyType: z.enum(["land", "building", "developed_land", "unit"]).optional()
       .describe("Property type filter"),
@@ -76,7 +76,7 @@ Example: search for apartments in Mokotów sold in 2024 above 500,000 PLN.`,
     dateTo: z.string().optional().describe("End date (YYYY-MM-DD)"),
     street: z.string().optional().describe("Street name filter (partial match, e.g. 'Puławska', 'Trakt Lubelski')"),
     buildingNumber: z.string().optional().describe("Building/house number (e.g. '251C', '12A'). Requires location or street to be set."),
-    parcelId: z.string().optional().describe("Exact parcel ID as returned in search results (e.g. '146518_8.0108.27'). Must match exactly — copy from a previous search result's parcel_id field."),
+    parcelId: z.string().optional().describe("Exact parcel ID as returned in search results (e.g. '146518_8.0108.27'). Must match exactly - copy from a previous search result's parcel_id field."),
     minArea: z.number().optional().describe("Minimum area in m²"),
     maxArea: z.number().optional().describe("Maximum area in m²"),
     limit: z.number().min(1).max(50).default(10)
@@ -123,7 +123,7 @@ server.tool(
   "get_price_statistics",
   `Get price per m² statistics by location for residential apartments in Poland.
 Note: only covers residential units (lokale mieszkalne). For other property types, use search_transactions.
-For Warsaw: use district names (Mokotów, Wola) — 'Warszawa' won't match any results.`,
+For Warsaw: use district names (Mokotów, Wola) - 'Warszawa' won't match any results.`,
   {
     location: z.string().optional().describe(
       "Filter by location name (case-insensitive partial match). E.g. 'Kraków' matches 'Kraków-Podgórze', 'Kraków-Śródmieście', etc. Omit for all Poland.",
@@ -232,7 +232,7 @@ Returns: total transaction count, date range, breakdown by property type and mar
 server.tool(
   "list_locations",
   `List available locations (cities and districts) in the database.
-Returns administrative districts — for most cities, the district name equals the city name.
+Returns administrative districts - for most cities, the district name equals the city name.
 For Warsaw: returns district names (Mokotów, Śródmieście, Wola, etc.), not 'Warszawa'.
 For Kraków: returns sub-districts (Kraków-Podgórze, Kraków-Śródmieście, etc.).
 Use the search parameter to filter by name.`,
@@ -356,7 +356,7 @@ Example: compare Mokotów, Wola, Ursynów for apartments.`,
       "Comma-separated district names to compare (2-5). E.g. 'Mokotów,Wola,Ursynów'",
     ),
     propertyType: z.enum(["land", "building", "developed_land", "unit"]).optional()
-      .describe("Property type filter (recommended — API requires at least one filter)"),
+      .describe("Property type filter (recommended - API requires at least one filter)"),
     marketType: z.enum(["primary", "secondary"]).optional()
       .describe("Market type filter"),
     minPrice: z.number().optional().describe("Minimum price in PLN"),

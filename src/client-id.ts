@@ -25,7 +25,7 @@ export function getClientId(): string {
       return stored;
     }
   } catch {
-    // File doesn't exist or isn't readable — generate new
+    // File doesn't exist or isn't readable - generate new
   }
 
   // Generate and persist
@@ -34,7 +34,7 @@ export function getClientId(): string {
     mkdirSync(CONFIG_DIR, { recursive: true });
     writeFileSync(CLIENT_ID_FILE, id + "\n", { mode: 0o600 });
   } catch {
-    // Read-only fs (Docker, sandbox) — use ephemeral ID
+    // Read-only fs (Docker, sandbox) - use ephemeral ID
   }
 
   cachedId = id;

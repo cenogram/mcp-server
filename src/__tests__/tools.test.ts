@@ -53,7 +53,7 @@ describe("mapMarketType", () => {
 });
 
 describe("radiusKmToBbox", () => {
-  it("returns [minLng, minLat, maxLng, maxLat] — lng-first!", () => {
+  it("returns [minLng, minLat, maxLng, maxLat] - lng-first!", () => {
     const [minLng, minLat, maxLng, maxLat] = radiusKmToBbox(52.23, 21.01, 2);
 
     // Verify order: longitude first, latitude second

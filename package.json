@@ -1,6 +1,6 @@
 {
   "name": "@cenogram/mcp-server",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "MCP Server for Polish real estate transaction data (7M+ transactions from RCN)",
   "type": "module",
   "bin": {

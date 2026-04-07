@@ -178,7 +178,7 @@ describe("formatTransactionList", () => {
     };
     const summary = { median_price_m2: 15200, avg_area: 58.3, min_date: "2024-01-01", max_date: "2024-12-31", total: 1234 };
     const result = formatTransactionList(res, summary);
-    // Intl may use non-breaking space — check digits exist
+    // Intl may use non-breaking space - check digits exist
     expect(result).toMatch(/1.?234/);
     expect(result).toContain("Puławska");
     expect(result).toContain("Median");
