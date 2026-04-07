@@ -1,0 +1,36 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "pl.cenogram/mcp-server",
+  "title": "Cenogram — Polish Real Estate Data",
+  "description": "Access 7M+ Polish real estate transactions from RCN government open data. Search by location, address, parcel ID, GPS coordinates, or polygon. Compare districts side-by-side.",
+  "version": "0.1.0",
+  "websiteUrl": "https://cenogram.pl",
+  "repository": {
+    "url": "https://github.com/cenogram/mcp-server",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "@cenogram/mcp-server",
+      "version": "0.1.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "CENOGRAM_API_KEY",
+          "description": "API key from cenogram.pl/api (free, email registration)",
+          "required": true,
+          "secret": true
+        }
+      ]
+    }
+  ],
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://mcp.cenogram.pl/mcp"
+    }
+  ]
+}
