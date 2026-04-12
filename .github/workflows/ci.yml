@@ -10,7 +10,10 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        node-version: [18, 20, 22]
+        # Runtime supports Node >=18 (see package.json engines).
+        # Matrix is narrower because vitest 4 tooling needs Node >=20.19.
+        # End users don't install devDependencies, so runtime compat on 18 is preserved.
+        node-version: [20, 22]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
