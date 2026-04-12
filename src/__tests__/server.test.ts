@@ -16,7 +16,9 @@ describe("createMcpServer", () => {
   });
 });
 
-describe("stdio server via symlink (npx scenario)", () => {
+const hasDistBuild = existsSync(distIndex);
+
+describe.skipIf(!hasDistBuild)("stdio server via symlink (npx scenario)", () => {
   const symlinkPath = join(__dirname, "..", "..", ".test-symlink-bin");
 
   beforeAll(() => {
