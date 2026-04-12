@@ -28,6 +28,8 @@ import {
   mapBuildingType,
   radiusKmToBbox,
   filterByLocation,
+  expandDistrict,
+  CITY_SUBDISTRICTS,
 } from "./mappings.js";
 
 // ── Helpers ─────────────────────────────────────────────────────────
@@ -74,7 +76,7 @@ Use list_locations first to find valid location names.
 Example: search for apartments in Mokotów sold in 2024 above 500,000 PLN.`,
   {
     location: z.string().optional().describe(
-      "Location name - city (e.g. 'Kraków', 'Gdańsk') or district (e.g. 'Mokotów', 'Śródmieście'). For Warsaw, use district names (Mokotów, Wola, etc.) - 'Warszawa' won't match. Use list_locations to find valid names.",
+      "Location name - city (e.g. 'Warszawa', 'Kraków', 'Gdańsk') or district (e.g. 'Mokotów', 'Kraków-Podgórze'). 'Warszawa', 'Kraków', 'Łódź' auto-expand to all sub-districts. Use list_locations to find valid names.",
     ),
     propertyType: z.enum(["land", "building", "developed_land", "unit"]).optional()
       .describe("Property type filter"),
@@ -143,10 +145,10 @@ server.tool(
   "get_price_statistics",
   `Get price per m² statistics by location for residential apartments in Poland.
 Note: only covers residential units (lokale mieszkalne). For other property types, use search_transactions.
-For Warsaw: use district names (Mokotów, Wola) - 'Warszawa' won't match any results.`,
+'Warszawa'/'Kraków'/'Łódź' auto-expand to all sub-districts (Warszawa=19, Kraków=5, Łódź=6). Other names use partial match.`,
   {
     location: z.string().optional().describe(
-      "Filter by location name (case-insensitive partial match). E.g. 'Kraków' matches 'Kraków-Podgórze', 'Kraków-Śródmieście', etc. Omit for all Poland.",
+      "Filter by location name. 'Warszawa'/'Kraków'/'Łódź' auto-expand to all sub-districts. Other names use case-insensitive partial match (e.g. 'Wrocł' matches 'Wrocław'). Omit for all Poland.",
     ),
   },
   { readOnlyHint: true },
@@ -156,9 +158,14 @@ For Warsaw: use district names (Mokotów, Wola) - 'Warszawa' won't match any res
       const { data: allRows, creditInfo } = await getPricePerM2(apiKey);
       let rows = allRows;
       if (params.location) {
-        rows = rows.filter((r) =>
-          filterByLocation(params.location!, [r.district]).length > 0,
-        );
+        if (CITY_SUBDISTRICTS.has(params.location)) {
+          const allowed = new Set(expandDistrict(params.location));
+          rows = rows.filter((r) => allowed.has(r.district));
+        } else {
+          rows = rows.filter((r) =>
+            filterByLocation(params.location!, [r.district]).length > 0,
+          );
+        }
       }
       return textResponse(formatPriceStats(rows, params.location) + formatCreditFooter(creditInfo));
     }),
@@ -191,7 +198,8 @@ server.tool(
   "search_by_area",
   `Search real estate transactions within a geographic radius.
 Provide latitude/longitude coordinates and a radius in km.
-Example: find apartment sales within 2km of Warsaw's Palace of Culture (lat 52.2317, lng 21.0060).`,
+Example: find apartment sales within 2km of Warsaw's Palace of Culture (lat 52.2317, lng 21.0060).
+Area filters (minArea/maxArea) work for all propertyType values via COALESCE(usable_area_m2, parcel_area).`,
   {
     latitude: z.number().min(49).max(55)
       .describe("Latitude (Poland range: 49-55)"),
@@ -209,6 +217,10 @@ Example: find apartment sales within 2km of Warsaw's Palace of Culture (lat 52.2
       .describe("Building type filter (PKOB classification)"),
     minPrice: z.number().optional().describe("Minimum price in PLN"),
     maxPrice: z.number().optional().describe("Maximum price in PLN"),
+    minArea: z.number().optional()
+      .describe("Minimum area in m² (usable_area_m2 for units, parcel_area for land)"),
+    maxArea: z.number().optional()
+      .describe("Maximum area in m²"),
     dateFrom: z.string().optional().describe("Start date (YYYY-MM-DD)"),
     dateTo: z.string().optional().describe("End date (YYYY-MM-DD)"),
     limit: z.number().min(1).max(50).default(20)
@@ -227,6 +239,8 @@ Example: find apartment sales within 2km of Warsaw's Palace of Culture (lat 52.2
         buildingType: mapBuildingType(params.buildingType),
         minPrice: params.minPrice,
         maxPrice: params.maxPrice,
+        minArea: params.minArea,
+        maxArea: params.maxArea,
         dateFrom: params.dateFrom,
         dateTo: params.dateTo,
         limit: params.limit,
@@ -405,6 +419,8 @@ Example: compare Mokotów, Wola, Ursynów for apartments.`,
       .describe("Unit/apartment function filter"),
     buildingType: z.enum(["residential", "commercial", "industrial", "transport", "office", "warehouse", "education_sports", "farm_utility", "hospital", "other_nonresidential"]).optional()
       .describe("Building type filter (PKOB classification)"),
+    mpzpDesignation: z.string().optional()
+      .describe("MPZP zoning designation prefix filter (e.g. 'terenRolniczy', 'budownictwoMieszkanioweJednorodzinne', 'budownictwoMieszkanioweWielorodzinne')"),
     minPrice: z.number().optional().describe("Minimum price in PLN"),
     maxPrice: z.number().optional().describe("Maximum price in PLN"),
     dateFrom: z.string().optional().describe("Start date (YYYY-MM-DD)"),
@@ -423,6 +439,7 @@ Example: compare Mokotów, Wola, Ursynów for apartments.`,
         marketType: mapMarketType(params.marketType),
         unitFunction: mapUnitFunction(params.unitFunction),
         buildingType: mapBuildingType(params.buildingType),
+        mpzpDesignation: params.mpzpDesignation,
         minPrice: params.minPrice,
         maxPrice: params.maxPrice,
         dateFrom: params.dateFrom,

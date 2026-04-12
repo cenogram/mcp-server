@@ -31,6 +31,7 @@ const sampleTx: Transaction = {
   parcel_area: null,
   unit_function: 1,
   parcel_id: "146509_8.0501.12",
+  parcel_number: "12",
   county_name: "Warszawa",
   voivodeship_name: "mazowieckie",
   centroid: { type: "Point", coordinates: [21.0060, 52.2317] },
@@ -302,6 +303,7 @@ describe("formatSpatialResults", () => {
       city: "Warszawa",
       district: "Mokotów",
       parcel_area: null,
+      parcel_number: "45/2",
     },
   };
 

@@ -42,6 +42,7 @@ export interface Transaction {
   parcel_area: number | null;
   unit_function: number | null;
   parcel_id: string | null;
+  parcel_number: string | null;
   county_name: string | null;
   voivodeship_name: string | null;
   centroid: { type: string; coordinates: [number, number] } | null;
@@ -329,6 +330,7 @@ export interface SpatialFeatureProperties {
   city: string | null;
   district: string | null;
   parcel_area: number | null;
+  parcel_number: string | null;
 }
 
 export interface SpatialFeature {

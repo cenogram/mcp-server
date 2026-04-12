@@ -16,7 +16,7 @@ describe("api-client", () => {
   it("getStats builds correct URL", async () => {
     mockFetch.mockResolvedValueOnce({
       ok: true,
-      json: async () => ({ counts: { transactions: 100 } }),
+      json: () => Promise.resolve({ counts: { transactions: 100 } }),
     });
 
     const { getStats } = await import("../api-client.js");
@@ -30,7 +30,7 @@ describe("api-client", () => {
   it("getTransactions passes query params", async () => {
     mockFetch.mockResolvedValueOnce({
       ok: true,
-      json: async () => ({ data: [], pagination: {}, summary: null }),
+      json: () => Promise.resolve({ data: [], pagination: {}, summary: null }),
     });
 
     const { getTransactions } = await import("../api-client.js");
@@ -52,7 +52,7 @@ describe("api-client", () => {
   it("getTransactions passes street, buildingNumber, parcelId", async () => {
     mockFetch.mockResolvedValueOnce({
       ok: true,
-      json: async () => ({ data: [], pagination: {}, summary: null }),
+      json: () => Promise.resolve({ data: [], pagination: {}, summary: null }),
     });
 
     const { getTransactions } = await import("../api-client.js");
@@ -80,7 +80,7 @@ describe("api-client", () => {
     mockFetch.mockResolvedValueOnce({
       ok: false,
       status: 402,
-      json: async () => ({ currentBalance: 0, creditsRequired: 2 }),
+      json: () => Promise.resolve({ currentBalance: 0, creditsRequired: 2 }),
     });
 
     const { fetchApi } = await import("../api-client.js");
@@ -91,7 +91,7 @@ describe("api-client", () => {
     mockFetch.mockResolvedValueOnce({
       ok: false,
       status: 402,
-      json: async () => ({ currentBalance: 0, creditsRequired: 5 }),
+      json: () => Promise.resolve({ currentBalance: 0, creditsRequired: 5 }),
     });
 
     const { fetchApi } = await import("../api-client.js");
@@ -104,7 +104,7 @@ describe("api-client", () => {
     mockFetch.mockResolvedValueOnce({
       ok: false,
       status: 402,
-      json: async () => { throw new Error("not json"); },
+      json: () => Promise.reject(new Error("not json")),
     });
 
     const { fetchApi } = await import("../api-client.js");
@@ -145,7 +145,7 @@ describe("api-client", () => {
   it("getPriceHistogram passes bins and max", async () => {
     mockFetch.mockResolvedValueOnce({
       ok: true,
-      json: async () => [],
+      json: () => Promise.resolve([]),
     });
 
     const { getPriceHistogram } = await import("../api-client.js");
@@ -159,7 +159,7 @@ describe("api-client", () => {
   it("getPricePerM2 calls correct endpoint", async () => {
     mockFetch.mockResolvedValueOnce({
       ok: true,
-      json: async () => [{ district: "Mokotów", avg_price_m2: 16000, median_price_m2: 15200, count: 5000 }],
+      json: () => Promise.resolve([{ district: "Mokotów", avg_price_m2: 16000, median_price_m2: 15200, count: 5000 }]),
     });
 
     const { getPricePerM2 } = await import("../api-client.js");
@@ -173,7 +173,7 @@ describe("api-client", () => {
   it("getDistricts calls correct endpoint", async () => {
     mockFetch.mockResolvedValueOnce({
       ok: true,
-      json: async () => ["Mokotów", "Śródmieście"],
+      json: () => Promise.resolve(["Mokotów", "Śródmieście"]),
     });
 
     const { getDistricts } = await import("../api-client.js");
@@ -187,7 +187,7 @@ describe("api-client", () => {
   it("returns creditInfo when response headers present", async () => {
     mockFetch.mockResolvedValueOnce({
       ok: true,
-      json: async () => ({ counts: { transactions: 100 } }),
+      json: () => Promise.resolve({ counts: { transactions: 100 } }),
       headers: { get: (h: string) => h === "X-Credits-Balance" ? "48" : h === "X-Credits-Cost" ? "2" : null },
     });
 
@@ -200,7 +200,7 @@ describe("api-client", () => {
   it("returns null creditInfo when headers missing", async () => {
     mockFetch.mockResolvedValueOnce({
       ok: true,
-      json: async () => ({ counts: { transactions: 100 } }),
+      json: () => Promise.resolve({ counts: { transactions: 100 } }),
     });
 
     const { getStats } = await import("../api-client.js");
@@ -212,7 +212,7 @@ describe("api-client", () => {
   it("sends X-Source header", async () => {
     mockFetch.mockResolvedValueOnce({
       ok: true,
-      json: async () => ({}),
+      json: () => Promise.resolve({}),
     });
 
     const { fetchApi } = await import("../api-client.js");
@@ -225,7 +225,7 @@ describe("api-client", () => {
   it("sends X-Cenogram-Client-Id header", async () => {
     mockFetch.mockResolvedValueOnce({
       ok: true,
-      json: async () => ({}),
+      json: () => Promise.resolve({}),
     });
 
     const { fetchApi } = await import("../api-client.js");
@@ -238,7 +238,7 @@ describe("api-client", () => {
   it("getTransactionsSummary builds correct URL with filters", async () => {
     mockFetch.mockResolvedValueOnce({
       ok: true,
-      json: async () => ({ median_price_m2: 15000, avg_area: 55, total: 100 }),
+      json: () => Promise.resolve({ median_price_m2: 15000, avg_area: 55, total: 100 }),
     });
 
     const { getTransactionsSummary } = await import("../api-client.js");
@@ -254,7 +254,7 @@ describe("api-client", () => {
   it("fetchApiPost sends POST with JSON body", async () => {
     mockFetch.mockResolvedValueOnce({
       ok: true,
-      json: async () => ({ type: "FeatureCollection", features: [], total: 0, truncated: false }),
+      json: () => Promise.resolve({ type: "FeatureCollection", features: [], total: 0, truncated: false }),
     });
 
     const { fetchApiPost } = await import("../api-client.js");
@@ -269,7 +269,7 @@ describe("api-client", () => {
   it("fetchApiPost sends X-Source and X-Cenogram-Client-Id headers", async () => {
     mockFetch.mockResolvedValueOnce({
       ok: true,
-      json: async () => ({}),
+      json: () => Promise.resolve({}),
     });
 
     const { fetchApiPost } = await import("../api-client.js");
@@ -284,7 +284,7 @@ describe("api-client", () => {
     mockFetch.mockResolvedValueOnce({
       ok: false,
       status: 402,
-      json: async () => ({ currentBalance: 0, creditsRequired: 5 }),
+      json: () => Promise.resolve({ currentBalance: 0, creditsRequired: 5 }),
     });
 
     const { fetchApiPost } = await import("../api-client.js");
@@ -294,7 +294,7 @@ describe("api-client", () => {
   it("fetchApiPost returns creditInfo from headers", async () => {
     mockFetch.mockResolvedValueOnce({
       ok: true,
-      json: async () => ({}),
+      json: () => Promise.resolve({}),
       headers: { get: (h: string) => h === "X-Credits-Balance" ? "100" : h === "X-Credits-Cost" ? "3" : null },
     });
 
@@ -306,7 +306,7 @@ describe("api-client", () => {
   it("searchParcels builds correct URL with q and limit", async () => {
     mockFetch.mockResolvedValueOnce({
       ok: true,
-      json: async () => ({ results: [{ parcel_id: "146518_8.0108.27", district: "Wawer", area_m2: 1200, lat: 52.1, lng: 21.1 }] }),
+      json: () => Promise.resolve({ results: [{ parcel_id: "146518_8.0108.27", district: "Wawer", area_m2: 1200, lat: 52.1, lng: 21.1 }] }),
     });
 
     const { searchParcels } = await import("../api-client.js");
@@ -321,7 +321,7 @@ describe("api-client", () => {
   it("searchByPolygon sends POST to spatial endpoint", async () => {
     mockFetch.mockResolvedValueOnce({
       ok: true,
-      json: async () => ({ type: "FeatureCollection", features: [], total: 0, truncated: false }),
+      json: () => Promise.resolve({ type: "FeatureCollection", features: [], total: 0, truncated: false }),
     });
 
     const { searchByPolygon } = await import("../api-client.js");
@@ -343,7 +343,7 @@ describe("api-client", () => {
   it("compareLocations builds correct URL with districts and filters", async () => {
     mockFetch.mockResolvedValueOnce({
       ok: true,
-      json: async () => ({ "Mokotów": { median_price_m2: 15000, total: 100 } }),
+      json: () => Promise.resolve({ "Mokotów": { median_price_m2: 15000, total: 100 } }),
     });
 
     const { compareLocations } = await import("../api-client.js");

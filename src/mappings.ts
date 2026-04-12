@@ -120,3 +120,26 @@ export function filterByLocation(
   const lower = location.toLowerCase();
   return districts.filter((d) => d.toLowerCase().includes(lower));
 }
+
+// ── City → sub-district expansion ───────────────────────────────────
+// Keep in sync with api/src/helpers.ts CITY_SUBDISTRICTS (ADR-003).
+// Cities: Warszawa (19), Kraków (5), Łódź (6).
+
+export const CITY_SUBDISTRICTS: ReadonlyMap<string, readonly string[]> = new Map([
+  ["Warszawa", [
+    "Warszawa", "Bemowo", "Białołęka", "Bielany", "Mokotów", "Ochota",
+    "Praga-Południe", "Praga-Północ", "Rembertów", "Śródmieście", "Targówek",
+    "Ursus", "Ursynów", "Wawer", "Wesoła", "Wilanów", "Włochy", "Wola", "Żoliborz",
+  ]],
+  ["Kraków", [
+    "Kraków", "Kraków-Krowodrza", "Kraków-Nowa Huta", "Kraków-Podgórze", "Kraków-Śródmieście",
+  ]],
+  ["Łódź", [
+    "Łódź", "Łódź-Bałuty", "Łódź-Górna", "Łódź-Polesie", "Łódź-Śródmieście", "Łódź-Widzew",
+  ]],
+]);
+
+/** Returns sub-districts for known multi-district cities, or [district] for everything else. */
+export function expandDistrict(district: string): string[] {
+  return CITY_SUBDISTRICTS.get(district)?.slice() ?? [district];
+}

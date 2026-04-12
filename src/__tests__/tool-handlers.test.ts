@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeAll, afterAll, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeAll, beforeEach } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type {
@@ -67,6 +67,7 @@ const sampleTransaction = {
   parcel_area: null,
   unit_function: 1,
   parcel_id: "146509_8.0501.12",
+  parcel_number: "12",
   county_name: "Warszawa",
   voivodeship_name: "mazowieckie",
   centroid: { type: "Point", coordinates: [21.006, 52.2317] as [number, number] },
@@ -133,6 +134,7 @@ const sampleSpatialResponse: SpatialSearchResponse = {
       city: "Warszawa",
       district: "Mokotów",
       parcel_area: null,
+      parcel_number: null,
     },
   }],
   truncated: false,
@@ -163,8 +165,9 @@ beforeEach(() => {
 
 // ── Helper ─────────────────────────────────────────────────────────
 
-function getTextContent(result: { content: { type: string; text?: string }[] }): string {
-  const textBlock = result.content.find((c) => c.type === "text");
+function getTextContent(result: unknown): string {
+  const typed = result as { content?: Array<{ type: string; text?: string }> };
+  const textBlock = typed.content?.find((c) => c.type === "text");
   return textBlock?.text ?? "";
 }
 
@@ -313,6 +316,30 @@ describe("get_price_statistics", () => {
     expect(text).toContain("No price statistics");
     expect(text).toContain("list_locations");
   });
+
+  it("expands 'Warszawa' to all sub-districts including city-level entry (not substring match)", async () => {
+    const warsawRows: PricePerM2Row[] = [
+      { district: "Warszawa", avg_price_m2: 18000, median_price_m2: 17000, count: 100 },
+      { district: "Mokotów", avg_price_m2: 16000, median_price_m2: 15200, count: 5000 },
+      { district: "Wola", avg_price_m2: 14000, median_price_m2: 13500, count: 4000 },
+      { district: "Śródmieście", avg_price_m2: 22000, median_price_m2: 21000, count: 3000 },
+      { district: "Bemowo", avg_price_m2: 12000, median_price_m2: 11500, count: 2000 },
+      { district: "Kraków-Podgórze", avg_price_m2: 12000, median_price_m2: 11500, count: 3000 },
+    ];
+    mockGetPricePerM2.mockResolvedValueOnce(withCredits(warsawRows));
+
+    const result = await client.callTool({ name: "get_price_statistics", arguments: { location: "Warszawa" } });
+    const text = getTextContent(result);
+
+    // Warsaw districts + city-level entry should be present
+    expect(text).toContain("Mokotów");
+    expect(text).toContain("Wola");
+    expect(text).toContain("Śródmieście");
+    expect(text).toContain("Bemowo");
+    expect(text).toContain("Warszawa");
+    // Non-Warsaw districts should be filtered out
+    expect(text).not.toContain("Kraków-Podgórze");
+  });
 });
 
 // ── Tests: get_price_distribution ──────────────────────────────────
@@ -387,6 +414,21 @@ describe("search_by_area", () => {
 
     expect(text).toContain("Error:");
     expect(result.isError).toBe(true);
+  });
+
+  it("forwards minArea and maxArea to backend (regression: bug v1-04)", async () => {
+    mockGetTransactions.mockResolvedValueOnce(withCredits(sampleTransactionsResponse));
+    mockGetTransactionsSummary.mockResolvedValueOnce(withCredits(sampleSummary));
+
+    await client.callTool({
+      name: "search_by_area",
+      arguments: { latitude: 52.23, longitude: 21.01, radiusKm: 5, propertyType: "land", minArea: 1000, maxArea: 2000 },
+    });
+
+    expect(mockGetTransactions).toHaveBeenCalledWith(
+      expect.objectContaining({ minArea: 1000, maxArea: 2000, propertyType: 1 }),
+      "test-api-key",
+    );
   });
 });
 
@@ -566,6 +608,24 @@ describe("compare_locations", () => {
         districts: "Mokotów,Wola",
         propertyType: 4,
         dateFrom: "2024-01-01",
+      }),
+      "test-api-key",
+    );
+  });
+
+  it("forwards mpzpDesignation to backend (regression: bug ext-S13)", async () => {
+    mockCompareLocations.mockResolvedValueOnce(withCredits(sampleCompareResponse));
+
+    await client.callTool({
+      name: "compare_locations",
+      arguments: { districts: "Mokotów,Wola", propertyType: "land", mpzpDesignation: "terenRolniczy" },
+    });
+
+    expect(mockCompareLocations).toHaveBeenCalledWith(
+      expect.objectContaining({
+        districts: "Mokotów,Wola",
+        propertyType: 1,
+        mpzpDesignation: "terenRolniczy",
       }),
       "test-api-key",
     );

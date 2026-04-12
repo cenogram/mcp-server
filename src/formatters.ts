@@ -40,6 +40,7 @@ interface FormattableFields {
   building_number: string | null;
   city: string | null;
   parcel_area: number | null;
+  parcel_number?: string | null;
   county_name?: string | null;
   voivodeship_name?: string | null;
   coordinates?: [number, number] | null;
@@ -73,6 +74,7 @@ function formatTransactionCore(f: FormattableFields): string {
 
   // Extra details
   const extra: string[] = [];
+  if (f.parcel_number) extra.push(`Plot no: ${f.parcel_number}`);
   if (f.rooms != null) extra.push(`Rooms: ${f.rooms}`);
   if (f.floor != null) extra.push(`Floor: ${f.floor}`);
   if (f.coordinates) {

@@ -25,8 +25,8 @@ export function createMcpServer(apiKey?: string): McpServer {
         "",
         "CRITICAL - District names (ALWAYS verify first):",
         "- NEVER guess district names. Call list_locations(search=\"city\") first.",
-        "- Warsaw: use district names (Mokotów, Wola, Śródmieście) - \"Warszawa\" returns 0 results",
-        "- Kraków: Kraków-Śródmieście, Kraków-Podgórze, Kraków-Krowodrza, Kraków-Nowa Huta",
+        "- Warsaw: 'Warszawa' auto-includes all 18 districts. Or use specific: Mokotów, Wola, Śródmieście",
+        "- Kraków/Łódź: 'Kraków'/'Łódź' auto-include all sub-districts. Or use specific: Kraków-Podgórze, etc.",
         "- Most cities (Gdańsk, Gdynia, Sopot, Poznań): just the city name, no sub-districts",
         "",
         "Workflows:",
@@ -59,7 +59,7 @@ async function main() {
     const { StreamableHTTPServerTransport } = await import("@modelcontextprotocol/sdk/server/streamableHttp.js");
 
     const port = parseInt(process.env.MCP_PORT || "3002", 10);
-    createServer(async (req, res) => {
+    const handleHttpRequest = async (req: import("node:http").IncomingMessage, res: import("node:http").ServerResponse) => {
       try {
         const pathname = req.url?.split("?")[0];
         if (pathname === "/mcp") {
@@ -92,6 +92,12 @@ async function main() {
           );
         }
       }
+    };
+
+    createServer((req, res) => {
+      handleHttpRequest(req, res).catch((err) => {
+        process.stderr.write(`Unhandled HTTP error: ${String(err)}\n`);
+      });
     }).listen(port, "0.0.0.0", () => {
       process.stderr.write(`MCP HTTP server on http://0.0.0.0:${port}/mcp\n`);
     });
