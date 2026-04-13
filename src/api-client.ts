@@ -1,3 +1,4 @@
+import { fetch, type Response } from "undici";
 import { getClientId } from "./client-id.js";
 
 const BASE_URL = process.env.CENOGRAM_API_URL || "https://cenogram.pl";
