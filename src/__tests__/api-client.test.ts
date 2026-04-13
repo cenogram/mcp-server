@@ -1,8 +1,10 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
-// Must mock fetch before importing api-client
-const mockFetch = vi.fn();
-vi.stubGlobal("fetch", mockFetch);
+const { mockFetch } = vi.hoisted(() => ({
+  mockFetch: vi.fn(),
+}));
+
+vi.mock("undici", () => ({ fetch: mockFetch }));
 
 vi.mock("../client-id.js", () => ({
   getClientId: () => "test-client-uuid-1234",

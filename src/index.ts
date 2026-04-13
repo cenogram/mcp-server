@@ -6,6 +6,16 @@ import { dirname, join } from "node:path";
 import { readFileSync, realpathSync } from "node:fs";
 import { registerTools } from "./tools.js";
 
+// ── Node version check ─────────────────────────────────────────────
+
+const [nodeMajor] = process.versions.node.split(".").map(Number);
+if (nodeMajor != null && nodeMajor < 18) {
+  process.stderr.write(
+    `Warning: @cenogram/mcp-server recommends Node.js >= 18 (current: ${process.version}). ` +
+    "The server will try to run, but some features may not work.\n",
+  );
+}
+
 // ── Version ────────────────────────────────────────────────────────
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
