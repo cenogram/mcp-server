@@ -71,11 +71,15 @@ describe("api-client", () => {
     expect(url).toContain("parcelId=146518");
   });
 
-  it("throws on non-200 status", async () => {
-    mockFetch.mockResolvedValueOnce({ ok: false, status: 500 });
+  it("throws readable message on non-200 status (500)", async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: false,
+      status: 500,
+      json: () => Promise.resolve({}),
+    });
 
     const { fetchApi } = await import("../api-client.js");
-    await expect(fetchApi("/api/stats")).rejects.toThrow("API error: HTTP 500");
+    await expect(fetchApi("/api/stats")).rejects.toThrow("HTTP 500");
   });
 
   it("throws readable message on 402 (insufficient credits)", async () => {
@@ -86,7 +90,7 @@ describe("api-client", () => {
     });
 
     const { fetchApi } = await import("../api-client.js");
-    await expect(fetchApi("/api/stats")).rejects.toThrow("Niewystarczające tokeny API");
+    await expect(fetchApi("/api/stats")).rejects.toThrow("Insufficient credits");
   });
 
   it("402 error includes balance and required credits", async () => {
@@ -98,8 +102,8 @@ describe("api-client", () => {
 
     const { fetchApi } = await import("../api-client.js");
     const error = await fetchApi("/api/stats").catch((e: Error) => e);
-    expect((error as Error).message).toContain("Saldo: 0");
-    expect((error as Error).message).toContain("wymagane: 5");
+    expect((error as Error).message).toContain("balance: 0");
+    expect((error as Error).message).toContain("query cost: 5");
   });
 
   it("402 error handles missing json body gracefully", async () => {
@@ -110,7 +114,7 @@ describe("api-client", () => {
     });
 
     const { fetchApi } = await import("../api-client.js");
-    await expect(fetchApi("/api/stats")).rejects.toThrow("Niewystarczające tokeny API");
+    await expect(fetchApi("/api/stats")).rejects.toThrow("Insufficient credits");
   });
 
   it("throws on 429 (IP rate limit)", async () => {
@@ -121,7 +125,7 @@ describe("api-client", () => {
     });
 
     const { fetchApi } = await import("../api-client.js");
-    await expect(fetchApi("/api/stats")).rejects.toThrow("Zbyt wiele zapytań");
+    await expect(fetchApi("/api/stats")).rejects.toThrow("Too many requests");
   });
 
   it("429 error includes days from Retry-After", async () => {
@@ -132,7 +136,7 @@ describe("api-client", () => {
     });
 
     const { fetchApi } = await import("../api-client.js");
-    await expect(fetchApi("/api/stats")).rejects.toThrow("Reset za 3 dni");
+    await expect(fetchApi("/api/stats")).rejects.toThrow("Resets in 3 day(s)");
   });
 
   it("throws on timeout", async () => {
@@ -290,7 +294,7 @@ describe("api-client", () => {
     });
 
     const { fetchApiPost } = await import("../api-client.js");
-    await expect(fetchApiPost("/api/test", {})).rejects.toThrow("Niewystarczające tokeny API");
+    await expect(fetchApiPost("/api/test", {})).rejects.toThrow("Insufficient credits");
   });
 
   it("fetchApiPost returns creditInfo from headers", async () => {
@@ -340,6 +344,57 @@ describe("api-client", () => {
     const body = JSON.parse(opts.body as string) as Record<string, unknown>;
     expect(body.propertyType).toBe(4);
     expect(body.minPrice).toBe(300000);
+  });
+
+  it("402 + OAuth ctx: 'na koncie' wording (no 'kluczem')", async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: false,
+      status: 402,
+      json: () => Promise.resolve({ currentBalance: 3, creditsRequired: 5 }),
+    });
+    const { getStats, encodeOAuthCtx } = await import("../api-client.js");
+    const oauthKey = encodeOAuthCtx("u1", "g1");
+    const err = await getStats(oauthKey).catch((e: Error) => e);
+    expect((err as Error).message).toContain("Insufficient credits");
+    expect((err as Error).message).toContain("balance: 3");
+    expect((err as Error).message).not.toContain("key's account");
+  });
+
+  it("401 + OAuth ctx: prompts disconnect/reconnect", async () => {
+    mockFetch.mockResolvedValueOnce({ ok: false, status: 401, json: () => Promise.resolve({}) });
+    const { getStats, encodeOAuthCtx } = await import("../api-client.js");
+    const oauthKey = encodeOAuthCtx("u1", "g1");
+    const err = await getStats(oauthKey).catch((e: Error) => e);
+    expect((err as Error).message).toContain("Connection to Cenogram expired");
+    expect((err as Error).message).toContain("disconnect and reconnect");
+  });
+
+  it("401 + API key: prompts api/keys check", async () => {
+    mockFetch.mockResolvedValueOnce({ ok: false, status: 401, json: () => Promise.resolve({}) });
+    const { getStats } = await import("../api-client.js");
+    const err = await getStats(`cngrm_${"a".repeat(32)}`).catch((e: Error) => e);
+    expect((err as Error).message).toContain("API key rejected");
+    expect((err as Error).message).toContain("https://cenogram.pl/api/keys");
+  });
+
+  it("403 email_not_verified: prompts inbox check", async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: false,
+      status: 403,
+      json: () => Promise.resolve({ error: "email_not_verified" }),
+    });
+    const { getStats } = await import("../api-client.js");
+    const err = await getStats(`cngrm_${"a".repeat(32)}`).catch((e: Error) => e);
+    expect((err as Error).message).toContain("not verified");
+  });
+
+  it("503: temporary unavailability with retry hint", async () => {
+    mockFetch.mockResolvedValueOnce({ ok: false, status: 503, json: () => Promise.resolve({}) });
+    const { getStats } = await import("../api-client.js");
+    const err = await getStats(`cngrm_${"a".repeat(32)}`).catch((e: Error) => e);
+    expect((err as Error).message).toContain("unavailable");
+    expect((err as Error).message).toContain("maintenance");
+    expect((err as Error).message).toContain("Try again");
   });
 
   it("compareLocations builds correct URL with districts and filters", async () => {

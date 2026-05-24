@@ -1,4 +1,4 @@
-import type { Transaction, TransactionsResponse, TransactionsSummary, StatsResponse, PricePerM2Row, HistogramBin, ParcelSearchResponse, SpatialSearchResponse, SpatialFeature, CompareResponse } from "./api-client.js";
+import type { Transaction, TransactionsResponse, TransactionsSummary, StatsResponse, PricePerM2Row, HistogramBin, ParcelSearchResponse, SpatialSearchResponse, SpatialFeature, CompareResponse, LocationItem } from "./api-client.js";
 import { PROPERTY_TYPES, MARKET_TYPES } from "./mappings.js";
 
 // ── Primitives ──────────────────────────────────────────────────────
@@ -25,7 +25,6 @@ export function formatNumber(value: number | null | undefined): string {
 
 // ── Shared transaction formatting ──────────────────────────────────
 
-// Note: parcel_id intentionally excluded from formatted output (DPIA B3)
 interface FormattableFields {
   transaction_date: string;
   property_type: number;
@@ -50,10 +49,12 @@ function formatTransactionCore(f: FormattableFields): string {
   const parts: string[] = [];
 
   // Address with optional county/voivodeship
-  const addr = [f.street, f.building_number].filter(Boolean).join(" ");
+  const streetAddr = [f.street, f.building_number].filter(Boolean).join(" ");
   const district = f.district || f.city;
-  const region = [f.county_name ? `pow. ${f.county_name}` : null, f.voivodeship_name ? `woj. ${f.voivodeship_name}` : null].filter(Boolean).join(", ");
-  const loc = [addr, district].filter(Boolean).join(", ");
+  const region = [f.county_name ? `county: ${f.county_name}` : null, f.voivodeship_name ? `voivodeship: ${f.voivodeship_name}` : null].filter(Boolean).join(", ");
+  const loc = f.street
+    ? [streetAddr, district].filter(Boolean).join(", ")
+    : [district, f.building_number].filter(Boolean).join(" ");
   if (loc && region) parts.push(`${loc} (${region})`);
   else if (loc) parts.push(loc);
 
@@ -228,8 +229,9 @@ export function formatParcelResults(res: ParcelSearchResponse, query: string): s
   for (const [i, p] of res.results.entries()) {
     const district = p.district ?? "Unknown";
     const area = p.area_m2 != null ? formatArea(p.area_m2) : "N/A";
+    const location = `${p.lat.toFixed(4)}\u00B0N, ${p.lng.toFixed(4)}\u00B0E`;
     lines.push(`${i + 1}. ${p.parcel_id}`);
-    lines.push(`   District: ${district} | Area: ${area} | Location: ${p.lat.toFixed(4)}\u00B0N, ${p.lng.toFixed(4)}\u00B0E`);
+    lines.push(`   District: ${district} | Area: ${area} | Location: ${location}`);
   }
   return lines.join("\n");
 }
@@ -264,6 +266,47 @@ export function formatSpatialResults(res: SpatialSearchResponse): string {
   }
   if (res.features.length > displayCap) {
     lines.push(`\n...and ${res.features.length - displayCap} more in response (not displayed). Use a smaller limit or narrower polygon.`);
+  }
+
+  return lines.join("\n");
+}
+
+// ── Location hierarchy formatting ─────────────────────────────────
+
+const LEVEL_TIPS: Record<string, string> = {
+  voivodeship: "Use a 2-digit code as 'parent' to browse counties.",
+  county: "Use a 4-digit code as 'parent' to browse municipalities.",
+  municipality: "Use a 6-digit code as 'parent' to browse precincts, or use any code with 'teryt' in search_transactions.",
+  precinct: "Use these precinct codes with 'teryt' in search_transactions for precise area filtering.",
+};
+
+export function formatLocationHierarchy(items: LocationItem[], parent?: string): string {
+  if (items.length === 0) {
+    if (parent) {
+      if (parent.length >= 6) {
+        return `No sub-locations found for TERYT code '${parent}'. This may be a leaf code - use it directly with search_transactions(teryt='${parent}').`;
+      }
+      return `No sub-locations found for TERYT code '${parent}'. Verify the code is correct using list_locations.`;
+    }
+    return "No locations available.";
+  }
+
+  const level = items[0]!.level;
+  const header = parent
+    ? `TERYT location hierarchy (parent: ${parent}, level: ${level}):`
+    : `TERYT location hierarchy (Poland, level: ${level}):`;
+
+  const plural: Record<string, string> = { voivodeship: "voivodeships", county: "counties", municipality: "municipalities", precinct: "precincts" };
+  const lines: string[] = [header, "", `Found ${items.length} ${plural[level] ?? `${level}s`}:`, ""];
+
+  for (const item of items) {
+    const typeSuffix = item.typeName ? ` (${item.typeName})` : "";
+    lines.push(`  ${item.code} - ${item.name}${typeSuffix}`);
+  }
+
+  const tip = LEVEL_TIPS[level];
+  if (tip) {
+    lines.push("", `Tip: ${tip}`);
   }
 
   return lines.join("\n");

@@ -112,19 +112,20 @@ export function radiusKmToBbox(
 
 // ── Location filtering ──────────────────────────────────────────────
 
-/** Filter districts by location name (case-insensitive includes match) */
+function stripDiacritics(s: string): string {
+  return s.normalize("NFD").replace(/[̀-ͯ]/g, "").replace(/[łŁ]/g, (c) => c === "ł" ? "l" : "L");
+}
+
+/** Filter districts by location name (case-insensitive, diacritics-insensitive includes match) */
 export function filterByLocation(
   location: string,
   districts: string[],
 ): string[] {
-  const lower = location.toLowerCase();
-  return districts.filter((d) => d.toLowerCase().includes(lower));
+  const needle = stripDiacritics(location.toLowerCase());
+  return districts.filter((d) => stripDiacritics(d.toLowerCase()).includes(needle));
 }
 
 // ── City → sub-district expansion ───────────────────────────────────
-// Keep in sync with api/src/helpers.ts CITY_SUBDISTRICTS (ADR-003).
-// Cities: Warszawa (19), Kraków (5), Łódź (6).
-
 export const CITY_SUBDISTRICTS: ReadonlyMap<string, readonly string[]> = new Map([
   ["Warszawa", [
     "Warszawa", "Bemowo", "Białołęka", "Bielany", "Mokotów", "Ochota",

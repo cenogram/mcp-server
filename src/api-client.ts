@@ -1,9 +1,11 @@
 import { fetch, type Response } from "undici";
 import { getClientId } from "./client-id.js";
+import { authErrorMessage, getAuthMode, type ErrorBody } from "./error-messages.js";
+import { requestContext } from "./request-context.js";
 
 const BASE_URL = process.env.CENOGRAM_API_URL || "https://cenogram.pl";
 
-// ── Types (adapted from explorer/src/types.ts) ─────────────────────
+// ── Types ──────────────────────────────────────────────────────────
 
 export interface StatsResponse {
   counts: {
@@ -96,6 +98,16 @@ function extractCreditInfo(res: Response): CreditInfo | null {
   return { balance, cost };
 }
 
+// ── OAuth internal auth ────────────────────────────────────────────
+
+// SOH char (\x01) is impossible in base64url or ctx_ keys - used as both prefix and separator
+const OAUTH_CTX_PREFIX = "\x01";
+
+export function encodeOAuthCtx(userId: string, grantId: string): string {
+  // \x01{userId}\x01{grantId} - \x01 cannot appear in UUIDs (hex + hyphens only)
+  return `${OAUTH_CTX_PREFIX}${userId}${OAUTH_CTX_PREFIX}${grantId}`;
+}
+
 // ── Shared HTTP helpers ────────────────────────────────────────────
 
 function buildHeaders(apiKey?: string): Record<string, string> {
@@ -103,25 +115,38 @@ function buildHeaders(apiKey?: string): Record<string, string> {
     "X-Source": "mcp-server",
     "X-Cenogram-Client-Id": getClientId(),
   };
+  const ctx = requestContext.getStore();
+  if (ctx?.clientUserAgent) headers["X-MCP-User-Agent"] = ctx.clientUserAgent;
   const key = apiKey ?? process.env.CENOGRAM_API_KEY;
-  if (key) headers["Authorization"] = `Bearer ${key}`;
+  if (key?.startsWith(OAUTH_CTX_PREFIX)) {
+    const rest = key.slice(OAUTH_CTX_PREFIX.length);
+    const sepIdx = rest.indexOf(OAUTH_CTX_PREFIX);
+    if (sepIdx <= 0) {
+      throw new Error("BUG: malformed OAuth context key");
+    }
+    const internalSecret = process.env.INTERNAL_AUTH_SECRET;
+    if (internalSecret) {
+      headers["X-Internal-Auth"] = internalSecret;
+    }
+    headers["X-OAuth-User"] = rest.slice(0, sepIdx);
+    headers["X-OAuth-Grant"] = rest.slice(sepIdx + OAUTH_CTX_PREFIX.length);
+  } else if (key) {
+    headers["Authorization"] = `Bearer ${key}`;
+  }
   return headers;
 }
 
-async function handleErrorResponse(res: Response): Promise<never> {
-  if (res.status === 402) {
-    const body = await res.json().catch(() => ({})) as { currentBalance?: number; creditsRequired?: number };
-    throw new Error(
-      `Niewystarczające tokeny API. Saldo: ${body.currentBalance ?? 0}, wymagane: ${body.creditsRequired ?? "?"}. Doładuj: https://cenogram.pl/api#cennik`,
-    );
-  }
+async function handleErrorResponse(res: Response, apiKey?: string): Promise<never> {
+  // 429 has special Retry-After handling - keep dedicated path
   if (res.status === 429) {
     const retryAfter = res.headers?.get?.("Retry-After");
     const days = retryAfter ? Math.ceil(parseInt(retryAfter, 10) / 86400) : null;
-    const resetInfo = days !== null ? ` Reset za ${days} ${days === 1 ? "dzień" : "dni"}.` : "";
-    throw new Error(`Zbyt wiele zapytań.${resetInfo}`);
+    const resetInfo = days !== null ? ` Resets in ${days} day(s).` : "";
+    throw new Error(`Too many requests.${resetInfo}`);
   }
-  throw new Error(`API error: HTTP ${res.status}`);
+  const body = (await res.json().catch(() => ({}))) as ErrorBody;
+  const mode = getAuthMode(apiKey ?? process.env.CENOGRAM_API_KEY);
+  throw new Error(authErrorMessage(res.status, mode, body));
 }
 
 function toQueryParams(obj: Record<string, string | number | undefined | null>): Record<string, string> {
@@ -151,7 +176,7 @@ export async function fetchApi<T>(
 
   try {
     const res = await fetch(url.toString(), { signal: controller.signal, headers: buildHeaders(apiKey) });
-    if (!res.ok) await handleErrorResponse(res);
+    if (!res.ok) await handleErrorResponse(res, apiKey);
     return { data: (await res.json()) as T, creditInfo: extractCreditInfo(res) };
   } finally {
     clearTimeout(timeout);
@@ -178,7 +203,7 @@ export async function fetchApiPost<T>(
       headers,
       body: JSON.stringify(body),
     });
-    if (!res.ok) await handleErrorResponse(res);
+    if (!res.ok) await handleErrorResponse(res, apiKey);
     return { data: (await res.json()) as T, creditInfo: extractCreditInfo(res) };
   } finally {
     clearTimeout(timeout);
@@ -193,6 +218,7 @@ export function getStats(apiKey?: string): Promise<ApiResponse<StatsResponse>> {
 
 export interface TransactionParams {
   district?: string;
+  teryt?: string;
   street?: string;
   buildingNumber?: string;
   parcelId?: string;
@@ -217,6 +243,7 @@ export interface TransactionParams {
 export function getTransactions(p: TransactionParams, apiKey?: string): Promise<ApiResponse<TransactionsResponse>> {
   return fetchApi("/api/transactions", toQueryParams({
     district: p.district,
+    teryt: p.teryt,
     street: p.street,
     buildingNumber: p.buildingNumber,
     parcelId: p.parcelId,
@@ -242,6 +269,7 @@ export function getTransactions(p: TransactionParams, apiKey?: string): Promise<
 export function getTransactionsSummary(p: TransactionParams, apiKey?: string): Promise<ApiResponse<TransactionsSummary>> {
   return fetchApi("/api/transactions/summary", toQueryParams({
     district: p.district,
+    teryt: p.teryt,
     street: p.street,
     propertyType: p.propertyType,
     marketType: p.marketType,
@@ -264,6 +292,17 @@ export function getPricePerM2(apiKey?: string): Promise<ApiResponse<PricePerM2Ro
 
 export function getDistricts(apiKey?: string): Promise<ApiResponse<string[]>> {
   return fetchApi("/api/districts", undefined, apiKey);
+}
+
+export interface LocationItem {
+  code: string;
+  name: string;
+  typeName: string | null;
+  level: "voivodeship" | "county" | "municipality" | "precinct";
+}
+
+export function getLocations(parent?: string, apiKey?: string): Promise<ApiResponse<LocationItem[]>> {
+  return fetchApi("/api/locations", parent ? { parent } : undefined, apiKey);
 }
 
 export function getPriceHistogram(

@@ -6,7 +6,7 @@
 
 **Polish Real Estate Transaction Data for AI**
 
-MCP server for Polish real estate data. Access 7M+ real estate transactions from the national Registry of Prices and Values (Rejestr Cen Nieruchomosci, RCN) directly from Claude, Cursor, or any MCP-compatible AI assistant.
+MCP server for Polish real estate data. Access 8M+ real estate transactions from the national Registry of Prices and Values (Rejestr Cen Nieruchomosci, RCN) directly from Claude, Cursor, or any MCP-compatible AI assistant.
 
 Data source: Polish national RCN registry (Rejestr Cen Nieruchomosci) | Platform: [cenogram.pl](https://cenogram.pl)
 
@@ -62,22 +62,7 @@ Add to your config file:
 - macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
 - Windows: `%APPDATA%\Claude\claude_desktop_config.json`
 
-**HTTP remote** (Claude Desktop 0.9+):
-```json
-{
-  "mcpServers": {
-    "cenogram": {
-      "type": "http",
-      "url": "https://mcp.cenogram.pl/mcp",
-      "headers": {
-        "Authorization": "Bearer YOUR_API_KEY"
-      }
-    }
-  }
-}
-```
-
-**Stdio fallback** (older versions - requires Node.js >= 18):
+**npx (stdio):**
 ```json
 {
   "mcpServers": {
@@ -262,7 +247,7 @@ This mimics how a property appraiser finds comparable transactions for valuation
 
 ## Data
 
-- **7M+ transactions** from all of Poland (380+ counties)
+- **8M+ transactions** from all of Poland (380 counties)
 - **Date range:** 2003 - present
 - **Source:** Polish national RCN registry (Rejestr Cen Nieruchomosci)
 - **Refresh:** periodic updates from RCN

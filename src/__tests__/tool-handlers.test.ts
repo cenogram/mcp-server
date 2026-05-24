@@ -12,6 +12,7 @@ import type {
   CompareResponse,
   CreditInfo,
   ApiResponse,
+  LocationItem,
 } from "../api-client.js";
 
 // ── Mock api-client (replaces entire module, including module-level API_KEY) ──
@@ -21,6 +22,7 @@ const mockGetTransactionsSummary = vi.fn();
 const mockGetStats = vi.fn();
 const mockGetPricePerM2 = vi.fn();
 const mockGetDistricts = vi.fn();
+const mockGetLocations = vi.fn();
 const mockGetPriceHistogram = vi.fn();
 const mockSearchParcels = vi.fn();
 const mockSearchByPolygon = vi.fn();
@@ -32,6 +34,7 @@ vi.mock("../api-client.js", () => ({
   getStats: (...args: unknown[]) => mockGetStats(...args),
   getPricePerM2: (...args: unknown[]) => mockGetPricePerM2(...args),
   getDistricts: (...args: unknown[]) => mockGetDistricts(...args),
+  getLocations: (...args: unknown[]) => mockGetLocations(...args),
   getPriceHistogram: (...args: unknown[]) => mockGetPriceHistogram(...args),
   searchParcels: (...args: unknown[]) => mockSearchParcels(...args),
   searchByPolygon: (...args: unknown[]) => mockSearchByPolygon(...args),
@@ -87,8 +90,8 @@ const sampleSummary: TransactionsSummary = {
 };
 
 const sampleStats: StatsResponse = {
-  counts: { transactions: 7352087, parcels: 681000, buildings: 50000, units: 30000, addresses: 20000 },
-  prices: { total: 7352087, avg_price: 456789, median_price: 280000, min_price: 1, max_price: 999999999 },
+  counts: { transactions: 8194025, parcels: 681000, buildings: 50000, units: 30000, addresses: 20000 },
+  prices: { total: 8194025, avg_price: 456789, median_price: 280000, min_price: 1, max_price: 999999999 },
   dateRange: { min_date: "2003-01-02", max_date: "2024-12-31" },
   byDistrict: [{ district: "Mokotów", transaction_count: 312456 }],
   byPropertyType: [{ type: 4, total: 3245678, label: "Lokal" }],
@@ -216,7 +219,7 @@ describe("search_transactions", () => {
     expect(text).toContain("Puławska");
     expect(text).toContain("Mokotów");
     expect(text).toContain("890");
-    expect(text).toMatch(/Tokeny API.*48/);
+    expect(text).toMatch(/API tokens.*48/);
   });
 
   it("maps location to district and propertyType string to number", async () => {
@@ -403,8 +406,8 @@ describe("search_by_area", () => {
   });
 
   it("returns Error with isError flag on API failure", async () => {
-    mockGetTransactions.mockRejectedValueOnce(new Error("Zbyt wiele zapytań."));
-    mockGetTransactionsSummary.mockRejectedValueOnce(new Error("Zbyt wiele zapytań."));
+    mockGetTransactions.mockRejectedValueOnce(new Error("Too many requests."));
+    mockGetTransactionsSummary.mockRejectedValueOnce(new Error("Too many requests."));
 
     const result = await client.callTool({
       name: "search_by_area",
@@ -416,7 +419,7 @@ describe("search_by_area", () => {
     expect(result.isError).toBe(true);
   });
 
-  it("forwards minArea and maxArea to backend (regression: bug v1-04)", async () => {
+  it("forwards minArea and maxArea to backend", async () => {
     mockGetTransactions.mockResolvedValueOnce(withCredits(sampleTransactionsResponse));
     mockGetTransactionsSummary.mockResolvedValueOnce(withCredits(sampleSummary));
 
@@ -442,7 +445,7 @@ describe("get_market_overview", () => {
     const text = getTextContent(result);
 
     expect(text).toContain("Cenogram");
-    expect(text).toMatch(/7.?352.?087/); // total count with possible separators
+    expect(text).toMatch(/8.?194.?025/); // total count with possible separators
     expect(text).toContain("2003");
   });
 
@@ -452,8 +455,8 @@ describe("get_market_overview", () => {
     const result = await client.callTool({ name: "get_market_overview", arguments: {} });
     const text = getTextContent(result);
 
-    expect(text).toMatch(/Tokeny API.*48/);
-    expect(text).toContain("koszt zapytania: 2");
+    expect(text).toMatch(/API tokens.*48/);
+    expect(text).toContain("query cost: 2");
   });
 
   it("returns isError flag on API failure", async () => {
@@ -470,30 +473,53 @@ describe("get_market_overview", () => {
 // ── Tests: list_locations ──────────────────────────────────────────
 
 describe("list_locations", () => {
-  const allDistricts = [
-    "Mokotów", "Śródmieście", "Wola", "Ursynów", "Praga-Południe",
-    ...Array.from({ length: 55 }, (_, i) => `District-${i}`),
-  ];
-
-  it("lists up to 50 locations without search", async () => {
-    mockGetDistricts.mockResolvedValueOnce(withCredits(allDistricts));
+  it("returns voivodeships when called without params (hierarchy mode)", async () => {
+    const voivodeships: LocationItem[] = [
+      { code: "02", name: "dolnośląskie", typeName: null, level: "voivodeship" },
+      { code: "14", name: "mazowieckie", typeName: null, level: "voivodeship" },
+    ];
+    mockGetLocations.mockResolvedValueOnce(withCredits(voivodeships));
 
     const result = await client.callTool({ name: "list_locations", arguments: {} });
     const text = getTextContent(result);
 
-    expect(text).toContain(`Found ${allDistricts.length} locations`);
-    expect(text).toContain("Mokotów");
-    expect(text).toContain("more");
+    expect(mockGetLocations).toHaveBeenCalledWith(undefined, "test-api-key");
+    expect(text).toContain("voivodeship");
+    expect(text).toContain("dolnośląskie");
   });
 
-  it("filters by search term", async () => {
+  it("filters by search term (legacy mode)", async () => {
     mockGetDistricts.mockResolvedValueOnce(withCredits(["Mokotów", "Śródmieście", "Wola", "Kraków-Podgórze", "Kraków-Śródmieście"]));
 
     const result = await client.callTool({ name: "list_locations", arguments: { search: "Kraków" } });
     const text = getTextContent(result);
 
+    expect(mockGetDistricts).toHaveBeenCalled();
+    expect(mockGetLocations).not.toHaveBeenCalled();
     expect(text).toContain("Kraków-Podgórze");
     expect(text).toContain("Kraków-Śródmieście");
+    expect(text).not.toContain("Mokotów");
+  });
+
+  it("search matches diacritics-insensitive ('Krakow' → Kraków districts)", async () => {
+    mockGetDistricts.mockResolvedValueOnce(withCredits(["Mokotów", "Kraków-Podgórze", "Kraków-Śródmieście"]));
+
+    const result = await client.callTool({ name: "list_locations", arguments: { search: "Krakow" } });
+    const text = getTextContent(result);
+
+    expect(text).toContain("Kraków-Podgórze");
+    expect(text).toContain("Kraków-Śródmieście");
+    expect(text).not.toContain("Mokotów");
+  });
+
+  it("search matches diacritics-insensitive ('Lodz' → Łódź districts)", async () => {
+    mockGetDistricts.mockResolvedValueOnce(withCredits(["Łódź-Bałuty", "Łódź-Górna", "Mokotów"]));
+
+    const result = await client.callTool({ name: "list_locations", arguments: { search: "Lodz" } });
+    const text = getTextContent(result);
+
+    expect(text).toContain("Łódź-Bałuty");
+    expect(text).toContain("Łódź-Górna");
     expect(text).not.toContain("Mokotów");
   });
 
@@ -613,7 +639,7 @@ describe("compare_locations", () => {
     );
   });
 
-  it("forwards mpzpDesignation to backend (regression: bug ext-S13)", async () => {
+  it("forwards mpzpDesignation to backend", async () => {
     mockCompareLocations.mockResolvedValueOnce(withCredits(sampleCompareResponse));
 
     await client.callTool({
@@ -659,6 +685,240 @@ describe("compare_locations", () => {
     const text = getTextContent(result);
 
     expect(text).toContain("Did you mean: Mokotów");
+  });
+});
+
+// ── Tests: list_locations with TERYT hierarchy ────────────────────
+
+describe("list_locations with TERYT hierarchy", () => {
+  const sampleVoivodeships: LocationItem[] = [
+    { code: "02", name: "dolnośląskie", typeName: null, level: "voivodeship" },
+    { code: "14", name: "mazowieckie", typeName: null, level: "voivodeship" },
+  ];
+
+  const sampleCounties: LocationItem[] = [
+    { code: "1401", name: "Warszawa", typeName: null, level: "county" },
+    { code: "1402", name: "ciechanowski", typeName: null, level: "county" },
+  ];
+
+  it("no params → returns voivodeships via getLocations", async () => {
+    mockGetLocations.mockResolvedValueOnce(withCredits(sampleVoivodeships));
+
+    const result = await client.callTool({ name: "list_locations", arguments: {} });
+    const text = getTextContent(result);
+
+    expect(mockGetLocations).toHaveBeenCalledWith(undefined, "test-api-key");
+    expect(mockGetDistricts).not.toHaveBeenCalled();
+    expect(text).toContain("voivodeship");
+    expect(text).toContain("02 - dolnośląskie");
+  });
+
+  it("parent='14' → returns counties", async () => {
+    mockGetLocations.mockResolvedValueOnce(withCredits(sampleCounties));
+
+    const result = await client.callTool({ name: "list_locations", arguments: { parent: "14" } });
+    const text = getTextContent(result);
+
+    expect(mockGetLocations).toHaveBeenCalledWith("14", "test-api-key");
+    expect(text).toContain("county");
+    expect(text).toContain("1401 - Warszawa");
+  });
+
+  it("empty results with parent → helpful message", async () => {
+    mockGetLocations.mockResolvedValueOnce(withCredits([]));
+
+    const result = await client.callTool({ name: "list_locations", arguments: { parent: "321705" } });
+    const text = getTextContent(result);
+
+    expect(text).toContain("No sub-locations");
+    expect(text).toContain("search_transactions");
+  });
+
+  it("invalid parent 'abc' → error without API call", async () => {
+    const result = await client.callTool({ name: "list_locations", arguments: { parent: "abc" } });
+    const text = getTextContent(result);
+
+    expect(mockGetLocations).not.toHaveBeenCalled();
+    expect(text).toContain("Invalid parent code");
+    expect(text).toContain("2, 4, or 6 digits");
+  });
+
+  it("trims whitespace from parent before validation", async () => {
+    const counties: LocationItem[] = [
+      { code: "1401", name: "Warszawa", typeName: null, level: "county" },
+    ];
+    mockGetLocations.mockResolvedValueOnce(withCredits(counties));
+
+    const result = await client.callTool({ name: "list_locations", arguments: { parent: " 14 " } });
+    const text = getTextContent(result);
+
+    expect(mockGetLocations).toHaveBeenCalledWith("14", "test-api-key");
+    expect(text).toContain("county");
+  });
+
+  it("sanitizes HTML from parent in error message", async () => {
+    const result = await client.callTool({ name: "list_locations", arguments: { parent: "<script>alert(1)</script>" } });
+    const text = getTextContent(result);
+
+    expect(text).toContain("Invalid parent code");
+    expect(text).not.toContain("<script>");
+  });
+
+  it("8-digit parent → error (rejects non-2/4/6 digit codes)", async () => {
+    const result = await client.callTool({ name: "list_locations", arguments: { parent: "12345678" } });
+    const text = getTextContent(result);
+
+    expect(mockGetLocations).not.toHaveBeenCalled();
+    expect(text).toContain("Invalid parent code");
+  });
+
+  it("precinct code as parent → error with search_transactions hint", async () => {
+    const result = await client.callTool({ name: "list_locations", arguments: { parent: "321705_2.0054" } });
+    const text = getTextContent(result);
+
+    expect(mockGetLocations).not.toHaveBeenCalled();
+    expect(text).toContain("Invalid parent code");
+    expect(text).toContain("search_transactions(teryt=...)");
+  });
+
+  it("6-digit parent returns precincts", async () => {
+    const precinctItems = [
+      { code: "321705_2.0054", name: "Strączno", typeName: null, level: "precinct" as const },
+      { code: "321705_2.0055", name: "Szwecja", typeName: null, level: "precinct" as const },
+    ];
+    mockGetLocations.mockResolvedValueOnce(withCredits(precinctItems));
+
+    const result = await client.callTool({ name: "list_locations", arguments: { parent: "321705" } });
+    const text = getTextContent(result);
+
+    expect(mockGetLocations).toHaveBeenCalledWith("321705", "test-api-key");
+    expect(text).toContain("precinct");
+    expect(text).toContain("Strączno");
+    expect(text).toContain("search_transactions");
+  });
+
+  it("parent + search → parent takes precedence", async () => {
+    mockGetLocations.mockResolvedValueOnce(withCredits(sampleCounties));
+
+    await client.callTool({ name: "list_locations", arguments: { parent: "14", search: "Krak" } });
+
+    expect(mockGetLocations).toHaveBeenCalledWith("14", "test-api-key");
+    expect(mockGetDistricts).not.toHaveBeenCalled();
+  });
+
+  it("search without parent → legacy flow via getDistricts", async () => {
+    mockGetDistricts.mockResolvedValueOnce(withCredits(["Mokotów", "Kraków-Podgórze"]));
+
+    const result = await client.callTool({ name: "list_locations", arguments: { search: "Krak" } });
+    const text = getTextContent(result);
+
+    expect(mockGetDistricts).toHaveBeenCalled();
+    expect(mockGetLocations).not.toHaveBeenCalled();
+    expect(text).toContain("Kraków-Podgórze");
+    expect(text).not.toContain("Mokotów");
+  });
+});
+
+// ── Tests: search_transactions with teryt ─────────────────────────
+
+describe("search_transactions with teryt", () => {
+  it("passes teryt to getTransactions and getTransactionsSummary", async () => {
+    mockGetTransactions.mockResolvedValueOnce(withCredits(sampleTransactionsResponse));
+    mockGetTransactionsSummary.mockResolvedValueOnce(withCredits(sampleSummary));
+
+    await client.callTool({ name: "search_transactions", arguments: { teryt: "1465" } });
+
+    expect(mockGetTransactions).toHaveBeenCalledWith(
+      expect.objectContaining({ teryt: "1465" }),
+      "test-api-key",
+    );
+    expect(mockGetTransactionsSummary).toHaveBeenCalledWith(
+      expect.objectContaining({ teryt: "1465" }),
+      "test-api-key",
+    );
+  });
+
+  it("passes multi-teryt string as-is", async () => {
+    mockGetTransactions.mockResolvedValueOnce(withCredits(sampleTransactionsResponse));
+    mockGetTransactionsSummary.mockResolvedValueOnce(withCredits(sampleSummary));
+
+    await client.callTool({ name: "search_transactions", arguments: { teryt: "1465,3217" } });
+
+    expect(mockGetTransactions).toHaveBeenCalledWith(
+      expect.objectContaining({ teryt: "1465,3217" }),
+      "test-api-key",
+    );
+  });
+
+  it("combines teryt with other filters", async () => {
+    mockGetTransactions.mockResolvedValueOnce(withCredits(sampleTransactionsResponse));
+    mockGetTransactionsSummary.mockResolvedValueOnce(withCredits(sampleSummary));
+
+    await client.callTool({
+      name: "search_transactions",
+      arguments: { teryt: "1465", propertyType: "unit", minPrice: 500000 },
+    });
+
+    expect(mockGetTransactions).toHaveBeenCalledWith(
+      expect.objectContaining({ teryt: "1465", propertyType: 4, minPrice: 500000 }),
+      "test-api-key",
+    );
+  });
+
+  it("rejects invalid teryt with error (MCP strict)", async () => {
+    const result = await client.callTool({ name: "search_transactions", arguments: { teryt: "garbage" } });
+    const text = getTextContent(result);
+
+    expect(text).toContain("Invalid TERYT code");
+    expect(text).toContain("'garbage'");
+    expect(mockGetTransactions).not.toHaveBeenCalled();
+  });
+
+  it("rejects mixed valid+invalid teryt (MCP strict: any invalid = reject)", async () => {
+    const result = await client.callTool({ name: "search_transactions", arguments: { teryt: "1465,not_a_code" } });
+    const text = getTextContent(result);
+
+    expect(text).toContain("Invalid TERYT code");
+    expect(text).toContain("'not_a_code'");
+    expect(mockGetTransactions).not.toHaveBeenCalled();
+  });
+
+  it("sanitizes HTML in invalid teryt error message", async () => {
+    const result = await client.callTool({ name: "search_transactions", arguments: { teryt: "<script>alert(1)</script>" } });
+    const text = getTextContent(result);
+
+    expect(text).toContain("Invalid TERYT code");
+    expect(text).not.toContain("<script>");
+    expect(mockGetTransactions).not.toHaveBeenCalled();
+  });
+
+  it("accepts all valid teryt formats", async () => {
+    mockGetTransactions.mockResolvedValueOnce(withCredits(sampleTransactionsResponse));
+    mockGetTransactionsSummary.mockResolvedValueOnce(withCredits(sampleSummary));
+
+    const result = await client.callTool({
+      name: "search_transactions",
+      arguments: { teryt: "14,1465,146509,146509_8,146509_8.0501" },
+    });
+    const text = getTextContent(result);
+
+    expect(text).not.toContain("Invalid TERYT");
+    expect(mockGetTransactions).toHaveBeenCalled();
+  });
+
+  it("combines teryt with location", async () => {
+    mockGetTransactions.mockResolvedValueOnce(withCredits(sampleTransactionsResponse));
+    mockGetTransactionsSummary.mockResolvedValueOnce(withCredits(sampleSummary));
+
+    await client.callTool({
+      name: "search_transactions",
+      arguments: { teryt: "1465", location: "Mokotów" },
+    });
+
+    expect(mockGetTransactions).toHaveBeenCalledWith(
+      expect.objectContaining({ teryt: "1465", district: "Mokotów" }),
+      "test-api-key",
+    );
   });
 });
 
