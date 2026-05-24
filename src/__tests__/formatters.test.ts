@@ -11,8 +11,9 @@ import {
   formatParcelResults,
   formatSpatialResults,
   formatCompareResults,
+  formatLocationHierarchy,
 } from "../formatters.js";
-import type { Transaction, TransactionsResponse, StatsResponse, PricePerM2Row, HistogramBin, ParcelSearchResponse, SpatialSearchResponse, SpatialFeature, CompareResponse } from "../api-client.js";
+import type { Transaction, TransactionsResponse, StatsResponse, PricePerM2Row, HistogramBin, ParcelSearchResponse, SpatialSearchResponse, SpatialFeature, CompareResponse, LocationItem } from "../api-client.js";
 
 const sampleTx: Transaction = {
   id: "1",
@@ -79,10 +80,10 @@ describe("formatArea", () => {
 
 describe("formatNumber", () => {
   it("formats with thousand separators", () => {
-    const result = formatNumber(7352087);
-    expect(result).toContain("7");
-    expect(result).toContain("352");
-    expect(result).toContain("087");
+    const result = formatNumber(8194025);
+    expect(result).toContain("8");
+    expect(result).toContain("194");
+    expect(result).toContain("025");
   });
 
   it("handles null", () => {
@@ -135,7 +136,7 @@ describe("formatTransaction", () => {
     expect(result).toContain("Price/m²");
   });
 
-  it("hides parcel_id but shows coordinates (DPIA B3)", () => {
+  it("hides parcel_id but shows coordinates", () => {
     const result = formatTransaction(sampleTx);
     expect(result).not.toContain("146509_8.0501.12");
     expect(result).toContain("52.2317");
@@ -144,8 +145,8 @@ describe("formatTransaction", () => {
 
   it("shows county and voivodeship", () => {
     const result = formatTransaction(sampleTx);
-    expect(result).toContain("pow. Warszawa");
-    expect(result).toContain("woj. mazowieckie");
+    expect(result).toContain("county: Warszawa");
+    expect(result).toContain("voivodeship: mazowieckie");
   });
 
   it("handles null centroid gracefully", () => {
@@ -160,6 +161,31 @@ describe("formatTransaction", () => {
     const result = formatTransaction(noRegionTx);
     expect(result).not.toContain("pow.");
     expect(result).toContain("Mokotów");
+  });
+
+  it("shows village + building number for rural (no street)", () => {
+    const ruralTx: Transaction = {
+      ...sampleTx,
+      street: null,
+      building_number: "47",
+      city: "Karsibór",
+      district: "Karsibór",
+    };
+    const result = formatTransaction(ruralTx);
+    expect(result).toContain("Karsibór 47");
+    expect(result).not.toMatch(/47,\s*Karsibór/);
+  });
+
+  it("shows building number with district when city is null", () => {
+    const ruralNoCity: Transaction = {
+      ...sampleTx,
+      street: null,
+      building_number: "12",
+      city: null,
+      district: "Wałcz",
+    };
+    const result = formatTransaction(ruralNoCity);
+    expect(result).toContain("Wałcz 12");
   });
 });
 
@@ -188,8 +214,8 @@ describe("formatTransactionList", () => {
 
 describe("formatMarketOverview", () => {
   const stats: StatsResponse = {
-    counts: { transactions: 7352087, parcels: 100, buildings: 50, units: 30, addresses: 20 },
-    prices: { total: 7352087, avg_price: 456789, median_price: 280000, min_price: 1, max_price: 999999999 },
+    counts: { transactions: 8194025, parcels: 100, buildings: 50, units: 30, addresses: 20 },
+    prices: { total: 8194025, avg_price: 456789, median_price: 280000, min_price: 1, max_price: 999999999 },
     dateRange: { min_date: "2003-01-02", max_date: "2024-12-31" },
     byDistrict: [{ district: "Warszawa-Mokotów", transaction_count: 312456 }],
     byPropertyType: [{ type: 4, total: 3245678, label: "Lokal" }],
@@ -198,7 +224,7 @@ describe("formatMarketOverview", () => {
 
   it("includes total count", () => {
     // Intl may use non-breaking space as thousand separator
-    expect(formatMarketOverview(stats)).toMatch(/7.?352.?087/);
+    expect(formatMarketOverview(stats)).toMatch(/8.?194.?025/);
   });
 
   it("includes date range", () => {
@@ -282,6 +308,7 @@ describe("formatParcelResults", () => {
     expect(result).toContain("Unknown");
     expect(result).toContain("N/A");
   });
+
 });
 
 describe("formatSpatialResults", () => {
@@ -391,5 +418,96 @@ describe("formatCompareResults", () => {
   it("handles empty response", () => {
     const result = formatCompareResults({});
     expect(result).toContain("No comparison data");
+  });
+});
+
+describe("formatLocationHierarchy", () => {
+  const voivodeships: LocationItem[] = [
+    { code: "02", name: "dolnośląskie", typeName: null, level: "voivodeship" },
+    { code: "14", name: "mazowieckie", typeName: null, level: "voivodeship" },
+  ];
+
+  const counties: LocationItem[] = [
+    { code: "1401", name: "Warszawa", typeName: null, level: "county" },
+    { code: "1402", name: "ciechanowski", typeName: null, level: "county" },
+  ];
+
+  const municipalities: LocationItem[] = [
+    { code: "140101", name: "Warszawa", typeName: "gmina miejska", level: "municipality" },
+    { code: "321705", name: "Wałcz", typeName: "gmina wiejska", level: "municipality" },
+  ];
+
+  const precincts: LocationItem[] = [
+    { code: "321705_2.0054", name: "Strączno", typeName: null, level: "precinct" },
+    { code: "321705_2.0055", name: "Szwecja", typeName: null, level: "precinct" },
+  ];
+
+  it("formats voivodeships without parent", () => {
+    const result = formatLocationHierarchy(voivodeships);
+    expect(result).toContain("Poland");
+    expect(result).toContain("voivodeship");
+    expect(result).toContain("02 - dolnośląskie");
+    expect(result).toContain("14 - mazowieckie");
+    expect(result).toContain("2-digit code");
+  });
+
+  it("formats counties with parent", () => {
+    const result = formatLocationHierarchy(counties, "14");
+    expect(result).toContain("parent: 14");
+    expect(result).toContain("county");
+    expect(result).toContain("1401 - Warszawa");
+    expect(result).toContain("4-digit code");
+  });
+
+  it("formats municipalities with typeName", () => {
+    const result = formatLocationHierarchy(municipalities, "3217");
+    expect(result).toContain("(gmina wiejska)");
+    expect(result).toContain("(gmina miejska)");
+    expect(result).toContain("municipalities");
+  });
+
+  it("formats precincts with search_transactions tip", () => {
+    const result = formatLocationHierarchy(precincts, "321705");
+    expect(result).toContain("precinct");
+    expect(result).toContain("search_transactions");
+    expect(result).not.toContain("browse");
+  });
+
+  it("shows helpful message for empty results with 6-digit parent (leaf)", () => {
+    const result = formatLocationHierarchy([], "321705");
+    expect(result).toContain("No sub-locations");
+    expect(result).toContain("321705");
+    expect(result).toContain("search_transactions");
+  });
+
+  it("does NOT suggest search_transactions for empty 2-digit parent", () => {
+    const result = formatLocationHierarchy([], "00");
+    expect(result).toContain("No sub-locations");
+    expect(result).not.toContain("search_transactions");
+    expect(result).toContain("Verify the code");
+  });
+
+  it("does NOT suggest search_transactions for empty 4-digit parent", () => {
+    const result = formatLocationHierarchy([], "0000");
+    expect(result).toContain("No sub-locations");
+    expect(result).not.toContain("search_transactions");
+    expect(result).toContain("Verify the code");
+  });
+
+  it("shows generic message for empty results without parent", () => {
+    const result = formatLocationHierarchy([]);
+    expect(result).toBe("No locations available.");
+  });
+
+  it("uses first item level for header when items have mixed levels", () => {
+    const mixed: LocationItem[] = [
+      { code: "1401", name: "Warszawa", typeName: null, level: "county" },
+      { code: "140101", name: "Warszawa", typeName: "gmina miejska", level: "municipality" },
+    ];
+    const result = formatLocationHierarchy(mixed, "14");
+    expect(result).toContain("level: county");
+    expect(result).toContain("counties");
+    expect(result).toContain("1401 - Warszawa");
+    expect(result).toContain("140101 - Warszawa");
   });
 });

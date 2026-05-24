@@ -1,7 +1,7 @@
 {
   "name": "@cenogram/mcp-server",
-  "version": "0.1.7",
-  "description": "MCP Server for Polish real estate transaction data (7M+ transactions from RCN)",
+  "version": "0.2.0",
+  "description": "MCP Server for Polish real estate transaction data (8M+ transactions from RCN)",
   "type": "module",
   "bin": {
     "cenogram-mcp": "./dist/index.js"
@@ -20,6 +20,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.28.0",
+    "jose": "^6.2.3",
     "undici": "^5.29.0",
     "zod": "^3.24.0"
   },
