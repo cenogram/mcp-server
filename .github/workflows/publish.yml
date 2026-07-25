@@ -16,8 +16,9 @@ jobs:
           node-version: 24
           registry-url: https://registry.npmjs.org
       - run: npm ci
-      - run: npm test
+      # Build first: part of the suite only runs against dist/, and skips itself when it is absent.
       - run: npm run build
+      - run: npm test
       - name: Verify tag matches package version
         run: |
           PKG_VERSION=$(node -p "require('./package.json').version")

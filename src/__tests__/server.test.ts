@@ -1,22 +1,110 @@
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from "vitest";
 import { spawn, type ChildProcess } from "node:child_process";
-import { symlinkSync, unlinkSync, existsSync } from "node:fs";
+import { symlinkSync, unlinkSync, existsSync, readFileSync, readdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createServer } from "node:net";
 import { fetch } from "undici";
 import { generateKeyPair, exportSPKI, SignJWT } from "jose";
 import type { CryptoKey } from "jose";
-import { createMcpServer } from "../index.js";
+import { createMcpServer, serverInstructions } from "../index.js";
+import { signupUrl } from "../error-messages.js";
 import { startStubApi, type StubApi } from "./fixtures/stub-api.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const distIndex = join(__dirname, "..", "..", "dist", "index.js");
+
+// Ask the kernel for a genuinely-free port instead of guessing a random one
+// (Math.random ranges collided under load → EADDRINUSE). The two HTTP describe
+// blocks run sequentially within this single file (vitest doesn't parallelise
+// describe blocks in one file, no .concurrent here), so the close→spawn window
+// of one never overlaps the other → no TOCTOU within the run.
+async function getFreePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const srv = createServer();
+    srv.unref();
+    srv.on("error", reject);
+    srv.listen(0, "127.0.0.1", () => {
+      const addr = srv.address();
+      if (addr && typeof addr === "object") {
+        const { port } = addr;
+        srv.close(() => resolve(port));
+      } else {
+        srv.close(() => reject(new Error("could not acquire a free port")));
+      }
+    });
+  });
+}
+
+// Kill a spawned server and WAIT for the OS to actually reap it, so the kernel
+// releases the bound port before the next describe block binds. Guards against a
+// process that already exited (exit event would never re-fire → hung promise) and
+// caps the wait so a stuck process can't wedge the suite.
+async function killAndWait(p: ChildProcess | undefined): Promise<void> {
+  if (!p || p.killed || p.exitCode !== null || p.signalCode !== null) return;
+  p.kill("SIGTERM");
+  await Promise.race([
+    new Promise<void>((r) => p.once("exit", () => r())),
+    new Promise<void>((r) => setTimeout(r, 5000)),
+  ]);
+}
 
 describe("createMcpServer", () => {
   it("returns server with correct name and version", () => {
     const server = createMcpServer("test-key");
     expect(server).toBeDefined();
     // Server is created without throwing
+  });
+});
+
+// Every cenogram.pl link we hand a client carries a `?src=` tag that must match the active
+// transport. Both transports serve the same source text, so a tag written as a literal is silently
+// wrong for one of them - invisible at runtime, hence asserted here rather than described in a
+// comment next to the link.
+describe("channel attribution", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it("tags links as stdio when no HTTP transport is set", () => {
+    expect(serverInstructions()).toContain("?src=mcpstdio");
+    expect(signupUrl()).toContain("?src=mcpstdio");
+  });
+
+  it("tags links as hosted HTTP, with no stdio tag left behind", () => {
+    vi.stubEnv("MCP_TRANSPORT", "http");
+    const instructions = serverInstructions();
+    expect(instructions).toContain("?src=mcphttp");
+    expect(instructions).not.toContain("mcpstdio");
+    expect(signupUrl()).toBe("https://cenogram.pl/api?src=mcphttp");
+  });
+
+  // The two tests above only cover the links they name, and the first version of this fix tagged
+  // exactly those, and four other links to the same page kept going out untagged. So this one asks
+  // the opposite question — find every cenogram.pl link in the package and demand a tag — because a
+  // test that names the links it checks can only ever confirm the ones somebody already thought of.
+  it("every cenogram.pl link handed to a client carries a channel tag", () => {
+    // Nothing anyone lands on from a link we emit, so a tag would measure nothing:
+    //   /ustawienia - behind a login, only ever shown to someone already registered
+    //   apple-touch-icon.png - an asset in OAuth metadata, never navigated to
+    // (The bare origin needs no exemption: the pattern below requires a path.)
+    const EXEMPT = [/\/ustawienia\b/, /apple-touch-icon/];
+    // Every source file, not a list of the ones that have a link today - a new file with a new
+    // link is the case this test is for, and it would be the one case a fixed list misses.
+    const srcDir = join(__dirname, "..");
+    const sources = readdirSync(srcDir).filter((f) => f.endsWith(".ts"));
+
+    const untagged: string[] = [];
+    for (const file of sources) {
+      const text = readFileSync(join(srcDir, file), "utf8");
+      // Stops at whitespace, a quote or a backtick — i.e. at the end of the literal, so a URL
+      // built from a `${...}` expression is captured with the expression intact.
+      for (const [url] of text.matchAll(/https:\/\/cenogram\.pl\/[^\s"'`,)]+/g)) {
+        if (EXEMPT.some((re) => re.test(url))) continue;
+        if (!url.includes("src=")) untagged.push(`${file}: ${url}`);
+      }
+    }
+    expect(untagged, `cenogram.pl links with no ?src= tag:\n${untagged.join("\n")}`).toEqual([]);
   });
 });
 
@@ -53,7 +141,7 @@ describe.skipIf(!hasDistBuild)("stdio server via symlink (npx scenario)", () => 
 
     const readResponse = () =>
       new Promise<object>((resolve, reject) => {
-        const timeout = setTimeout(() => reject(new Error("Timeout waiting for server response")), 5000);
+        const timeout = setTimeout(() => reject(new Error("Timeout waiting for server response")), 20000);
         proc.stdout!.on("data", (chunk: Buffer) => {
           buffer += chunk.toString();
           // MCP responses are newline-delimited JSON
@@ -82,7 +170,7 @@ describe.skipIf(!hasDistBuild)("stdio server via symlink (npx scenario)", () => 
   }
 
   it("responds to initialize when run directly", async () => {
-    const { send, readResponse, kill } = spawnServer(distIndex);
+    const { proc, send, readResponse } = spawnServer(distIndex);
     try {
       send({
         jsonrpc: "2.0",
@@ -101,12 +189,16 @@ describe.skipIf(!hasDistBuild)("stdio server via symlink (npx scenario)", () => 
       expect(response.id).toBe(1);
       expect(serverInfo.name).toBe("cenogram-mcp-server");
     } finally {
-      kill();
+      await killAndWait(proc);
     }
-  });
+    // 30s timeout: spawn (node boot + dist load) under pre-push load (run_all.sh
+    // oversubscribes cores with 6+ suites) can exceed the 5s default; must also clear
+    // readResponse's internal 20s timeout (above) with a buffer. Mitigation, not a
+    // contention fix (serialization = out of scope).
+  }, 30000);
 
   it("responds to initialize when run via symlink (like npx)", async () => {
-    const { send, readResponse, kill } = spawnServer(symlinkPath);
+    const { proc, send, readResponse } = spawnServer(symlinkPath);
     try {
       send({
         jsonrpc: "2.0",
@@ -125,9 +217,9 @@ describe.skipIf(!hasDistBuild)("stdio server via symlink (npx scenario)", () => 
       expect(response.id).toBe(1);
       expect(serverInfo.name).toBe("cenogram-mcp-server");
     } finally {
-      kill();
+      await killAndWait(proc);
     }
-  });
+  }, 30000); // see timeout note above (spawn under pre-push load > 5s, > internal 20s)
 
   it("exits with error when CENOGRAM_API_KEY is missing", async () => {
     const proc = spawn(process.execPath, [distIndex], {
@@ -140,14 +232,17 @@ describe.skipIf(!hasDistBuild)("stdio server via symlink (npx scenario)", () => 
     });
 
     expect(exitCode).toBe(1);
-  });
+  }, 30000); // see timeout note above (process spawn under pre-push load > 5s default)
 });
 
 describe.skipIf(!hasDistBuild)("HTTP mode auth dispatch (E2E spawn)", () => {
   let proc: ChildProcess;
   let port: number;
 
-  async function waitForPort(p: number, timeoutMs = 5000): Promise<void> {
+  // 20s: node boot under pre-push load (6 suites oversubscribing 8 cores) can exceed
+  // the old 5s. The loop polls /health (readiness, not a fixed sleep) so a fast boot
+  // still returns immediately; the larger budget only matters when the box is thrashing.
+  async function waitForPort(p: number, timeoutMs = 20000): Promise<void> {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       try {
@@ -162,7 +257,7 @@ describe.skipIf(!hasDistBuild)("HTTP mode auth dispatch (E2E spawn)", () => {
   }
 
   beforeAll(async () => {
-    port = 33000 + Math.floor(Math.random() * 1000);
+    port = await getFreePort();
     proc = spawn(process.execPath, [distIndex], {
       env: {
         ...process.env,
@@ -174,10 +269,10 @@ describe.skipIf(!hasDistBuild)("HTTP mode auth dispatch (E2E spawn)", () => {
       stdio: ["pipe", "pipe", "pipe"],
     });
     await waitForPort(port);
-  }, 10_000);
+  }, 30_000);
 
-  afterAll(() => {
-    if (proc && !proc.killed) proc.kill("SIGTERM");
+  afterAll(async () => {
+    await killAndWait(proc);
   });
 
   it("/health returns 200 ok", async () => {
@@ -227,7 +322,8 @@ describe.skipIf(!hasDistBuild)("HTTP mode E2E (JWT + stub upstream)", () => {
   const KID = "test-kid";
   let stderrBuf = "";
 
-  async function waitForPort(p: number, timeoutMs = 8000): Promise<void> {
+  // 20s: see the auth block's waitForPort — boot under pre-push CPU load.
+  async function waitForPort(p: number, timeoutMs = 20000): Promise<void> {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       try {
@@ -264,7 +360,7 @@ describe.skipIf(!hasDistBuild)("HTTP mode E2E (JWT + stub upstream)", () => {
     stub = await startStubApi();
 
     // 3. Spawn MCP HTTP with OAuth + stub URL
-    port = 34000 + Math.floor(Math.random() * 1000);
+    port = await getFreePort();
     proc = spawn(process.execPath, [distIndex], {
       env: {
         ...process.env,
@@ -279,10 +375,10 @@ describe.skipIf(!hasDistBuild)("HTTP mode E2E (JWT + stub upstream)", () => {
     });
     proc.stderr?.on("data", (chunk: Buffer) => { stderrBuf += chunk.toString("utf-8"); });
     await waitForPort(port);
-  }, 15_000);
+  }, 30_000);
 
   afterAll(async () => {
-    if (proc && !proc.killed) proc.kill("SIGTERM");
+    await killAndWait(proc);
     if (stub) await stub.close();
   });
 
@@ -349,12 +445,14 @@ describe.skipIf(!hasDistBuild)("HTTP mode E2E (JWT + stub upstream)", () => {
       expectInText: ["Connection to Cenogram expired", "Connectors > Cenogram", "disconnect and reconnect"],
     },
     {
-      name: "503: maintenance mode EN",
+      // Body-less 503, so there is nothing to relay and the generic wording applies. It no
+      // longer claims "maintenance": a 503 is just as often a disabled feature or a failover.
+      name: "503: temporarily unavailable EN",
       setScenario: () => stub.setScenarios({
         byBearerToken: { "cngrm_test_503": { status: 503 } },
       }),
       auth: "Bearer cngrm_test_503",
-      expectInText: ["unavailable", "maintenance", "Try again"],
+      expectInText: ["unavailable", "Try again"],
     },
     {
       name: "403 email_not_verified: inbox check EN",

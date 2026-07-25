@@ -29,7 +29,7 @@ let cachedKid: string | undefined;
 
 async function getKeyPair(): Promise<{ key: CryptoKey; kid: string }> {
   const kid = process.env.OAUTH_JWT_KID;
-  const pem = (process.env.OAUTH_JWT_PUBLIC_KEY ?? "").replace(/\\\\n|\\n/g, "\n");
+  const pem = (process.env.OAUTH_JWT_PUBLIC_KEY ?? "").replace(/\\+n/g, "\n");
   if (!kid || !pem) throw new OAuthConfigError();
   if (cachedKey && cachedKid === kid) return { key: cachedKey, kid };
   cachedKey = await importSPKI(pem, "RS256");

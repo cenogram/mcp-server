@@ -1,7 +1,7 @@
 {
   "name": "@cenogram/mcp-server",
-  "version": "0.2.0",
-  "description": "MCP Server for Polish real estate transaction data (8M+ transactions from RCN)",
+  "version": "0.5.0",
+  "description": "MCP server for Polish property prices from notarial deeds, not listings - 8M+ transactions from the RCN registry",
   "type": "module",
   "bin": {
     "cenogram-mcp": "./dist/index.js"
@@ -16,10 +16,11 @@
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "check": "tsc --noEmit && eslint .",
-    "prepublishOnly": "npm run lint && npm run test && npm run build"
+    "prepublishOnly": "npm run lint && npm run build && npm run test"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.28.0",
+    "@sentry/node": "^10.54.0",
     "jose": "^6.2.3",
     "undici": "^5.29.0",
     "zod": "^3.24.0"
@@ -36,12 +37,19 @@
   "mcpName": "pl.cenogram/mcp-server",
   "keywords": [
     "mcp",
-    "real-estate",
     "poland",
-    "rcn",
-    "nieruchomosci",
+    "europe",
+    "government-data",
+    "official-registry",
+    "public-records",
+    "real-estate",
     "property",
-    "transactions"
+    "property-data",
+    "transactions",
+    "transaction-data",
+    "geospatial",
+    "rcn",
+    "nieruchomosci"
   ],
   "license": "MIT",
   "publishConfig": {

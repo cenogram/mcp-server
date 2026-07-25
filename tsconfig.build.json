@@ -1,4 +1,9 @@
 {
   "extends": "./tsconfig.json",
+  // Comments survive compilation into dist/, and dist/ is what npm ships. A note written for
+  // whoever maintains this file then travels to every machine that installs the package.
+  "compilerOptions": {
+    "removeComments": true
+  },
   "exclude": ["src/**/*.test.ts", "src/__tests__"]
 }

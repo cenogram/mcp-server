@@ -1,6 +1,13 @@
 node_modules/
 dist/
 *.tsbuildinfo
+# The leak-guard skips node_modules/, dist/, coverage/ and .turbo/ on the strength of the rules in
+# THIS file — the four rules above and below, wherever they sit. Remove one and the guard keeps
+# skipping the directory while git starts committing it. A test enforces the pairing; heed it.
+coverage/
+.turbo/
+# Holds absolute paths of the machine that ran the lint — must not travel with this directory.
+.eslintcache
 .env
 .env.*
 !.env.example
