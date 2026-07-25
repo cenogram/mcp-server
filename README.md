@@ -8,11 +8,11 @@
 
 MCP server for Polish real estate data. Access 8M+ real estate transactions from the national Registry of Prices and Values (Rejestr Cen Nieruchomosci, RCN) directly from Claude, Cursor, or any MCP-compatible AI assistant.
 
-Data source: Polish national RCN registry (Rejestr Cen Nieruchomosci) | Platform: [cenogram.pl](https://cenogram.pl)
+Data source: Polish national RCN registry (Rejestr Cen Nieruchomosci) | Platform: [cenogram.pl](https://cenogram.pl?src=mcpstdio)
 
 ## Get your API key
 
-1. Go to [cenogram.pl/api](https://cenogram.pl/api)
+1. Go to [cenogram.pl/api](https://cenogram.pl/api?src=mcpstdio)
 2. Enter your email
 3. You'll receive your `cngrm_...` API key by email
 
@@ -176,13 +176,17 @@ Requires **Node.js >= 18**. Use this if you want to run the server locally inste
 
 | Env Variable | Required | Default | Description |
 |---|---|---|---|
-| `CENOGRAM_API_KEY` | **Yes** (stdio) | - | API key from [cenogram.pl/api](https://cenogram.pl/api) |
+| `CENOGRAM_API_KEY` | **Yes** (stdio) | - | API key from [cenogram.pl/api](https://cenogram.pl/api?src=mcpstdio) |
 | `CENOGRAM_API_URL` | No | `https://cenogram.pl` | API base URL |
 | `MCP_TRANSPORT` | No | `stdio` | Set to `http` for Streamable HTTP mode |
 | `MCP_PORT` | No | `3002` | HTTP server port (HTTP mode only) |
 | `CENOGRAM_CLIENT_ID` | No | auto-generated | Persistent client identifier |
 
 You can also use the `--http` CLI flag instead of `MCP_TRANSPORT=http`.
+
+## Tips
+
+- **Model selection**: For best results, use Claude **Opus 4.7**. It makes more sequential tool calls and produces richer analysis. You can switch the model in the dropdown at the bottom of the chat window.
 
 ## Example Prompts
 
@@ -215,12 +219,27 @@ You can also use the `--http` CLI flag instead of `MCP_TRANSPORT=http`.
 | `search_parcels` | Search parcels by cadastral ID prefix | q (parcel ID prefix, min 3 chars) |
 | `search_by_polygon` | Search within a GeoJSON polygon | polygon, propertyType, dateFrom/dateTo |
 | `compare_locations` | Compare stats across 2-5 districts | districts (comma-separated), propertyType |
+| `get_building_breakdown` | Per-building breakdown for one transaction (footprint, storeys, est. floor area) | transaction_id (UUID from a search result) |
+| `get_parcel_report` | Composite dossier for one parcel: core, 9 enrichment layers, transaction history, local price context and municipal context | parcelId (cadastral id or UUID) |
+| `resolve_parcel` | Resolve a cadastral parcel identifier to its canonical record | parcelId or q (id prefix), or lat + lng |
+| `get_demographics` | Population and demographic context for a location | location or teryt, year (or yearFrom/yearTo), category |
+| `get_infrastructure_signals` | Municipal infrastructure signals (tenders, utilities, capital spending) | location or teryt |
+| `estimate_value` | Comparable-sales value estimate for a property | area, plus lat + lng or parcelId; rooms, market |
+| `get_transaction_flood` | Flood risk for the property in a transaction | transaction_id (UUID from a search result) |
+| `get_transaction_heritage` | Heritage-register status for the property | transaction_id |
+| `get_transaction_landslide` | Landslide risk for the property | transaction_id |
+| `get_transaction_surroundings` | Nuisance and land-use context around the property | transaction_id |
+| `get_transaction_transit` | Public transport accessibility for the property | transaction_id |
+| `get_transaction_permits` | Building permits recorded for the property | transaction_id |
+| `get_transaction_planning` | Local zoning and planning status for the property | transaction_id |
+| `get_transaction_farmland` | Agricultural land-use classification for the property | transaction_id |
 
 ### Location naming
 
 - Most cities: use the city name directly (e.g., "Gdansk", "Lublin")
-- Warsaw: use district names ("Mokotow", "Srodmiescie", "Wola") -- "Warszawa" won't match
-- Krakow: use sub-districts ("Krakow-Podgorze", "Krakow-Srodmiescie") - plain "Krakow" won't match
+- Warsaw: "Warszawa" covers all 18 districts at once; name one ("Mokotow", "Srodmiescie", "Wola") to narrow it down
+- Krakow and Lodz work the same way: the city name covers every sub-district, or name one ("Krakow-Podgorze")
+- Neighbourhood names are not administrative units - search by radius or polygon instead
 - Use `list_locations` to find valid names
 
 ### Property types
@@ -258,7 +277,7 @@ This mimics how a property appraiser finds comparable transactions for valuation
 
 **npx hangs or fails** - Check your Node.js version with `node -v`. The stdio mode requires Node.js >= 18. If you're on an older version, use the HTTP remote option instead (no Node.js needed).
 
-**"Warszawa" returns 0 results** - Warsaw uses district names (Mokotow, Wola, Srodmiescie, Bemowo, etc.). Use `list_locations(search="warsz")` to find valid names. Same applies to Krakow (use "Krakow-Podgorze", "Krakow-Srodmiescie", etc.).
+**A location returns 0 results** - The name may not be an administrative unit. Districts and neighbourhoods are two different things: "Mokotow" is a district and works, "Sluzew" is a neighbourhood inside it and does not. Use `list_locations(search="...")` to find valid names, or search by radius (`search_by_area`) for anything smaller than a district.
 
 **401 Unauthorized (HTTP mode)** - The `Authorization` header must be `Bearer cngrm_...` (with the `Bearer` prefix). Double-check that the full API key is included, not just the prefix.
 

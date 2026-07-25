@@ -1,13 +1,16 @@
 #!/usr/bin/env node
+import { Sentry } from "./sentry.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { readFileSync, realpathSync } from "node:fs";
 import { fetch } from "undici";
-import { registerTools } from "./tools.js";
+import { registerTools, experimentalToolsEnabled } from "./tools.js";
 import { dispatchAuth, sanitizeForLog } from "./auth-dispatch.js";
 import { requestContext } from "./request-context.js";
+import { signupUrl } from "./error-messages.js";
+import { channelSrc, isHttpMode } from "./transport-mode.js";
 
 function logAuth(payload: Record<string, unknown>, level: "info" | "warn" | "error"): void {
   process.stderr.write(JSON.stringify({ level, ...payload }) + "\n");
@@ -33,38 +36,62 @@ try {
 
 // ── Server factory ──────────────────────────────────────────────────
 
+/**
+ * What every client is told before it calls a tool.
+ *
+ * Built per call rather than held in a constant, because the `?src=` tags below follow the
+ * transport. Exported so a test can read the text back — both transports share every line of it
+ * except those tags, so a tag written as a literal is silently wrong for one of them.
+ */
+export function serverInstructions(): string {
+  return [
+    "Cenogram MCP Server - 8M+ verified real estate transactions from Poland's official RCN registry (Rejestr Cen Nieruchomości). Transaction prices from notarial deeds - NOT asking/listing prices. Data from 2003 to present, 380 counties, refreshed every ~2 weeks.",
+    "",
+    "CRITICAL - District names (ALWAYS verify first):",
+    "- NEVER guess district names. Call list_locations(search=\"city\") first.",
+    "- Warsaw: 'Warszawa' auto-includes all 18 districts. Or use specific: Mokotów, Wola, Śródmieście",
+    "- Kraków/Łódź: 'Kraków'/'Łódź' auto-include all sub-districts. Or use specific: Kraków-Podgórze, etc.",
+    "- Most cities (Gdańsk, Gdynia, Sopot, Poznań, Wrocław): just the city name, no sub-districts",
+    "- Neighborhoods/osiedla (Nowy Dwór, Oliwa, Jeżyce) are NOT TERYT districts. Start with search_by_area (radiusKm 0.5-1.0), then refine with search_by_polygon if needed.",
+    "- TERYT hierarchy: For precise administrative filtering (avoids name ambiguity), use list_locations(parent) to browse TERYT codes, then search_transactions(teryt=code).",
+    "- Use 'location' for quick city searches, 'teryt' when you need exact administrative boundaries.",
+    "",
+    "Workflows:",
+    "- Market analysis: get_market_overview → get_price_statistics(location) → search_transactions",
+    // Only documented when those tools are actually registered.
+    ...(experimentalToolsEnabled()
+      ? [
+          "- Rental yield: (experimental - may change/withdraw) list_rental_yield_locations (catalog of covered cities) → get_rental_yield(location|teryt) - indicative gross yield from asking rent vs RCN transaction prices. County level only (miasta na prawach powiatu), or Warszawa district via 6-digit teryt. For any name that is not a major city you know is covered, call the catalog FIRST or pass a county teryt - towns inside a larger powiat and non-Warszawa districts 404.",
+          "- Price spread: (experimental - may change/withdraw) list_price_spread_locations (catalog of covered cities) → get_price_spread(location|teryt) - asking-vs-transaction price spread %, marketType all|secondary|primary. County level only (miasta na prawach powiatu), or Warszawa district via 6-digit teryt. For any name that is not a major city you know is covered, call the catalog FIRST or pass a county teryt - towns inside a larger powiat and non-Warszawa districts 404.",
+        ]
+      : []),
+    "- Compare locations: list_locations → compare_locations (2-5 districts, requires at least one filter e.g. propertyType). Add includeDemographics=true for a GUS BDL block per district.",
+    "- Demographics & local stats: get_demographics(location|teryt) — GUS BDL indicators (population, economy, housing, planning, safety, education, prices). A city name resolves to county level; pass a 6/7-digit teryt for gmina-level detail.",
+    "- Parcel lookup: search_parcels(q, min 3 chars) → search_by_area (use returned lat/lng)",
+    "- Parcel resolve: resolve_parcel(parcelId | q | lat+lng) — turn a full parcel id, a UUID, a 'locality name + parcel number', or a coordinate into a concrete parcel; feed the returned id to search_transactions(parcelId) for its sale history.",
+    "- Per-building detail: search_transactions → get_building_breakdown(transaction_id) — footprint, storeys, est. total floor area per building (searches return per-transaction sums inline)",
+    "- Surroundings (nearby nuisances): search_transactions → get_transaction_surroundings(transaction_id) — per-plot distance to the nearest cemetery, landfill, sewage treatment plant, industrial/storage area, large industrial plant, and intensive livestock farm. A null distance = nothing within the search radius in reference data, never a guarantee.",
+    "- Address search: search_transactions(location, street, buildingNumber)",
+    "- Radius search: search_by_area(lat, lng, radiusKm) - for geographic proximity",
+    "- Polygon search: search_by_polygon - coordinates are [longitude, latitude], first=last point, max 500 vertices",
+    "- TERYT drill-down: list_locations() → list_locations(parent=voivodeshipCode) → list_locations(parent=countyCode) → search_transactions(teryt=municipalityCode)",
+    "",
+    "Data notes:",
+    "- Median/average prices are market-based: fractional ownership shares (share_basis=\"fraction\") and non-market deeds (public tenders, foreclosures, privileged/subsidized sales) are excluded from price aggregates. Transaction counts and coverage stay full. search_transactions/search_by_area flag fractional-share rows so you can spot which comparables are partial.",
+    "- price_per_m2 only meaningful for apartments (propertyType=\"unit\")",
+    "- Field provenance (search_transactions/search_by_area/search_by_polygon): per-record values are from the notarial deed (RCN) by default and carry no marker. Values we computed (parcel area summed across plots or converted from hectares; an inferred or reclassified property type) and approximated streets are flagged inline with a neutral [...] note — mirroring the \"Z RCN / Obliczone / Uzupełnione\" tiers on cenogram.pl. A field being absent from a result does NOT mean the deed omitted it: the county may simply not report that field.",
+    "- Rooms (izby) filter: search_transactions/search_by_area/search_by_polygon/compare_locations accept `rooms` (array, e.g. [\"2\",\"3\"]; \"8plus\" = 8 or more). Units only (propertyType=\"unit\"); rows with no room count are excluded. NOTE: RCN counts izby (chambers - a kitchen counts as one izba), so values run higher than portal \"pokoje\" listings.",
+    "- Floor (piętro) filter: the same tools accept `floor` (array, e.g. [\"0\",\"1\",\"2\"]; \"0\" = ground/parter, negatives = basement, \"10plus\" = 10 or more, \"0plus\" = ground and above, \"unknown\" = no floor recorded). Units only; this is the unit's floor, NOT the number of building storeys. Rows with no floor are excluded unless \"unknown\" is included.",
+    "- Results paginated (default 10-20). Use page parameter for more.",
+    `- For §79-compliant export table or interactive map - direct user to https://cenogram.pl/ceny-transakcyjne?src=${channelSrc()}`,
+    `- Deep link / permalink to the map: from a transaction's \`id\` and its \`Location: <A>°N, <B>°E\` line, build https://cenogram.pl/ceny-transakcyjne?src=${channelSrc()}#v=1&lat=<A>&lng=<B>&z=16&tx=<id> (drop the °N/°E; lat = the °N number, lng = the °E number) — opens that exact transaction on the map. Omit &tx=<id> for a link centered on the area without a specific row open.`,
+  ].join("\n");
+}
+
 export function createMcpServer(apiKey?: string): McpServer {
   const server = new McpServer(
     { name: "cenogram-mcp-server", version: PKG_VERSION },
-    {
-      instructions: [
-        "Cenogram MCP Server - 8M+ verified real estate transactions from Poland's official RCN registry (Rejestr Cen Nieruchomości). Transaction prices from notarial deeds - NOT asking/listing prices. Data from 2003 to present, 380 counties, refreshed every ~2 weeks.",
-        "",
-        "CRITICAL - District names (ALWAYS verify first):",
-        "- NEVER guess district names. Call list_locations(search=\"city\") first.",
-        "- Warsaw: 'Warszawa' auto-includes all 18 districts. Or use specific: Mokotów, Wola, Śródmieście",
-        "- Kraków/Łódź: 'Kraków'/'Łódź' auto-include all sub-districts. Or use specific: Kraków-Podgórze, etc.",
-        "- Most cities (Gdańsk, Gdynia, Sopot, Poznań, Wrocław): just the city name, no sub-districts",
-        "- Neighborhoods/osiedla (Nowy Dwór, Oliwa, Jeżyce) are NOT TERYT districts. Start with search_by_area (radiusKm 0.5-1.0), then refine with search_by_polygon if needed.",
-        "- TERYT hierarchy: For precise administrative filtering (avoids name ambiguity), use list_locations(parent) to browse TERYT codes, then search_transactions(teryt=code).",
-        "- Use 'location' for quick city searches, 'teryt' when you need exact administrative boundaries.",
-        "",
-        "Workflows:",
-        "- Market analysis: get_market_overview → get_price_statistics(location) → search_transactions",
-        "- Compare locations: list_locations → compare_locations (2-5 districts, requires at least one filter e.g. propertyType)",
-        "- Parcel lookup: search_parcels(q, min 3 chars) → search_by_area (use returned lat/lng)",
-        "- Address search: search_transactions(location, street, buildingNumber)",
-        "- Radius search: search_by_area(lat, lng, radiusKm) - for geographic proximity",
-        "- Polygon search: search_by_polygon - coordinates are [longitude, latitude], first=last point, max 500 vertices",
-        "- TERYT drill-down: list_locations() → list_locations(parent=voivodeshipCode) → list_locations(parent=countyCode) → search_transactions(teryt=municipalityCode)",
-        "",
-        "Data notes:",
-        "- price_per_m2 only meaningful for apartments (propertyType=\"unit\")",
-        "- API has no rooms filter - use area as proxy (1-room: 20-35m², 2: 35-55m², 3: 55-90m², 4+: 80-130m²), then post-filter by rooms field in results",
-        "- Results paginated (default 10-20). Use page parameter for more.",
-        "- For §79-compliant export table or interactive map - direct user to cenogram.pl",
-      ].join("\n"),
-    },
+    { instructions: serverInstructions() },
   );
   registerTools(server, apiKey);
   return server;
@@ -73,7 +100,7 @@ export function createMcpServer(apiKey?: string): McpServer {
 // ── Start ───────────────────────────────────────────────────────────
 
 async function main() {
-  const mode = process.argv.includes("--http") || process.env.MCP_TRANSPORT === "http" ? "http" : "stdio";
+  const mode = isHttpMode() ? "http" : "stdio";
 
   if (mode === "http") {
     const { createServer } = await import("node:http");
@@ -178,6 +205,7 @@ async function main() {
           res.writeHead(404).end();
         }
       } catch (err) {
+        Sentry.captureException(err, { tags: { error_layer: "http_handler" } });
         process.stderr.write(`HTTP error: ${String(err)}\n`);
         if (!res.headersSent) {
           res.writeHead(500, { "Content-Type": "application/json" }).end(
@@ -198,7 +226,7 @@ async function main() {
     if (!process.env.CENOGRAM_API_KEY) {
       process.stderr.write(
         "Error: CENOGRAM_API_KEY is required.\n" +
-        "Get your free API key at https://cenogram.pl/api\n" +
+        `Get your free API key at ${signupUrl()}\n` +
         "Then add it to your MCP config:\n" +
         '  "env": { "CENOGRAM_API_KEY": "cngrm_..." }\n',
       );
@@ -210,7 +238,13 @@ async function main() {
 }
 
 if (process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  main().catch((err) => {
+  process.on("SIGTERM", () => {
+    void Sentry.flush(2000).then(() => process.exit(0));
+  });
+
+  main().catch(async (err) => {
+    Sentry.captureException(err, { tags: { error_layer: "fatal" } });
+    await Sentry.flush(2000);
     process.stderr.write(`Fatal: ${String(err)}\n`);
     process.exit(1);
   });

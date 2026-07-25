@@ -2,8 +2,8 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "pl.cenogram/mcp-server",
   "title": "Cenogram - Polish Real Estate Data",
-  "description": "8M+ real estate transactions from Poland's RCN registry. Search, compare, and analyze prices.",
-  "version": "0.2.0",
+  "description": "Polish property prices from notarial deeds, not listings - 8M+ transactions from the RCN registry.",
+  "version": "0.5.0",
   "websiteUrl": "https://cenogram.pl",
   "repository": {
     "url": "https://github.com/cenogram/mcp-server",
@@ -13,7 +13,7 @@
     {
       "registryType": "npm",
       "identifier": "@cenogram/mcp-server",
-      "version": "0.2.0",
+      "version": "0.5.0",
       "transport": {
         "type": "stdio"
       },

@@ -1,0 +1,17 @@
+node_modules
+dist
+*.log
+.git
+.gitignore
+.github
+.claude
+.env
+.env.*
+README.md
+CONTRIBUTING.md
+SECURITY.md
+LICENSE
+server.json
+src/__tests__
+src/**/*.test.ts
+eslint.config.js

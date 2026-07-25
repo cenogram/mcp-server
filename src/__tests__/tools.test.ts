@@ -2,11 +2,17 @@ import { describe, it, expect } from "vitest";
 import {
   mapPropertyType,
   mapMarketType,
+  mapUnitFunction,
+  mapBuildingType,
+  mapOwnershipTypes,
+  mapTransactionTypes,
   radiusKmToBbox,
   filterByLocation,
   PROPERTY_TYPES,
   MARKET_TYPES,
+  resolveDistrict,
 } from "../mappings.js";
+import { encodeOAuthCtx, decodeOAuthCtx, OAUTH_CTX_PREFIX } from "../api-client.js";
 
 describe("mapPropertyType", () => {
   it("maps 'unit' to 4", () => {
@@ -118,7 +124,7 @@ describe("filterByLocation", () => {
     expect(filterByLocation("GDAŃSK", districts)).toEqual(["Gdańsk"]);
   });
 
-  it("'Warszawa' does NOT match Warsaw districts", () => {
+  it("'Warszawa' does not match Warsaw districts (filterByLocation is substring only)", () => {
     const result = filterByLocation("Warszawa", districts);
     expect(result).toEqual([]);
   });
@@ -129,6 +135,41 @@ describe("filterByLocation", () => {
 
   it("matches district name directly", () => {
     expect(filterByLocation("Mokotów", districts)).toEqual(["Mokotów"]);
+  });
+});
+
+describe("resolveDistrict", () => {
+  const allDistricts = [
+    "Warszawa", "Bemowo", "Białołęka", "Bielany", "Mokotów", "Ochota",
+    "Praga-Południe", "Praga-Północ", "Rembertów", "Śródmieście", "Targówek",
+    "Ursus", "Ursynów", "Wawer", "Wesoła", "Wilanów", "Włochy", "Wola", "Żoliborz",
+    "Kraków", "Kraków-Krowodrza", "Kraków-Nowa Huta", "Kraków-Podgórze", "Kraków-Śródmieście",
+    "Łódź", "Łódź-Bałuty", "Łódź-Górna", "Łódź-Polesie", "Łódź-Śródmieście", "Łódź-Widzew",
+    "Gdańsk", "Wrocław",
+  ];
+
+  it("resolves 'Krakow' (no diacritics) to 5 sub-districts", () => {
+    expect(resolveDistrict("Krakow", allDistricts)).toHaveLength(5);
+  });
+
+  it("resolves 'warszawa' (lowercase) to 19 sub-districts", () => {
+    expect(resolveDistrict("warszawa", allDistricts)).toHaveLength(19);
+  });
+
+  it("resolves 'Lodz' to 6 sub-districts", () => {
+    expect(resolveDistrict("Lodz", allDistricts)).toHaveLength(6);
+  });
+
+  it("resolves 'mokotow' to ['Mokotów']", () => {
+    expect(resolveDistrict("mokotow", allDistricts)).toEqual(["Mokotów"]);
+  });
+
+  it("resolves 'gdansk' to ['Gdańsk']", () => {
+    expect(resolveDistrict("gdansk", allDistricts)).toEqual(["Gdańsk"]);
+  });
+
+  it("passes through unknown district", () => {
+    expect(resolveDistrict("xyz", allDistricts)).toEqual(["xyz"]);
   });
 });
 
@@ -143,5 +184,104 @@ describe("enum constants", () => {
   it("MARKET_TYPES has 2 types", () => {
     expect(MARKET_TYPES[1]).toContain("Primary");
     expect(MARKET_TYPES[2]).toContain("Secondary");
+  });
+});
+
+describe("mapUnitFunction", () => {
+  it("maps named functions to codes", () => {
+    expect(mapUnitFunction("residential")).toBe(1);
+    expect(mapUnitFunction("garage")).toBe(5);
+  });
+
+  it("maps 'unknown' to the 'unknown' sentinel string (resolved to IS NULL by the API)", () => {
+    expect(mapUnitFunction("unknown")).toBe("unknown");
+  });
+
+  it("returns undefined for undefined / unmapped value", () => {
+    expect(mapUnitFunction(undefined)).toBeUndefined();
+    expect(mapUnitFunction("bogus")).toBeUndefined();
+  });
+});
+
+describe("mapBuildingType", () => {
+  it("maps named PKOB types to codes", () => {
+    expect(mapBuildingType("residential")).toBe(110);
+    expect(mapBuildingType("office")).toBe(124);
+  });
+
+  it("maps 'unknown' to the 'unknown' sentinel string", () => {
+    expect(mapBuildingType("unknown")).toBe("unknown");
+  });
+
+  it("returns undefined for undefined / unmapped value", () => {
+    expect(mapBuildingType(undefined)).toBeUndefined();
+    expect(mapBuildingType("bogus")).toBeUndefined();
+  });
+});
+
+describe("mapTransactionTypes", () => {
+  it("joins mapped codes into a CSV string", () => {
+    expect(mapTransactionTypes(["free_market", "auction"])).toBe("1,3");
+  });
+
+  it("passes the 'unknown' sentinel through alongside codes", () => {
+    expect(mapTransactionTypes(["free_market", "unknown"])).toBe("1,unknown");
+    expect(mapTransactionTypes(["unknown"])).toBe("unknown");
+  });
+
+  it("returns undefined for empty / undefined", () => {
+    expect(mapTransactionTypes(undefined)).toBeUndefined();
+    expect(mapTransactionTypes([])).toBeUndefined();
+  });
+});
+
+describe("decodeOAuthCtx (identity decode for tool.call logging)", () => {
+  const UUID = "3f9a1c22-1b7e-4d0a-9c11-2b3c4d5e6f70";
+
+  it("round-trips a well-formed OAuth context key", () => {
+    const key = encodeOAuthCtx(UUID, "grant-abc");
+    expect(decodeOAuthCtx(key)).toEqual({ userId: UUID, grantId: "grant-abc" });
+  });
+
+  it("returns null for a plain api-key (no \\x01 prefix)", () => {
+    expect(decodeOAuthCtx("cngrm_live_abcd1234")).toBeNull();
+  });
+
+  it("returns null when the separator is missing (only userId, no grantId sep)", () => {
+    expect(decodeOAuthCtx(`${OAUTH_CTX_PREFIX}${UUID}`)).toBeNull();
+  });
+
+  it("returns null for an empty userId (\\x01\\x01grant)", () => {
+    expect(decodeOAuthCtx(`${OAUTH_CTX_PREFIX}${OAUTH_CTX_PREFIX}grant`)).toBeNull();
+  });
+
+  it("returns null for an empty grantId (\\x01user\\x01)", () => {
+    expect(decodeOAuthCtx(`${OAUTH_CTX_PREFIX}${UUID}${OAUTH_CTX_PREFIX}`)).toBeNull();
+  });
+});
+
+describe("mapOwnershipTypes", () => {
+  it("maps named legal-right types to registry codes", () => {
+    expect(mapOwnershipTypes(["land_ownership"])).toBe("1");
+    expect(mapOwnershipTypes(["ownership"])).toBe("5");
+  });
+
+  it("expands perpetual_usufruct to both registry codes 2 and 8", () => {
+    // the registry records użytkowanie wieczyste under code 2 or 8 depending on the record — cover both.
+    expect(mapOwnershipTypes(["perpetual_usufruct"])).toBe("2,8");
+  });
+
+  it("joins multi-select into one CSV (land + usufruct)", () => {
+    expect(mapOwnershipTypes(["land_ownership", "perpetual_usufruct"])).toBe("1,2,8");
+  });
+
+  it("passes the 'unknown' sentinel through alongside codes", () => {
+    expect(mapOwnershipTypes(["ownership", "unknown"])).toBe("5,unknown");
+    expect(mapOwnershipTypes(["unknown"])).toBe("unknown");
+  });
+
+  it("returns undefined for empty / undefined", () => {
+    expect(mapOwnershipTypes(undefined)).toBeUndefined();
+    expect(mapOwnershipTypes([])).toBeUndefined();
   });
 });
