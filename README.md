@@ -4,9 +4,9 @@
 [![Node.js](https://img.shields.io/badge/node-%3E%3D18-brightgreen)](https://nodejs.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-**Polish Real Estate Transaction Data for AI**
+**Polish Real Estate Transaction & Parcel Data for AI**
 
-MCP server for Polish real estate data. Access 8M+ real estate transactions from the national Registry of Prices and Values (Rejestr Cen Nieruchomosci, RCN) directly from Claude, Cursor, or any MCP-compatible AI assistant.
+MCP server for Polish real estate data. Access 8M+ real estate transactions from the national Registry of Prices and Values (Rejestr Cen Nieruchomosci, RCN) - prices from notarial deeds, not listings - directly from Claude, Cursor, ChatGPT, Grok, or any MCP-compatible AI assistant. Beyond transaction prices, the server resolves cadastral parcels and adds per-parcel context: zoning, flood and landslide risk, heritage register, building permits and construction activity, public transport access, agricultural land classification and surrounding land use.
 
 Data source: Polish national RCN registry (Rejestr Cen Nieruchomosci) | Platform: [cenogram.pl](https://cenogram.pl?src=mcpstdio)
 
@@ -193,7 +193,8 @@ You can also use the `--http` CLI flag instead of `MCP_TRANSPORT=http`.
 **Polish:**
 - "Jaka jest mediana cen mieszkan w Krakowie w 2025?"
 - "Pokaz transakcje z ulicy Pulawskiej 15 na Mokotowie"
-- "Znajdz transakcje na dzialce 146518_8.0108.27"
+- "Znajdz transakcje na dzialce 126104_9.0015.201"
+- "Sprawdz plan miejscowy i ryzyko powodziowe dla dzialki 126104_9.0015.201"
 - "Znajdz transakcje gruntow w promieniu 5km od centrum Wroclawia powyzej 500 000 PLN"
 - "Porownaj ceny mieszkan na Mokotowie i Woli"
 - "Pokaz rozklad cen nieruchomosci w Polsce"
@@ -201,7 +202,8 @@ You can also use the `--http` CLI flag instead of `MCP_TRANSPORT=http`.
 **English:**
 - "What's the median apartment price in Krakow in 2025?"
 - "Show transactions at Pulawska 15 in Mokotow"
-- "Find all transactions on parcel 146502_8.0901.12 and then search nearby"
+- "Find all transactions on parcel 126104_9.0015.201 and then search nearby"
+- "Check the zoning and flood risk for parcel 126104_9.0015.201"
 - "Find land transactions within 5km of Wroclaw center above 500,000 PLN"
 - "Compare apartment prices in Mokotow and Wola districts"
 - "Show the price distribution of real estate in Poland"
@@ -270,6 +272,7 @@ This mimics how a property appraiser finds comparable transactions for valuation
 - **Date range:** 2003 - present
 - **Source:** Polish national RCN registry (Rejestr Cen Nieruchomosci)
 - **Refresh:** periodic updates from RCN
+- **Per-parcel context:** zoning, flood and landslide risk, heritage register, building permits and construction activity, transit access, agricultural land use and surroundings, addressable by cadastral ID
 
 ## Troubleshooting
 

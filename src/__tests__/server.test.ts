@@ -263,6 +263,7 @@ describe.skipIf(!hasDistBuild)("HTTP mode auth dispatch (E2E spawn)", () => {
         ...process.env,
         MCP_TRANSPORT: "http",
         MCP_PORT: String(port),
+        GLAMA_MAINTAINER_EMAIL: "maintainer@example.test",
         // Note: NODE_ENV not 'production' so OAUTH_JWT_KID etc. not strictly required.
         // Tests that hit JWT validation path will trigger OAuthConfigError → 500.
       },
@@ -309,6 +310,24 @@ describe.skipIf(!hasDistBuild)("HTTP mode auth dispatch (E2E spawn)", () => {
     const body = await res.json() as { authorization_servers: string[]; resource: string };
     expect(body.resource).toBe("https://mcp.cenogram.pl");
     expect(body.authorization_servers).toContain("https://api.cenogram.pl");
+  });
+
+  it("path-aware /.well-known/oauth-protected-resource/mcp echoes the identifier its URL was derived from", async () => {
+    const res = await fetch(`http://127.0.0.1:${port}/.well-known/oauth-protected-resource/mcp`);
+    expect(res.status).toBe(200);
+    const body = await res.json() as { authorization_servers: string[]; resource: string };
+    // Not the origin: a client that derived this URL from https://mcp.cenogram.pl/mcp verifies the
+    // field against that identifier, so echoing the origin here would make it abort, not fall back.
+    expect(body.resource).toBe("https://mcp.cenogram.pl/mcp");
+    expect(body.authorization_servers).toContain("https://api.cenogram.pl");
+  });
+
+  it("/.well-known/glama.json serves the connector claim from the environment", async () => {
+    const res = await fetch(`http://127.0.0.1:${port}/.well-known/glama.json`);
+    expect(res.status).toBe(200);
+    const body = await res.json() as { $schema: string; maintainers: { email: string }[] };
+    expect(body.$schema).toBe("https://glama.ai/mcp/schemas/connector.json");
+    expect(body.maintainers).toEqual([{ email: "maintainer@example.test" }]);
   });
 });
 
