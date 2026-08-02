@@ -151,15 +151,40 @@ async function main() {
               await mcpServer.close();
             }
           });
-        } else if (pathname === "/.well-known/oauth-protected-resource") {
+        } else if (pathname === "/.well-known/oauth-protected-resource" || pathname === "/.well-known/oauth-protected-resource/mcp") {
+          // RFC 9728 defines BOTH shapes: the bare document for a resource whose identifier is the
+          // origin, and the path-aware one derived from an identifier that carries a path. Clients
+          // that skip WWW-Authenticate and guess the URL from the endpoint they are calling look for
+          // the second one. Each document echoes the identifier its own URL was derived from - a
+          // client verifies that field against the resource it thinks it is talking to, so serving
+          // the origin under the path-aware URL would make strict clients abort instead of fall back.
+          // Both identifiers land on the same audience: /oauth/authorize canonicalizes `resource`
+          // down to the origin, so the issued token's `aud` is the origin either way.
+          const resource = pathname.endsWith("/mcp") ? "https://mcp.cenogram.pl/mcp" : "https://mcp.cenogram.pl";
           res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "public, max-age=3600" }).end(
             JSON.stringify({
-              resource: "https://mcp.cenogram.pl",
+              resource,
               authorization_servers: ["https://api.cenogram.pl"],
               scopes_supported: ["mcp"],
               bearer_methods_supported: ["header"],
             }),
           );
+        } else if (pathname === "/.well-known/glama.json") {
+          // Directory ownership proof: the file must live on the server's own domain, so it cannot
+          // ship in the repo like the sibling server-level claim. The address comes from the
+          // environment because this file is published verbatim to npm and a public repo - no
+          // personal address in public source. Unset (stdio users, dev) → 404, not an empty claim.
+          const maintainer = process.env.GLAMA_MAINTAINER_EMAIL;
+          if (!maintainer) {
+            res.writeHead(404, { "Content-Type": "application/json" }).end(JSON.stringify({ error: "not_found" }));
+          } else {
+            res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "public, max-age=3600" }).end(
+              JSON.stringify({
+                $schema: "https://glama.ai/mcp/schemas/connector.json",
+                maintainers: [{ email: maintainer }],
+              }),
+            );
+          }
         } else if (pathname === "/.well-known/mcp.json") {
           res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*", "Cache-Control": "public, max-age=3600" }).end(
             JSON.stringify({

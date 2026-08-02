@@ -696,8 +696,8 @@ Example: {"type":"Polygon","coordinates":[[[21.0,52.2],[21.01,52.2],[21.01,52.21
     maxArea: z.number().optional().describe("Maximum area in m²"),
     district: z.string().optional().describe("District name filter"),
     street: z.string().optional().describe("Street name filter (partial match)"),
-    limit: z.number().min(1).max(5000).default(100).optional()
-      .describe("Max results (1-5000, default 100). MCP displays up to 50 transactions."),
+    limit: z.number().min(1).max(3000).default(100).optional()
+      .describe("Max results (1-3000, default 100). MCP displays up to 50 transactions."),
   },
   { readOnlyHint: true, destructiveHint: false, title: "Search Transactions by Polygon" },
   async (params) =>

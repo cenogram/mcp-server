@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.6.0
+
+Documentation and protocol-compatibility release - no breaking changes, no new tools.
+
+### OAuth / discovery
+- Serve the path-aware `/.well-known/oauth-protected-resource/mcp` document (RFC 9728) in
+  addition to the origin-level one, so clients that derive the metadata URL from the endpoint
+  they call can complete discovery instead of aborting.
+- Add a `/.well-known/glama.json` endpoint for directory ownership verification (served only
+  when `GLAMA_MAINTAINER_EMAIL` is set, 404 otherwise).
+
+### Tools
+- `search_by_polygon`: maximum `limit` lowered from 5000 to 3000.
+
+### Docs
+- README and package description now cover per-parcel context (zoning, flood and landslide
+  risk, heritage register, building permits, construction activity, transit access,
+  agricultural land and surroundings) alongside transaction prices, and mention more MCP
+  clients (ChatGPT, Grok).
+- Refreshed the example parcel IDs used in the sample prompts.
+
 ## 0.5.0
 
 First release since 0.2.0, so it carries everything published on the hosted server in the

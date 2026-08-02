@@ -1,10 +1,10 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "pl.cenogram/mcp-server",
-  "title": "Cenogram - Polish Real Estate Data",
-  "description": "Polish property prices from notarial deeds, not listings - 8M+ transactions from the RCN registry.",
-  "version": "0.5.0",
-  "websiteUrl": "https://cenogram.pl",
+  "title": "Cenogram - Polish Real Estate Prices & Parcel Data",
+  "description": "Polish real estate data for AI: 8M+ transaction prices from notarial deeds (RCN registry, not listings), plus per-parcel context by cadastral ID - zoning, flood risk, heritage register, building permits, agricultural land use and public transport.",
+  "version": "0.6.0",
+  "websiteUrl": "https://cenogram.pl/en/mcp?src=mcpregistry",
   "repository": {
     "url": "https://github.com/cenogram/mcp-server",
     "source": "github"
@@ -13,7 +13,7 @@
     {
       "registryType": "npm",
       "identifier": "@cenogram/mcp-server",
-      "version": "0.5.0",
+      "version": "0.6.0",
       "transport": {
         "type": "stdio"
       },
