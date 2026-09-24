@@ -5,8 +5,9 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createServer } from "node:net";
 import { fetch } from "undici";
-import { generateKeyPair, exportSPKI, SignJWT } from "jose";
+import { SignJWT } from "jose";
 import type { CryptoKey } from "jose";
+import { loadTestKeyA } from "./fixtures/test-keys.js";
 import { createMcpServer, serverInstructions } from "../index.js";
 import { signupUrl } from "../error-messages.js";
 import { startStubApi, type StubApi } from "./fixtures/stub-api.js";
@@ -54,6 +55,36 @@ describe("createMcpServer", () => {
     const server = createMcpServer("test-key");
     expect(server).toBeDefined();
     // Server is created without throwing
+  });
+});
+
+// Two files carry this package's version and two different registries read them: npm publishes from
+// package.json, the MCP registry from server.json (which repeats it twice — once for the server entry,
+// once for the npm package it points at). Nothing links them, so a version bump that touches one file
+// ships a manifest advertising a release that does not exist. It has already drifted once, silently, and
+// the only place it would have surfaced is a registry submission — too late to be cheap.
+describe("package version parity", () => {
+  const pkgRoot = join(__dirname, "..", "..");
+  const readJson = (name: string): Record<string, unknown> =>
+    JSON.parse(readFileSync(join(pkgRoot, name), "utf-8")) as Record<string, unknown>;
+
+  it("package.json and both server.json versions agree", () => {
+    const version = readJson("package.json").version as string;
+    const manifest = readJson("server.json") as {
+      version: string;
+      packages: Array<{ registryType: string; identifier: string; version: string }>;
+    };
+    expect(version).toMatch(/^\d+\.\d+\.\d+$/);
+    expect(manifest.version).toBe(version);
+    const npmEntry = manifest.packages.find((p) => p.registryType === "npm");
+    expect(npmEntry, "server.json must keep an npm package entry").toBeDefined();
+    expect(npmEntry!.version).toBe(version);
+  });
+
+  it("the CHANGELOG documents the version being shipped", () => {
+    const version = readJson("package.json").version as string;
+    const changelog = readFileSync(join(pkgRoot, "CHANGELOG.md"), "utf-8");
+    expect(changelog).toContain(`\n## ${version}\n`);
   });
 });
 
@@ -370,10 +401,11 @@ describe.skipIf(!hasDistBuild)("HTTP mode E2E (JWT + stub upstream)", () => {
   }
 
   beforeAll(async () => {
-    // 1. Generate ephemeral RSA keypair
-    const kp = await generateKeyPair("RS256");
+    // 1. Load static precomputed RSA keypair (see fixtures/test-keys.ts) —
+    //    no runtime keygen, so no false hook-timeout under CPU contention.
+    const kp = await loadTestKeyA();
     privateKey = kp.privateKey;
-    const pubKeyPem = await exportSPKI(kp.publicKey);
+    const pubKeyPem = kp.publicPem;
 
     // 2. Start stub upstream API
     stub = await startStubApi();

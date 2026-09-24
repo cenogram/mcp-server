@@ -1,6 +1,6 @@
 import { fetch, type Response } from "undici";
 import { getClientId } from "./client-id.js";
-import { authErrorMessage, getAuthMode, type ErrorBody } from "./error-messages.js";
+import { authErrorMessage, getAuthMode, type AuthMode, type ErrorBody } from "./error-messages.js";
 import { requestContext } from "./request-context.js";
 
 const BASE_URL = process.env.CENOGRAM_API_URL || "https://cenogram.pl";
@@ -392,6 +392,8 @@ export function getInfrastructureSignals(
 export interface CreditInfo {
   balance: number;
   cost: number;
+  // Set only when the server refunded the call (X-Credits-Refunded), e.g. an unmatched `street` page.
+  refunded?: number;
 }
 
 export interface ApiResponse<T> {
@@ -404,7 +406,8 @@ function extractCreditInfo(res: Response): CreditInfo | null {
   const balance = parseInt(res.headers.get("X-Credits-Balance") ?? "", 10);
   const cost = parseInt(res.headers.get("X-Credits-Cost") ?? "", 10);
   if (isNaN(balance) || isNaN(cost)) return null;
-  return { balance, cost };
+  const refunded = parseInt(res.headers.get("X-Credits-Refunded") ?? "", 10);
+  return isNaN(refunded) ? { balance, cost } : { balance, cost, refunded };
 }
 
 // ── OAuth internal auth ────────────────────────────────────────────
@@ -488,18 +491,84 @@ export function formatRetryAfter(seconds: number): string {
   return unit(Math.ceil(seconds / 86400), "day");
 }
 
+/**
+ * An error response from the API, carrying enough context to tell an expected outcome apart from a
+ * failure. The message is unchanged from what the caller has always seen - only the type is new.
+ */
+export class ApiHttpError extends Error {
+  readonly status: number;
+  readonly code: string | undefined;
+  readonly authMode: AuthMode;
+  readonly retryAfterSeconds: number | undefined;
+
+  constructor(
+    message: string,
+    opts: { status: number; code?: string | undefined; authMode: AuthMode; retryAfterSeconds?: number | undefined },
+  ) {
+    super(message);
+    this.name = "ApiHttpError";
+    this.status = opts.status;
+    this.code = opts.code;
+    this.authMode = opts.authMode;
+    this.retryAfterSeconds = opts.retryAfterSeconds;
+  }
+}
+
+/**
+ * Whether an error is worth reporting to error tracking, as opposed to being an ordinary answer the
+ * API is expected to give.
+ *
+ * An unknown location, an expired trial, a spent allowance or a rate limit are all states of the
+ * caller's account or query, not faults - and they were drowning the real failures. They stay
+ * visible in the per-call log either way, so nothing is lost by not treating them as incidents.
+ *
+ * Kept as failures: every 5xx, anything that is not an HTTP response at all (aborts, transport
+ * timeouts, malformed JSON, plain bugs), and rejected authentication on the OAuth path - the OAuth
+ * token was already validated before the call, so a 401/403 there points at a configuration drift on
+ * our side rather than at the user.
+ */
+export function isExpectedApiError(error: unknown): boolean {
+  if (!(error instanceof ApiHttpError)) return false;
+  const { status, authMode, code } = error;
+  if (status >= 500) return false;
+  switch (status) {
+    case 400:
+    case 402:
+    case 404:
+    case 409:
+    case 410:
+    case 422:
+    case 429:
+      return true;
+    case 401:
+      // A key the user configured can be revoked, expired or simply mistyped - their state to fix.
+      return authMode !== "oauth";
+    case 403:
+      return code === "email_not_verified";
+    default:
+      return false;
+  }
+}
+
 async function handleErrorResponse(res: Response, apiKey?: string): Promise<never> {
+  const mode = getAuthMode(apiKey ?? process.env.CENOGRAM_API_KEY);
   // 429 has special Retry-After handling - keep dedicated path
   if (res.status === 429) {
     const seconds = parseRetryAfterSeconds(res.headers?.get?.("Retry-After"));
     // Every 429 the API emits is a short rate limit; an exhausted allowance is a 402.
     // Spelling that out stops the caller from reporting a few seconds' wait as "come back later".
     const wait = seconds !== null ? ` Retry in ${formatRetryAfter(seconds)}.` : " Retry shortly.";
-    throw new Error(`Too many requests - this is a rate limit, not an exhausted allowance.${wait}`);
+    throw new ApiHttpError(
+      `Too many requests - this is a rate limit, not an exhausted allowance.${wait}`,
+      { status: 429, authMode: mode, retryAfterSeconds: seconds ?? undefined },
+    );
   }
   const body = (await res.json().catch(() => ({}))) as ErrorBody;
-  const mode = getAuthMode(apiKey ?? process.env.CENOGRAM_API_KEY);
-  throw new Error(authErrorMessage(res.status, mode, body));
+  throw new ApiHttpError(authErrorMessage(res.status, mode, body), {
+    status: res.status,
+    code: typeof body.error === "string" ? body.error : undefined,
+    authMode: mode,
+  });
 }
 
 function toQueryParams(obj: Record<string, string | number | undefined | null>): Record<string, string> {
@@ -594,6 +663,13 @@ export interface TransactionParams {
   floodRisk?: string;
   heritageStatus?: string;
   landslideRisk?: string;
+  // Recorded land-use category of the transaction's land (CSV; "unknown"=NULL bucket).
+  landUse?: string;
+  // Storey-count buckets for the building (CSV of exact ints / "Nplus" / "unknown"=NULL).
+  buildingStoreys?: string;
+  // Building footprint (ground-plan) area bounds in m² — distinct from minArea/maxArea (usable/land area).
+  minFootprintArea?: number;
+  maxFootprintArea?: number;
   limit?: number;
   page?: number;
   sort?: string;
@@ -619,6 +695,10 @@ export function getTransactions(p: TransactionParams, apiKey?: string): Promise<
     floodRisk: p.floodRisk,
     heritageStatus: p.heritageStatus,
     landslideRisk: p.landslideRisk,
+    landUse: p.landUse,
+    buildingStoreys: p.buildingStoreys,
+    minFootprintArea: p.minFootprintArea,
+    maxFootprintArea: p.maxFootprintArea,
     minPrice: p.minPrice,
     maxPrice: p.maxPrice,
     dateFrom: p.dateFrom,
@@ -654,6 +734,10 @@ export function getTransactionsSummary(p: TransactionParams, apiKey?: string): P
     // Summary must carry the same row-filtering params as getTransactions — otherwise the
     // "Found N" count reports an unfiltered total (same drift guard as floodRisk).
     landslideRisk: p.landslideRisk,
+    landUse: p.landUse,
+    buildingStoreys: p.buildingStoreys,
+    minFootprintArea: p.minFootprintArea,
+    maxFootprintArea: p.maxFootprintArea,
     minPrice: p.minPrice,
     maxPrice: p.maxPrice,
     dateFrom: p.dateFrom,
@@ -709,6 +793,63 @@ export function getPriceSpreadLocations(
   apiKey?: string,
 ): Promise<ApiResponse<PriceSpreadLocationsResponse>> {
   return fetchApi("/api/v1/price-spread/locations", toQueryParams({
+    search: params.search,
+  }), apiKey);
+}
+
+// ── Flood risk (county flood-exposure share) ────────────────────────
+
+// Share of a county's transactions on land in a mapped flood-hazard zone, by severity. Single
+// aggregate (no offer numerator, no window), so coverage has only the sample-size states.
+export interface FloodRiskResponse {
+  location: LocationRef;
+  metric: "flood_exposure_share";
+  result: {
+    flood_share_pct: number | null; // % of assessed transactions in ANY mapped zone; null when suppressed
+    by_severity: { low: number | null; medium: number | null; high: number | null }; // counts; null when suppressed
+  };
+  inputs: {
+    assessed_sample_n: number | null; // transactions with a completed flood assessment
+    window: "all_time";
+  };
+  quality: {
+    coverage: "full" | "low_sample" | "suppressed";
+    confidence: "high" | "low";
+    as_of: string | null;
+    stale: boolean;
+    notes: string[];
+  };
+}
+
+export interface FloodRiskLocation {
+  location: string;
+  county_code: string;
+  voivodeship: string;
+  type: "city" | "county";
+  assessed_sample_n: number;
+  confidence: "high" | "low";
+}
+
+export interface FloodRiskLocationsResponse {
+  data: FloodRiskLocation[];
+  meta: { total: number; snapshot_date: string | null };
+}
+
+export function getFloodRisk(
+  params: { location?: string; teryt?: string },
+  apiKey?: string,
+): Promise<ApiResponse<FloodRiskResponse>> {
+  return fetchApi("/api/v1/flood-risk", toQueryParams({
+    location: params.location,
+    teryt: params.teryt,
+  }), apiKey);
+}
+
+export function getFloodRiskLocations(
+  params: { search?: string },
+  apiKey?: string,
+): Promise<ApiResponse<FloodRiskLocationsResponse>> {
+  return fetchApi("/api/v1/flood-risk/locations", toQueryParams({
     search: params.search,
   }), apiKey);
 }
@@ -790,10 +931,24 @@ export interface LocationItem {
   name: string;
   typeName: string | null;
   level: "voivodeship" | "county" | "municipality" | "precinct";
+  // Name of the parent administrative unit (county for a municipality, etc.); null for voivodeships.
+  parent_name: string | null;
+}
+
+// Name-search mode of GET /api/locations. rcn_district is true iff the name is a valid value for
+// search_transactions(location=) — the tool layer uses it to decide which follow-up calls to print.
+export interface LocationSearchItem extends LocationItem {
+  rcn_district?: boolean;
 }
 
 export function getLocations(parent?: string, apiKey?: string): Promise<ApiResponse<LocationItem[]>> {
   return fetchApi("/api/v1/locations", parent ? { parent } : undefined, apiKey);
+}
+
+// Name-search variant. Kept as a separate export from getLocations so the browse signature stays
+// unchanged for existing callers; this one carries rcn_district in its result rows.
+export function searchLocations(q: string, apiKey?: string): Promise<ApiResponse<LocationSearchItem[]>> {
+  return fetchApi("/api/v1/locations", { search: q }, apiKey);
 }
 
 export function getPriceHistogram(
@@ -818,6 +973,7 @@ export interface ParcelSearchResult {
 
 export interface ParcelSearchResponse {
   results: ParcelSearchResult[];
+  corpus_coverage?: CorpusCoverage | null;
 }
 
 export function searchParcels(
@@ -826,6 +982,184 @@ export function searchParcels(
   apiKey?: string,
 ): Promise<ApiResponse<ParcelSearchResponse>> {
   return fetchApi("/api/v1/parcels/search", toQueryParams({ q, limit }), apiKey);
+}
+
+// ── Parcel collections (an area or an administrative filter → many parcels) ─────────
+
+// One row of the light collection. It carries what is needed to POINT at a parcel — identifiers,
+// centroid, district — and deliberately neither the outline nor the surface: the outline is what the
+// geometric collections return, and the registered surface is a field of the single-parcel endpoint.
+//
+// parcel_id / parcel_key are gated identity: the server sends them as null (never omits them) when
+// the account may not see them, so a renderer has to handle null rather than test for absence.
+// lat/lng are null for a parcel whose outline we do not hold — those rows are reachable through the
+// administrative filters but not through the spatial ones.
+export interface ParcelListRow {
+  id: string;
+  parcel_id: string | null;
+  parcel_key: string | null;
+  district: string | null;
+  lat: number | null;
+  lng: number | null;
+  // The street address held for the parcel. Present on EVERY row, whether or not the request
+  // mentioned an address, so a renderer never has to test which question was asked.
+  //
+  // address_source is the provenance and is never omitted: 'rcn' = the street is the one on record
+  // for this parcel; 'approx_high'/'approx_low' = we worked it out for a parcel the record left
+  // without one, at the stated confidence; 'none' = we hold no street either way, and then `street`
+  // and `building_number` are both null. Surfaced so an approximated street is never quoted as a
+  // recorded one. A building number only ever comes from the record, so an approximated street
+  // carries none.
+  street?: string | null;
+  building_number?: string | null;
+  address_source?: "rcn" | "approx_high" | "approx_low" | "none" | null;
+}
+
+// Cursor paging. has_more says whether more rows remain; next_cursor is present ONLY when they do,
+// and its contents are the server's to change — pass it back unchanged and never parse it. There is
+// no total and no page number: an exact count would undo the limit that keeps the scan bounded.
+// How much of the cadastral register the answer above could have come from, for the counties the
+// query addressed. Coverage is near-complete but not the whole register and not live, so a parcel
+// collection returning a short list is reporting our holdings, not the land. This block is what turns
+// that from an unstated caveat into a number the caller can act on.
+//
+// The figures are null for an area query (bounding box, circle, drawn shape): sizing an arbitrary
+// shape needs county boundaries the service does not hold, and counting the counties present in the
+// RESULT would quietly skip the ones that returned nothing because we hold nothing there — biased in
+// exactly the direction this block exists to reveal. `basis` still says the corpus is partial.
+// The whole block may be null when no measurement is available.
+export interface CorpusCoverage {
+  basis: string;
+  held_parcels: number | null;
+  source_parcels: number | null;
+  held_pct: number | null;
+  counties: number | null;
+  as_of: string | null;
+  note: string;
+}
+
+export interface ParcelListResponse {
+  data: ParcelListRow[];
+  pagination: { limit: number; has_more: boolean; next_cursor?: string };
+  corpus_coverage?: CorpusCoverage | null;
+  // Present only on an empty `street` page: close catalogue names to retry (streets) or the numbers
+  // recorded on a street when the given buildingNumber missed (building_numbers). `hint` is the
+  // human-facing sentence the server built for the same case; suggestions carry the actionable form.
+  suggestions?: { streets?: string[]; building_numbers?: string[] };
+  hint?: string;
+}
+
+export interface ParcelListParams {
+  location?: string;
+  teryt?: string;
+  bbox?: string;
+  lat?: number;
+  lng?: number;
+  radiusKm?: number;
+  minArea?: number;
+  maxArea?: number;
+  street?: string;
+  buildingNumber?: string;
+  limit?: number;
+  cursor?: string;
+}
+
+export function listParcels(
+  p: ParcelListParams,
+  apiKey?: string,
+): Promise<ApiResponse<ParcelListResponse>> {
+  return fetchApi("/api/v1/parcels", toQueryParams({
+    location: p.location,
+    teryt: p.teryt,
+    bbox: p.bbox,
+    lat: p.lat,
+    lng: p.lng,
+    radiusKm: p.radiusKm,
+    minArea: p.minArea,
+    maxArea: p.maxArea,
+    street: p.street,
+    buildingNumber: p.buildingNumber,
+    limit: p.limit,
+    cursor: p.cursor,
+  }), apiKey);
+}
+
+// ── Street catalogue (a scope → the street names we hold inside it) ─────────
+
+// One catalogue entry. `address_source` has only TWO values here, not the four a parcel row carries:
+// a confidence band belongs to one parcel's derived street, not to a name, and stating one for a
+// name would be a number about nothing. 'rcn' = the name is on record; 'approx' = we derived it for
+// parcels the record left without a street.
+export interface StreetListRow {
+  street: string;
+  address_source: "rcn" | "approx";
+}
+
+// has_more with no cursor, deliberately: this answers a typeahead, and the reply to "too many
+// matches" is another character, not another page.
+export interface StreetListResponse {
+  data: StreetListRow[];
+  // The scope the answer used, echoed back: several requests can be in flight and they return out
+  // of order, so without this there is nothing to match an answer to its question. `resolved_from`
+  // is the only way to see that a NAME resolved to a county rather than to the district or village
+  // the caller meant.
+  scope: { teryt: string; resolved_from: "teryt" | "location" };
+  pagination: { limit: number; has_more: boolean };
+}
+
+// No tool calls this — the catalogue answers over REST only. The scope it takes is a name OR a code,
+// the same pair the parcel collection accepts, so a caller that can scope one can scope the other.
+export function getStreets(
+  scope: { q: string; teryt?: string; location?: string },
+  apiKey?: string,
+): Promise<ApiResponse<StreetListResponse>> {
+  return fetchApi("/api/v1/streets", toQueryParams({ ...scope }), apiKey);
+}
+
+// One feature of a geometric parcel collection. `geometry` is GeoJSON in WGS84; its `coordinates`
+// are typed as unknown on purpose, because the same route can answer with a Polygon or a
+// MultiPolygon and a narrower type here would be a lie the renderer then has to work around.
+export interface ParcelFeature {
+  type: "Feature";
+  geometry: { type: string; coordinates: unknown } | null;
+  properties: {
+    id: string;
+    parcel_id: string | null;
+    parcel_key: string | null;
+    district: string | null;
+  };
+}
+
+// truncated = more of the parcels WE HOLD in that area matched than the limit returns, and the
+// features returned are an ARBITRARY subset — not the first, nearest or largest ones. It is a fact
+// about our result set, NOT about the area: `truncated: false` says nothing further matched our
+// holdings, and our holdings are near-complete coverage of the cadastral register rather than the
+// whole of it. Reading it as
+// "the area contains exactly these parcels" is the mistake corpus_coverage exists to prevent.
+// No cursor and no total here either: the geometric collections have no stable ordering to page through.
+export interface ParcelFeatureCollection {
+  type: "FeatureCollection";
+  truncated: boolean;
+  features: ParcelFeature[];
+  corpus_coverage?: CorpusCoverage | null;
+}
+
+export function getParcelsMap(
+  bbox: string,
+  limit: number | undefined,
+  apiKey?: string,
+): Promise<ApiResponse<ParcelFeatureCollection>> {
+  return fetchApi("/api/v1/parcels/map", toQueryParams({ bbox, limit }), apiKey);
+}
+
+export function searchParcelsByPolygon(
+  polygon: { type: "Polygon"; coordinates: number[][][] },
+  limit: number | undefined,
+  apiKey?: string,
+): Promise<ApiResponse<ParcelFeatureCollection>> {
+  const body: Record<string, unknown> = { polygon };
+  if (limit != null) body.limit = limit;
+  return fetchApiPost("/api/v1/parcels/spatial", body, apiKey);
 }
 
 // ── Parcel resolve (discovery → cadastral identity) ─────────────────
@@ -846,13 +1180,17 @@ export interface ParcelResolveMatch {
 }
 
 // Envelope from /parcels/resolve. coverage: covered = ≥1 match; not_covered = no confirmed parcel (the
-// credit is refunded). as_of = freshness of our cadastral copy (a global value; matches may span areas).
+// credit is refunded); not_computed = the lookup could not be completed, so nothing is claimed either way
+// (also refunded — a live confirmation that failed, or a name search too broad to finish). The three are
+// not interchangeable: not_covered asserts an absence, not_computed asserts nothing.
+// as_of = freshness of our cadastral copy (a global value; matches may span areas).
 export interface ParcelResolveResponse {
   query: { mode: string; q?: string; parcelId?: string; lat?: number; lng?: number };
-  coverage: "covered" | "not_covered";
+  coverage: "covered" | "not_covered" | "not_computed";
   as_of: string | null;
   matches: ParcelResolveMatch[];
   truncated: boolean;
+  corpus_coverage?: CorpusCoverage | null;
 }
 
 export interface ResolveParcelParams {
@@ -943,7 +1281,7 @@ export interface ReportSection {
 }
 
 // Envelope from GET /api/parcels/:key/report — the composite parcel dossier. Top-level `coverage` is the
-// four-state of the parcel CORE (covered / not_covered / not_computed). `sections` bundles the 9 enrichment
+// four-state of the parcel CORE (covered / not_covered / not_computed). `sections` bundles the 13 enrichment
 // layers + transaction history (each four-state) and the two context sections (statistical canon). `billing`
 // carries the net outcome: charged + refunded (their sum is the gross for a non-demo caller) and a `rule`
 // naming why (full / core_floor / total_miss_refund / not_computed_refund / disabled / demo).
@@ -970,12 +1308,16 @@ export interface ParcelReportResponse {
     flood: ReportSection;
     heritage: ReportSection;
     landslide: ReportSection;
+    subsurface: ReportSection;
     surroundings: ReportSection;
     transit: ReportSection;
     planning: ReportSection;
     buildings: ReportSection;
     permits: ReportSection;
     farmland: ReportSection;
+    land_class: ReportSection;
+    nature: ReportSection;
+    roads: ReportSection;
     market_context: ReportMarketContext;
     location_context: ReportLocationContext;
   };
@@ -985,7 +1327,7 @@ export interface ParcelReportResponse {
 
 // GET /api/parcels/:key/report — the whole parcel dossier in one call. The path key must be the URL-safe
 // dash form (a '/' in the number segment becomes '-'); we normalise a raw-slash id here so callers can pass
-// the natural '142907_2.0014.342/5' form. A UUID passes through unchanged. Costs 35 API tokens, refunded in
+// the natural '142907_2.0014.342/5' form. A UUID passes through unchanged. Costs 45 API tokens, refunded in
 // full or in part by outcome (see billing.rule on the response).
 export function getParcelReport(
   parcelKey: string,
@@ -993,6 +1335,35 @@ export function getParcelReport(
 ): Promise<ApiResponse<ParcelReportResponse>> {
   const urlKey = parcelKey.trim().replace(/\//g, "-");
   return fetchApi(`/api/v1/parcels/${encodeURIComponent(urlKey)}/report`, undefined, apiKey);
+}
+
+// Envelope from GET /api/parcels/:key/land-class — the standalone land-use / soil-quality layer. Same
+// fields the report's land_class section carries, one level up. The sets are exhaustive for the parcel and
+// carry NO per-category area: the source records none, so nothing here can name a prevailing category.
+export interface ParcelLandClassResponse {
+  parcel: { id: string | null; parcel_id: string | null; parcel_key: string | null };
+  coverage: string;
+  as_of: string | null;
+  use_codes: string[];
+  use_names: string[];
+  soil_classes: string[];
+  protected_class_present: boolean;
+  in_city: boolean | null;
+  legal_note: string | null;
+  legal_state_as_of: string | null;
+  note?: string | null;
+}
+
+// GET /api/parcels/:key/land-class — the classification and its re-designation consequences for one
+// parcel. Key handling matches getParcelReport: the path takes the URL-safe dash form, so a raw '/' in the
+// number segment is normalised here and a UUID passes through. Costs 4 API tokens, refunded when the
+// county publishes no classification or the lookup could not be completed.
+export function getParcelLandClass(
+  parcelKey: string,
+  apiKey?: string,
+): Promise<ApiResponse<ParcelLandClassResponse>> {
+  const urlKey = parcelKey.trim().replace(/\//g, "-");
+  return fetchApi(`/api/v1/parcels/${encodeURIComponent(urlKey)}/land-class`, undefined, apiKey);
 }
 
 // ── Spatial search (polygon) ───────────────────────────────────────
@@ -1016,6 +1387,10 @@ export interface SpatialSearchParams {
   transactionType?: string;
   rooms?: string;
   floor?: string;
+  landUse?: string;
+  buildingStoreys?: string;
+  minFootprintArea?: number;
+  maxFootprintArea?: number;
   limit?: number;
 }
 
@@ -1097,6 +1472,10 @@ export function searchByPolygon(
   if (p.transactionType) body.transactionType = p.transactionType;
   if (p.rooms) body.rooms = p.rooms;
   if (p.floor) body.floor = p.floor;
+  if (p.landUse) body.landUse = p.landUse;
+  if (p.buildingStoreys) body.buildingStoreys = p.buildingStoreys;
+  if (p.minFootprintArea != null) body.minFootprintArea = p.minFootprintArea;
+  if (p.maxFootprintArea != null) body.maxFootprintArea = p.maxFootprintArea;
   if (p.limit != null) body.limit = p.limit;
   return fetchApiPost("/api/v1/transactions/spatial", body, apiKey);
 }
@@ -1181,6 +1560,33 @@ export function compareLocations(
 // NUMERIC columns arrive as strings over the wire (Intl.format coerces). Field names are neutral —
 // no source register is named. footprint_area_alt_m2 / footprint_divergent are NULL unless a
 // second independent footprint measurement exists; est_total_area_m2 is NULL without footprint+storeys.
+// Construction-age estimate for one building. ALWAYS carries a `status`, and a refusal is a real
+// answer: `older_than_register` means "we cannot date this building", not "unknown, maybe new".
+// `year_from` is a legal lower bound (works may not start before the decision is final); `year_to` and
+// `year_point` add a completion offset and are estimates. `year_point` is null when the building's
+// class has no stable calibration — the interval alone is then the correct answer.
+export interface BuildingAgeEstimate {
+  status:
+    | "estimated"
+    | "older_than_register"
+    | "ambiguous_permits"
+    | "ambiguous_buildings"
+    | "ambiguous_both"
+    | "no_parcel_key"
+    | "not_applicable"
+    | "not_computed";
+  year_from: number | null;
+  year_to: number | null;
+  year_point: number | null;
+  basis: string | null;
+  basis_year: number | null;
+  match_rule: string | null;
+  confidence: string | null;
+  offset_model: string | null;
+  last_works_year: number | null;
+  note: string;
+}
+
 export interface BuildingBreakdownRow {
   building_type: number | null;
   footprint_area_m2: number | null;
@@ -1189,6 +1595,10 @@ export interface BuildingBreakdownRow {
   storeys: number | null;
   est_total_area_m2: number | null;
   match_confidence: string | null;
+  // OPTIONAL on purpose, and it must stay optional. The API and this server are deployed separately,
+  // so during any rollout window — and after any rollback of the API — responses arrive without this
+  // field. Rendering has to tolerate its absence rather than throw.
+  age_estimate?: BuildingAgeEstimate;
 }
 
 export interface BuildingBreakdownResponse {
@@ -1305,6 +1715,46 @@ export interface LandslideBreakdownResponse {
   truncated: boolean;
 }
 
+// ── Nature (forest amenity + protected-area restriction) breakdown (per-transaction, per-parcel) ──────
+
+// One protected natural area overlapping a parcel. form = canonical category (national_park, nature_reserve,
+// natura2000_habitat/bird, landscape_park, protected_landscape, ecological_site, landscape_nature_complex,
+// documentation_site, nature_monument_area, buffer_zone, other); name = the area's official name (public).
+// buffer_zone is the belt around a park or reserve — reported, but never a statutory ban. overlap_pct =
+// its share of the parcel (NUMERIC → string over the wire). Capped at 5 areas per parcel.
+export interface NatureArea {
+  form: string | null;
+  name: string | null;
+  overlap_pct: number | string | null;
+}
+
+// One linked parcel with a nature signal. Mirrors the /api/transactions/:id/nature row contract. A row
+// exists ONLY when the parcel has a forest within 2 km OR overlaps a protected area — an empty list is never
+// a statement that building is allowed. forest_distance_m: nearest forest in metres, 0 = the parcel overlaps
+// forest (then forest_overlap_pct is set). protection_rank: sharpest overlapping form, 1 (national park) …
+// 6 (other); null = none. building_restriction: 'statutory_ban' (rank 1-2, a build ban that follows directly
+// from the Nature Protection Act) | 'conditional' (rank 3-6, depends on the establishing act) | null.
+export interface NatureBreakdownRow {
+  forest_distance_m: number | null;
+  forest_overlap_pct: number | string | null;
+  protection_rank: number | null;
+  building_restriction: "statutory_ban" | "conditional" | null;
+  protected_overlap_pct: number | string | null;
+  protected_forms: string[] | null;
+  protected_areas: NatureArea[] | null;
+}
+
+// `coverage` tells an EMPTY response apart from a checked one, and it is the only thing that can:
+// 'covered_no_data' = every linked plot was checked and none has a forest or protected-area signal;
+// 'not_covered' = nothing was checked (no reference data held yet, or a malformed id). Optional because a
+// server predating the field simply omits it; the formatter then hedges rather than picking either reading,
+// since guessing "checked" is the mistake this field exists to stop.
+export interface NatureBreakdownResponse {
+  data: NatureBreakdownRow[];
+  truncated: boolean;
+  coverage?: "covered" | "covered_no_data" | "not_covered";
+}
+
 // ── Public-transport access breakdown (per-transaction, per-parcel) ─
 
 // One linked parcel's nearest-stop distance + name per mode. Mirrors the /api/transactions/:id/transit row
@@ -1328,8 +1778,9 @@ export interface TransitBreakdownResponse {
 
 // ── Building-permit breakdown (per-transaction, per-parcel) ──────────
 
-// One positively-resolved case (permit or notification) registered against one of the
-// transaction's parcels. Mirrors the /api/transactions/:id/permits row contract. TWO-STATE:
+// One closed case (permit with an issued decision, or notification accepted without objection)
+// registered against one of the transaction's parcels. Mirrors the
+// /api/v1/transactions/:id/permits row contract. TWO-STATE:
 // a row exists ONLY for a registered case — an empty list is never asserted as "nothing was
 // ever planned". The response carries NO parcel identity and NO source-registry number by
 // design (identity-stripped). record_kind: permit = building-permit decision, notification = works
@@ -1376,6 +1827,73 @@ export function getTransactionLandslide(
   return fetchApi(`/api/v1/transactions/${transactionId}/landslide`, undefined, apiKey);
 }
 
+// No encodeURIComponent: transactionId is zod-validated as a UUID at the tool layer (see above).
+export function getTransactionNature(
+  transactionId: string,
+  apiKey?: string,
+): Promise<ApiResponse<NatureBreakdownResponse>> {
+  return fetchApi(`/api/v1/transactions/${transactionId}/nature`, undefined, apiKey);
+}
+
+// ── Subsurface breakdown (per-transaction, per-parcel) ──────────────
+
+// One mapped mining terrain touching a linked parcel. Public-safe fields only: the source register's
+// internal id is never present. status is the two-state (active = current, former = former); mineral_class
+// is the deformation-risk classification. overlap_pct is NUMERIC → string over the wire (formatters coerce).
+export interface SubsurfaceMiningTerrain {
+  name: string | null;
+  status: "active" | "former" | string | null;
+  mineral_class: "subsidence" | "surface" | "fluid" | "other" | string | null;
+  oversight_authority: string | null;
+  valid_until: string | null;
+  revoked_on: string | null;
+  overlap_pct: number | string | null;
+}
+
+// One mapped major groundwater reservoir touching a linked parcel. number is the reservoir's public
+// designation. documentation_status is the two-state (documented / undocumented). A reservoir's extent
+// alone imposes NO restriction — no protection zone is published here.
+export interface SubsurfaceGroundwaterBody {
+  number: number | null;
+  name: string | null;
+  documentation_status: "documented" | "undocumented" | string | null;
+  documented_year: number | null;
+  depth_from_m: number | null;
+  medium_type: string | null;
+  overlap_pct: number | string | null;
+}
+
+// One linked parcel that overlaps a mining terrain OR a major groundwater reservoir. Mirrors the
+// /api/transactions/:id/subsurface row contract. TWO-STATE: a row exists ONLY for an in-zone parcel —
+// absence of rows is never asserted as "safe". Carries NO parcel identity and no source-register id.
+export interface SubsurfaceBreakdownRow {
+  mining_status: "active" | "former" | string | null;
+  mineral_class: "subsidence" | "surface" | "fluid" | "other" | string | null;
+  mining_overlap_pct: number | string | null;
+  mining_terrains: SubsurfaceMiningTerrain[] | null;
+  // The per-object list reached its 5-entry cap. NOT a claim that further objects exist: neither
+  // derivation stores the pre-cap total, so "exactly five" and "more than five" are indistinguishable.
+  // Optional because an older API build does not send it.
+  mining_terrains_capped?: boolean | null;
+  groundwater_status: "documented" | "undocumented" | string | null;
+  groundwater_overlap_pct: number | string | null;
+  groundwater_bodies: SubsurfaceGroundwaterBody[] | null;
+  groundwater_bodies_capped?: boolean | null;
+}
+
+export interface SubsurfaceBreakdownResponse {
+  data: SubsurfaceBreakdownRow[];
+  truncated: boolean;
+}
+
+// No encodeURIComponent: transactionId is zod-validated as a UUID at the tool layer (see above).
+export function getTransactionSubsurface(
+  transactionId: string,
+  apiKey?: string,
+): Promise<ApiResponse<SubsurfaceBreakdownResponse>> {
+  return fetchApi(`/api/v1/transactions/${transactionId}/subsurface`, undefined, apiKey);
+}
+
 // ── Surroundings (per-transaction, per-parcel nuisance distances) ───
 
 // One linked plot with the distance (meters, from the plot boundary) to the nearest object of each
@@ -1391,6 +1909,11 @@ export interface SurroundingsRow {
   industrial_area_distance_m: number | string | null;
   industrial_plant_distance_m: number | string | null;
   livestock_farm_distance_m: number | string | null;
+  // Overhead power lines, OPTIONAL on purpose: the service may omit these two keys entirely instead of
+  // sending nulls. An absent key is no claim; a null would be the claim "nothing within the radius".
+  // The formatter therefore skips a category whose key is missing, and shows it once it arrives.
+  power_line_hv_distance_m?: number | string | null;
+  power_line_ehv_distance_m?: number | string | null;
 }
 
 export interface SurroundingsResponse {
@@ -1404,6 +1927,47 @@ export function getTransactionSurroundings(
   apiKey?: string,
 ): Promise<ApiResponse<SurroundingsResponse>> {
   return fetchApi(`/api/v1/transactions/${transactionId}/surroundings`, undefined, apiKey);
+}
+
+// ── Road access (per-transaction, per-parcel) ───────────────────────
+
+// One linked plot with its road-access evidence. TWO-STATE: assessed=false = the plot has not been
+// evaluated yet (every field null then, no statement either way). On an assessed plot a null distance
+// means nothing of that kind was found inside the search radius — never a claim that none exists.
+//
+// access_indicator is GEOMETRIC EVIDENCE derived from carriageway centrelines in reference road-network
+// data. It is deliberately three-state and never a boolean, because it does NOT determine legal access:
+// the reference data models the axis of the carriageway rather than the edge of the right of way, and a
+// legal right of access is frequently an easement recorded in the land register, which this service does
+// not hold. access_rule_version identifies the classification rule that produced the indicator, so a
+// later recalibration is visible to a client instead of silently changing the meaning of the field.
+export interface RoadsBreakdownRow {
+  assessed: boolean;
+  access_indicator: "likely" | "uncertain" | "unlikely" | string | null;
+  access_rule_version: number | null;
+  public_road_distance_m: number | string | null;
+  /** Distance to the estimated carriageway EDGE. null = the source carries no width; no median is substituted. */
+  public_road_edge_distance_m: number | string | null;
+  public_road_category: "national" | "voivodeship" | "county" | "municipal" | string | null;
+  public_road_class: "motorway" | "expressway" | "main_accelerated" | "main" | "collector" | "local" | "access" | "other" | string | null;
+  /** false = the road crosses on a viaduct or runs in a tunnel, i.e. it passes the plot over or under it. */
+  public_road_at_grade: boolean | null;
+  any_road_distance_m: number | string | null;
+  major_road_distance_m: number | string | null;
+  source_as_of: string | null;
+}
+
+export interface RoadsBreakdownResponse {
+  data: RoadsBreakdownRow[];
+  truncated?: boolean;
+}
+
+// No encodeURIComponent: transactionId is zod-validated as a UUID at the tool layer (see above).
+export function getTransactionRoads(
+  transactionId: string,
+  apiKey?: string,
+): Promise<ApiResponse<RoadsBreakdownResponse>> {
+  return fetchApi(`/api/v1/transactions/${transactionId}/roads`, undefined, apiKey);
 }
 
 // No encodeURIComponent: transactionId is zod-validated as a UUID at the tool layer (see above).

@@ -6,7 +6,7 @@
 
 **Polish Real Estate Transaction & Parcel Data for AI**
 
-MCP server for Polish real estate data. Access 8M+ real estate transactions from the national Registry of Prices and Values (Rejestr Cen Nieruchomosci, RCN) - prices from notarial deeds, not listings - directly from Claude, Cursor, ChatGPT, Grok, or any MCP-compatible AI assistant. Beyond transaction prices, the server resolves cadastral parcels and adds per-parcel context: zoning, flood and landslide risk, heritage register, building permits and construction activity, public transport access, agricultural land classification and surrounding land use.
+MCP server for Polish real estate data. Access 8M+ real estate transactions from the national Registry of Prices and Values (Rejestr Cen Nieruchomosci, RCN) - prices from notarial deeds, not listings - directly from Claude, Cursor, ChatGPT, Grok, or any MCP-compatible AI assistant. Beyond transaction prices, the server resolves cadastral parcels and adds per-parcel context: zoning, flood and landslide risk, heritage register, building permits and construction activity, public transport access, agricultural land classification, surrounding land use, nature - nearby forest and overlapping protected areas - what lies underground (mining terrains and major groundwater reservoirs), the land-use and soil-quality classification, and road access.
 
 Data source: Polish national RCN registry (Rejestr Cen Nieruchomosci) | Platform: [cenogram.pl](https://cenogram.pl?src=mcpstdio)
 
@@ -17,6 +17,18 @@ Data source: Polish national RCN registry (Rejestr Cen Nieruchomosci) | Platform
 3. You'll receive your `cngrm_...` API key by email
 
 Manage your keys at [cenogram.pl/ustawienia](https://cenogram.pl/ustawienia).
+
+### Free tier
+
+New accounts start with 1,000 tokens and a 14-day trial of the Standard plan. After that the key keeps
+working on 50 tokens a week - the balance is restored to 50 every 7 days rather than accumulating -
+with no expiry date and no card.
+
+A call costs 1 token for statistics, reference data, parcel identity and municipal context; 2 for a
+transaction search, a price histogram or a list of the parcels in an area; 4 for one context layer of
+a parcel or transaction; 5 for spatial search, parcel outlines, valuation and a multi-district
+comparison; 45 for `get_parcel_report`, which returns every layer at once. Location catalogues are
+free. Paid plans raise the allowance - see [cenogram.pl/api](https://cenogram.pl/api?src=mcpstdio#cennik).
 
 ## Installation
 
@@ -215,15 +227,16 @@ You can also use the `--http` CLI flag instead of `MCP_TRANSPORT=http`.
 | `search_transactions` | Search transactions with filters | location, street, buildingNumber, parcelId, propertyType, marketType, price/date/area range |
 | `get_price_statistics` | Price/m2 stats by location (residential only) | location (optional) |
 | `get_price_distribution` | Price histogram | bins, maxPrice |
-| `search_by_area` | Search by geographic radius | latitude, longitude, radiusKm |
+| `search_by_area` | Search transactions by geographic radius | latitude, longitude, radiusKm |
 | `get_market_overview` | Database overview and stats | (none) |
 | `list_locations` | List available locations | search (optional) |
 | `search_parcels` | Search parcels by cadastral ID prefix | q (parcel ID prefix, min 3 chars) |
-| `search_by_polygon` | Search within a GeoJSON polygon | polygon, propertyType, dateFrom/dateTo |
+| `list_parcels_in_area` | List the cadastral parcels in an area - light list or full outlines | teryt, location, bbox, lat + lng + radiusKm, or polygon; includeGeometry, minArea/maxArea, street/buildingNumber, cursor |
+| `search_by_polygon` | Search transactions within a GeoJSON polygon | polygon, propertyType, dateFrom/dateTo |
 | `compare_locations` | Compare stats across 2-5 districts | districts (comma-separated), propertyType |
 | `get_building_breakdown` | Per-building breakdown for one transaction (footprint, storeys, est. floor area) | transaction_id (UUID from a search result) |
-| `get_parcel_report` | Composite dossier for one parcel: core, 9 enrichment layers, transaction history, local price context and municipal context | parcelId (cadastral id or UUID) |
-| `resolve_parcel` | Resolve a cadastral parcel identifier to its canonical record | parcelId or q (id prefix), or lat + lng |
+| `get_parcel_report` | Composite dossier for one parcel: core, 13 enrichment layers, transaction history, local price context and municipal context | parcelId (cadastral id or UUID) |
+| `resolve_parcel` | Resolve a parcel to its cadastral identity | parcelId, q (full cadastral id or 'locality + parcel number' - not a street address), or lat + lng |
 | `get_demographics` | Population and demographic context for a location | location or teryt, year (or yearFrom/yearTo), category |
 | `get_infrastructure_signals` | Municipal infrastructure signals (tenders, utilities, capital spending) | location or teryt |
 | `estimate_value` | Comparable-sales value estimate for a property | area, plus lat + lng or parcelId; rooms, market |
@@ -235,6 +248,9 @@ You can also use the `--http` CLI flag instead of `MCP_TRANSPORT=http`.
 | `get_transaction_permits` | Building permits recorded for the property | transaction_id |
 | `get_transaction_planning` | Local zoning and planning status for the property | transaction_id |
 | `get_transaction_farmland` | Agricultural land-use classification for the property | transaction_id |
+| `get_transaction_nature` | Nearby forest and overlapping protected natural areas for the property | transaction_id |
+| `get_transaction_subsurface` | Mining terrains and major groundwater reservoirs under the property | transaction_id |
+| `get_transaction_roads` | Geometric evidence of road access for the property (distances, road class, access indicator) | transaction_id |
 
 ### Location naming
 
@@ -266,13 +282,24 @@ Results include parcel IDs and GPS coordinates, enabling multi-step research:
 
 This mimics how a property appraiser finds comparable transactions for valuation reports.
 
+Starting from the land rather than from a deed is a different route:
+
+```
+1. List the parcels     -> list_parcels_in_area(location="Wawer", minArea=800)
+2. Draw the ones you want -> list_parcels_in_area(bbox="21.10,52.20,21.14,52.23", includeGeometry=true)
+3. Open one in full     -> get_parcel_report(parcelId="146518_8.0108.27")
+```
+
+Step 1 pages by cursor; step 2 is capped and usually truncated, so narrow the box rather than reading
+a truncated answer as the parcel list of the area.
+
 ## Data
 
 - **8M+ transactions** from all of Poland (380 counties)
 - **Date range:** 2003 - present
 - **Source:** Polish national RCN registry (Rejestr Cen Nieruchomosci)
 - **Refresh:** periodic updates from RCN
-- **Per-parcel context:** zoning, flood and landslide risk, heritage register, building permits and construction activity, transit access, agricultural land use and surroundings, addressable by cadastral ID
+- **Per-parcel context:** zoning, flood and landslide risk, heritage register, building permits and construction activity, transit access, agricultural land use, surroundings, nature (nearby forest and protected areas), subsurface (mining terrains and major groundwater reservoirs), land-use and soil-quality classification, and road access - addressable by cadastral ID
 
 ## Troubleshooting
 
@@ -283,6 +310,8 @@ This mimics how a property appraiser finds comparable transactions for valuation
 **A location returns 0 results** - The name may not be an administrative unit. Districts and neighbourhoods are two different things: "Mokotow" is a district and works, "Sluzew" is a neighbourhood inside it and does not. Use `list_locations(search="...")` to find valid names, or search by radius (`search_by_area`) for anything smaller than a district.
 
 **401 Unauthorized (HTTP mode)** - The `Authorization` header must be `Bearer cngrm_...` (with the `Bearer` prefix). Double-check that the full API key is included, not just the prefix.
+
+**402 Payment Required** - The account is out of tokens. On a free account the response says the date from which the balance is back at its weekly 50; the key and the connection stay valid until then. A paid plan lifts the limit - see [cenogram.pl/api](https://cenogram.pl/api?src=mcpstdio#cennik).
 
 ## Development
 

@@ -1,4 +1,6 @@
 import { describe, it, expect } from "vitest";
+import { findGuardToken } from "./guard-tokens.js";
+import { registerTools } from "../tools.js";
 import {
   mapPropertyType,
   mapMarketType,
@@ -283,5 +285,101 @@ describe("mapOwnershipTypes", () => {
   it("returns undefined for empty / undefined", () => {
     expect(mapOwnershipTypes(undefined)).toBeUndefined();
     expect(mapOwnershipTypes([])).toBeUndefined();
+  });
+});
+
+// ── Registration and argument schema: get_parcel_land_class ─────────
+//
+// This is the one per-layer tool of the parcel family; every other layer is reachable only through the
+// composite report. That makes its DESCRIPTION load-bearing in a way a schema test cannot cover: an
+// assistant picks between two similar names by reading it, and a caller sizes the cost from it. The
+// assertions below pin what the description has to keep saying, not how it says it.
+
+interface RecordedTool {
+  name: string;
+  description: string;
+  schema: Record<string, unknown> | undefined;
+}
+
+// Positional scan of server.tool(name, description?, schema?, …), the same shape the docs generator
+// relies on (its contract is pinned separately in tool-reference.test.ts).
+function recordTools(): RecordedTool[] {
+  const tools: RecordedTool[] = [];
+  const recorder = {
+    tool(...args: unknown[]) {
+      let i = 1;
+      let description = "";
+      if (typeof args[i] === "string") { description = args[i] as string; i++; }
+      const schema = args[i] && typeof args[i] === "object" ? (args[i] as Record<string, unknown>) : undefined;
+      tools.push({ name: String(args[0] ?? ""), description, schema });
+    },
+  };
+  delete process.env.CENOGRAM_EXPERIMENTAL_TOOLS;
+  registerTools(recorder as unknown as Parameters<typeof registerTools>[0]);
+  return tools;
+}
+
+function landClassTool(): RecordedTool {
+  const found = recordTools().find((t) => t.name === "get_parcel_land_class");
+  expect(found, "get_parcel_land_class is not registered").toBeDefined();
+  return found!;
+}
+
+describe("get_parcel_land_class registration", () => {
+  it("is in the default set, not behind the experimental flag", () => {
+    // The flag gates beta derivatives whose shape may still move. This layer rides the stable
+    // four-state contract, so a caller with no flag set must still see it.
+    const names = recordTools().map((t) => t.name);
+    expect(names).toContain("get_parcel_land_class");
+    expect(names).toContain("get_parcel_report");
+  });
+
+  it("takes exactly one argument: the parcel id", () => {
+    const schema = landClassTool().schema;
+    expect(schema && Object.keys(schema)).toEqual(["parcelId"]);
+  });
+
+  it("accepts a raw '/' id, the '-' form and a UUID, and rejects a string too short to be any of them", () => {
+    // The slash form is the natural one and URL encoding is the HTTP layer's problem, so the schema
+    // must not reject it. The lower bound protects a caller's tokens from a typo becoming a paid call.
+    const parcelId = landClassTool().schema!.parcelId as { safeParse: (v: unknown) => { success: boolean } };
+    expect(parcelId.safeParse("142907_2.0014.342/5").success).toBe(true);
+    expect(parcelId.safeParse("142907_2.0014.342-5").success).toBe(true);
+    expect(parcelId.safeParse("11111111-2222-3333-4444-555555555555").success).toBe(true);
+    expect(parcelId.safeParse("ab").success).toBe(false);
+    expect(parcelId.safeParse(42).success).toBe(false);
+  });
+
+  it("sends every other parcel question to the composite tool", () => {
+    // An assistant picks wrong exactly when two tool names look alike, so the description has to name
+    // the alternative rather than merely describe itself.
+    expect(landClassTool().description).toContain("get_parcel_report");
+  });
+
+  it("names all four coverage states and the refund rule", () => {
+    const description = landClassTool().description;
+    for (const state of ["covered_no_data", "not_covered", "not_computed"]) {
+      expect(description, `state ${state} is not explained`).toContain(state);
+    }
+    expect(description).toContain("Costs 4 API tokens");
+    expect(description).toMatch(/refunded on not_covered and not_computed/);
+  });
+
+  it("promises no prevailing category and no share", () => {
+    // The source records no per-category area, so any ranking or percentage a caller inferred from the
+    // description would be invented. The description says so instead of leaving room for the inference.
+    const description = landClassTool().description;
+    expect(description).toContain("can never say which category prevails");
+    expect(description).not.toContain("%");
+  });
+
+  it("says what the layer does not cover without quoting a coverage figure", () => {
+    const description = landClassTool().description;
+    expect(description).toContain("many counties");
+    expect(description).not.toMatch(/\d+(\.\d+)?\s*(percent|per cent)/i);
+  });
+
+  it("carries no guarded term in its description", () => {
+    expect(findGuardToken(landClassTool().description)).toBeNull();
   });
 });

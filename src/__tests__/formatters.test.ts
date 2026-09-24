@@ -14,24 +14,33 @@ import {
   formatSpatialResults,
   formatCompareResults,
   formatLocationHierarchy,
+  formatLocationSearch,
   formatRentalYield,
   formatRentalYieldLocations,
   formatPriceSpread,
   formatPriceSpreadLocations,
+  formatFloodRisk,
+  formatFloodRiskLocations,
   formatValuation,
   formatBuildingBreakdown,
   formatFloodBreakdown,
   formatHeritageBreakdown,
   formatLandslideBreakdown,
+  formatNatureBreakdown,
+  formatSubsurfaceBreakdown,
   formatSurroundings,
+  formatRoads,
   formatTransitBreakdown,
   formatPermitsBreakdown,
   formatPlanningBreakdown,
   formatFarmland,
   formatDemographics,
   formatParcelReport,
+  formatParcelLandClass,
+  formatCorpusCoverage,
+  REPORT_LAYER_ORDER,
 } from "../formatters.js";
-import type { Transaction, TransactionsResponse, StatsResponse, PricePerM2Row, HistogramBin, ParcelSearchResponse, SpatialSearchResponse, SpatialFeature, CompareResponse, LocationItem, RentalYieldResponse, RentalYieldLocationsResponse, PriceSpreadResponse, PriceSpreadLocationsResponse, ValuationResponse, BuildingBreakdownResponse, FloodBreakdownResponse, HeritageBreakdownResponse, LandslideBreakdownResponse, SurroundingsResponse, TransitBreakdownResponse, PermitsResponse, PlanningResponse, FarmlandResponse, DemographicsResponse, ParcelResolveResponse, ParcelReportResponse } from "../api-client.js";
+import type { Transaction, TransactionsResponse, StatsResponse, PricePerM2Row, HistogramBin, ParcelSearchResponse, SpatialSearchResponse, SpatialFeature, CompareResponse, LocationItem, LocationSearchItem, RentalYieldResponse, RentalYieldLocationsResponse, PriceSpreadResponse, PriceSpreadLocationsResponse, FloodRiskResponse, FloodRiskLocationsResponse, ValuationResponse, BuildingBreakdownResponse, FloodBreakdownResponse, HeritageBreakdownResponse, LandslideBreakdownResponse, NatureBreakdownResponse, SubsurfaceBreakdownResponse, SurroundingsResponse, RoadsBreakdownResponse, TransitBreakdownResponse, PermitsResponse, PlanningResponse, FarmlandResponse, DemographicsResponse, ParcelResolveResponse, ParcelReportResponse, ParcelLandClassResponse, CorpusCoverage } from "../api-client.js";
 
 const sampleTx: Transaction = {
   id: "1",
@@ -354,6 +363,110 @@ describe("formatBuildingBreakdown", () => {
     const result = formatBuildingBreakdown(full).toLowerCase();
     expect(findGuardToken(result)).toBeNull();
   });
+
+  // ── Construction age ──────────────────────────────────────────────
+  //
+  // The rollout window and every API rollback leave this server receiving rows WITHOUT the age field.
+  // That is the one path where a correct rollback could still show a visible failure, so it is asserted
+  // first and asserted twice (no exception, no stray line).
+  const withAge = (age: unknown): BuildingBreakdownResponse => ({
+    data: [{ ...full.data[0]!, age_estimate: age as never }],
+    truncated: false,
+  });
+
+  it("a row without the age field renders normally and adds no age line", () => {
+    const result = formatBuildingBreakdown(full);
+    expect(result).toContain("Per-building breakdown (2 buildings)");
+    expect(result).not.toContain("built");
+    expect(result).not.toContain("construction year");
+  });
+
+  it("an estimated age renders as an interval, never as a bare year", () => {
+    const result = formatBuildingBreakdown(withAge({
+      status: "estimated", year_from: 2019, year_to: 2022, year_point: 2021,
+      basis: "permit_decision", basis_year: 2019, match_rule: "pinned_single",
+      confidence: "high", offset_model: "residential_multi_family", last_works_year: null, note: "",
+    }));
+    expect(result).toContain("range 2019-2022");
+    expect(result).toContain("~2021");
+    // Order is part of the contract: the measured range leads, the single year follows it. A reader
+    // that meets the year first quotes the year and drops the range.
+    expect(result.indexOf("range 2019-2022")).toBeLessThan(result.indexOf("~2021"));
+    expect(result).toContain("not a registry date");
+    // The grade must never render as a bare "high confidence": it grades the building-to-permit match,
+    // and the measurement shows it does not order the error on the year. Naming what it covers — and
+    // what it does not — is the contract, so both halves are asserted.
+    expect(result).toContain("high confidence in the permit match (not in the year)");
+    expect(result).not.toMatch(/high confidence(?! in the permit match)/);
+  });
+
+  it("a class without a calibrated point renders the interval alone", () => {
+    const result = formatBuildingBreakdown(withAge({
+      status: "estimated", year_from: 2019, year_to: 2022, year_point: null,
+      basis: "permit_decision", basis_year: 2019, match_rule: "pinned_single",
+      confidence: "medium", offset_model: "pooled", last_works_year: null, note: "",
+    }));
+    expect(result).toContain("range 2019-2022");
+    expect(result).not.toContain("~");
+  });
+
+  it("a refusal renders as a sentence, not as a missing line", () => {
+    for (const status of ["older_than_register", "ambiguous_permits", "ambiguous_buildings", "ambiguous_both", "no_parcel_key", "not_applicable", "not_computed"]) {
+      const result = formatBuildingBreakdown(withAge({
+        status, year_from: null, year_to: null, year_point: null, basis: null, basis_year: null,
+        match_rule: null, confidence: null, offset_model: null, last_works_year: null, note: "",
+      }));
+      expect(result).toContain("construction year not established");
+    }
+  });
+
+  // This package and the service it reads are deployed separately, so the closed union in the types is
+  // not closed at runtime. An unrecognised status must still produce a sentence: a missing line reads
+  // as "the age was never discussed", which is the exact misreading the age rendering exists to avoid.
+  it("an unrecognised status renders as a sentence, not as a missing line", () => {
+    const result = formatBuildingBreakdown(withAge({
+      status: "some_future_status", year_from: null, year_to: null, year_point: null, basis: null,
+      basis_year: null, match_rule: null, confidence: null, offset_model: null, last_works_year: null, note: "",
+    }));
+    expect(result).toContain("construction year not established");
+    expect(result).toContain("does not recognise");
+  });
+
+  it("an unrecognised status still surfaces later works", () => {
+    const result = formatBuildingBreakdown(withAge({
+      status: "some_future_status", year_from: null, year_to: null, year_point: null, basis: null,
+      basis_year: null, match_rule: null, confidence: null, offset_model: null, last_works_year: 2024, note: "",
+    }));
+    expect(result).toContain("later works 2024");
+  });
+
+  // "estimated" with a missing edge is a contradiction on the wire, not a case to pass over in silence.
+  it("an estimated status without a full interval refuses out loud instead of dropping the line", () => {
+    for (const partial of [{ year_from: 2019, year_to: null }, { year_from: null, year_to: 2022 }]) {
+      const result = formatBuildingBreakdown(withAge({
+        status: "estimated", ...partial, year_point: null, basis: "permit_decision", basis_year: 2019,
+        match_rule: "pinned_single", confidence: "high", offset_model: "pooled", last_works_year: null, note: "",
+      }));
+      expect(result).toContain("construction year not established");
+      expect(result).not.toContain("built range");
+    }
+  });
+
+  it("later works are surfaced next to a refusal, so the reader knows the structure was touched", () => {
+    const result = formatBuildingBreakdown(withAge({
+      status: "older_than_register", year_from: null, year_to: null, year_point: null, basis: null,
+      basis_year: null, match_rule: null, confidence: null, offset_model: null, last_works_year: 2024, note: "",
+    }));
+    expect(result).toContain("later works 2024");
+  });
+
+  it("the age rendering never names the source register", () => {
+    const result = formatBuildingBreakdown(withAge({
+      status: "older_than_register", year_from: null, year_to: null, year_point: null, basis: null,
+      basis_year: null, match_rule: null, confidence: null, offset_model: null, last_works_year: null, note: "",
+    })).toLowerCase();
+    expect(findGuardToken(result)).toBeNull();
+  });
 });
 
 describe("formatTransaction — flood-hazard", () => {
@@ -508,6 +621,59 @@ describe("formatSurroundings", () => {
   it("two-state empty data → neutral message (no linked plots or unknown id)", () => {
     const result = formatSurroundings({ data: [], truncated: false });
     expect(result).toContain("No surroundings data is available");
+  });
+
+  // The two power-line keys are OPTIONAL: the service may omit them entirely instead of sending nulls.
+  // Rendering "none within 1 km" for an ABSENT key would convert that silence into a false negative
+  // statement — an absent key is no claim, only a null carries "nothing within the radius".
+  it("omits a category whose key the service did not send", () => {
+    const result = formatSurroundings(full);
+    expect(result).not.toContain("high-voltage overhead power line");
+  });
+
+  it("renders the power-line categories once the service sends them", () => {
+    const withLines: SurroundingsResponse = {
+      data: [{ ...full.data[0]!, power_line_hv_distance_m: 420.4, power_line_ehv_distance_m: null }],
+      truncated: false,
+    };
+    const result = formatSurroundings(withLines);
+    expect(result).toContain("high-voltage overhead power line: ~420 m");
+    expect(result).toContain("extra-high-voltage overhead power line: none within 1 km");
+  });
+
+  // The shape the service sends once the power-line fields are published: all eight categories on the
+  // row, none of them withheld. Asserted as a set rather than a substring so a category quietly dropped
+  // from the renderer's list cannot pass by leaving the other seven intact.
+  it("all eight categories present → all eight are rendered on one line", () => {
+    const eight: SurroundingsResponse = {
+      data: [{
+        assessed: true,
+        cemetery_distance_m: 240.5,
+        landfill_distance_m: 1234.56,
+        sewage_treatment_distance_m: 1800,
+        industrial_area_distance_m: 890,
+        industrial_plant_distance_m: 1500,
+        livestock_farm_distance_m: 2750.4,
+        power_line_hv_distance_m: 412.3,
+        power_line_ehv_distance_m: 907.85,
+      }],
+      truncated: false,
+    };
+    const result = formatSurroundings(eight);
+    for (const label of [
+      "cemetery: ~241 m",
+      "landfill (waste disposal): ~1235 m",
+      "sewage treatment plant: ~1800 m",
+      "industrial/storage area: ~890 m",
+      "large industrial plant: ~1500 m",
+      "intensive livestock farm: ~2750 m",
+      "high-voltage overhead power line: ~412 m",
+      "extra-high-voltage overhead power line: ~908 m",
+    ]) {
+      expect(result).toContain(label);
+    }
+    // Eight categories → seven separators on the single plot line; a dropped one would leave six.
+    expect(result.split("\n").find((l) => l.startsWith("1. "))!.split(" | ")).toHaveLength(8);
   });
 
   it("handles an absent truncated flag (optional over the wire)", () => {
@@ -843,7 +1009,7 @@ describe("formatPermitsBreakdown", () => {
 
   it("two-state empty data → neutral message that never asserts nothing was planned", () => {
     const result = formatPermitsBreakdown({ data: [], truncated: false });
-    expect(result).toContain("No positively-resolved building permit");
+    expect(result).toContain("No building permit or works notification is on record");
     expect(result).toContain("never a statement that nothing was ever planned");
   });
 
@@ -1095,6 +1261,207 @@ describe("formatLandslideBreakdown", () => {
   it("truncated → appends the 500-parcel note", () => {
     const result = formatLandslideBreakdown({ ...full, truncated: true });
     expect(result).toContain("first 500 parcels");
+  });
+});
+
+describe("formatNatureBreakdown", () => {
+  const full: NatureBreakdownResponse = {
+    data: [
+      // Already-scrubbed shape (canonical EN forms + official area names; no source-register fingerprint).
+      {
+        forest_distance_m: 0, forest_overlap_pct: "35.00" as unknown as number, protection_rank: 1,
+        building_restriction: "statutory_ban", protected_overlap_pct: "60.00" as unknown as number,
+        protected_forms: ["national_park", "natura2000_habitat"],
+        protected_areas: [
+          { form: "national_park", name: "Kampinoski Park Narodowy", overlap_pct: "50.00" as unknown as number },
+          { form: "natura2000_habitat", name: "Puszcza Kampinoska", overlap_pct: "12.00" as unknown as number },
+        ],
+      },
+      {
+        forest_distance_m: 830, forest_overlap_pct: null, protection_rank: null,
+        building_restriction: null, protected_overlap_pct: null, protected_forms: null, protected_areas: null,
+      },
+    ],
+    truncated: false,
+  };
+
+  it("renders forest overlap + the sharpest form, restriction, share and named areas", () => {
+    const result = formatNatureBreakdown(full);
+    expect(result).toContain("Per-parcel nature breakdown (2 parcels with a forest or protected-area signal)");
+    expect(result).toContain("forest: overlaps the parcel (35% of area)");
+    expect(result).toContain("protection: national park");
+    expect(result).toContain("build restriction: statutory_ban");
+    expect(result).toContain("60% of the parcel under protection");
+    expect(result).toContain("areas: Kampinoski Park Narodowy; Puszcza Kampinoska");
+    // Forest-only parcel: distance rendered, no protection cells.
+    expect(result).toContain("2. forest: 830 m away");
+  });
+
+  it("names the SOURCE of the restriction, never rules on a case — no 'null' rendered", () => {
+    const result = formatNatureBreakdown(full);
+    expect(result).toContain("not the outcome of any permitting case");
+    expect(result).toContain("never a statement that building is allowed");
+    expect(result).not.toContain("null");
+  });
+
+  // The three empty states. They differ in ONE thing that matters more than any field we render: whether
+  // we are entitled to say the world has no forest and no protected area here. Only the checked one is.
+  it("empty + covered_no_data → the settled negative, still hedged on an unknown id", () => {
+    const result = formatNatureBreakdown({ data: [], truncated: false, coverage: "covered_no_data" });
+    expect(result).toContain("No forest within 2 km and no protected natural area overlaps");
+    expect(result).toContain("never a statement that building is allowed");
+  });
+
+  it("empty + not_covered → 'nothing was checked', and NEVER the settled negative", () => {
+    const result = formatNatureBreakdown({ data: [], truncated: false, coverage: "not_covered" });
+    expect(result).toContain("nothing was checked");
+    expect(result).toContain("NOT a finding");
+    // The exact sentence the endpoint used to emit for an unchecked layer. Its absence is the whole fix:
+    // an empty source must not be rendered as a verified absence of forest or protection.
+    expect(result).not.toContain("No forest within 2 km and no protected natural area overlaps");
+  });
+
+  it("empty with NO coverage field (older server) → hedges, asserts neither reading", () => {
+    const result = formatNatureBreakdown({ data: [], truncated: false });
+    expect(result).toContain("does not distinguish");
+    expect(result).not.toContain("No forest within 2 km and no protected natural area overlaps");
+    expect(result).toContain("never as a statement that building is allowed");
+  });
+
+  it("singular 'parcel' when there is exactly one; truncated appends the 500-parcel note", () => {
+    const one = formatNatureBreakdown({ data: [full.data[0]!], truncated: true });
+    expect(one).toContain("(1 parcel with a forest");
+    expect(one).not.toContain("(1 parcels");
+    expect(one).toContain("first 500 parcels");
+  });
+
+  it("no guarded source term leaks into the rendered output", () => {
+    expect(findGuardToken(formatNatureBreakdown(full))).toBeNull();
+    // The empty messages talk ABOUT our data holdings, which is exactly where naming the register we
+    // read from is tempting. Sweep them too.
+    for (const coverage of ["covered_no_data", "not_covered", undefined] as const) {
+      expect(findGuardToken(formatNatureBreakdown({ data: [], truncated: false, coverage }))).toBeNull();
+    }
+  });
+});
+
+describe("formatSubsurfaceBreakdown", () => {
+  const full: SubsurfaceBreakdownResponse = {
+    // Input mirrors the API's already-scrubbed shape (neutral EN classes, no source-register fingerprint).
+    data: [
+      {
+        mining_status: "active", mineral_class: "subsidence", mining_overlap_pct: "55.00" as unknown as number,
+        mining_terrains: [
+          { name: "Lubin", status: "active", mineral_class: "subsidence", oversight_authority: "Okręgowy Urząd Górniczy - Wrocław", valid_until: "2030-12-31", revoked_on: null, overlap_pct: "55.00" as unknown as number },
+        ],
+        groundwater_status: "documented", groundwater_overlap_pct: "80.00" as unknown as number,
+        groundwater_bodies: [
+          { number: 319, name: "Subzbiornik Prochowice-Środa", documentation_status: "documented", documented_year: 2011, depth_from_m: 40, medium_type: "porous", overlap_pct: "80.00" as unknown as number },
+        ],
+      },
+      {
+        mining_status: null, mineral_class: null, mining_overlap_pct: null, mining_terrains: null,
+        groundwater_status: "undocumented", groundwater_overlap_pct: "100.00" as unknown as number,
+        groundwater_bodies: [{ number: 215, name: "Subniecka warszawska", documentation_status: "undocumented", documented_year: null, depth_from_m: null, medium_type: null, overlap_pct: "100.00" as unknown as number }],
+      },
+    ],
+    truncated: false,
+  };
+
+  it("renders one numbered line per in-zone parcel with both dimensions, class meaning and shares", () => {
+    const result = formatSubsurfaceBreakdown(full);
+    expect(result).toContain("Per-parcel subsurface breakdown (2 parcels overlapping a mining terrain or a major groundwater reservoir)");
+    expect(result).toContain("mining terrain: active, subsidence (extraction with surface deformation — the actual mining-damage risk)");
+    expect(result).toContain("55% of the parcel in the terrain");
+    expect(result).toContain("oversight: Okręgowy Urząd Górniczy - Wrocław");
+    // distinction 2: reservoir extent is explicitly not a restriction.
+    expect(result).toContain("groundwater reservoir: documented (reservoir extent only — not a restriction)");
+    expect(result).toContain("no. 319");
+    // second parcel: groundwater-only, undocumented is rendered distinctly.
+    expect(result).toContain("groundwater reservoir: undocumented");
+  });
+
+  it("carries all three distinctions in the closing note; never asserts safety", () => {
+    const result = formatSubsurfaceBreakdown(full);
+    expect(result).toContain("advisory signal to verify with the competent mining-supervision authority");
+    expect(result).toContain("extent alone imposes NO restriction");
+    expect(result).toContain("never asserted as 'safe'");
+  });
+
+  it("closing note explains a past valid_until on an 'active' terrain", () => {
+    // Without this the client reads a past date on a live terrain as a defect in our copy. The
+    // wording is a translation of the Polish variant the public data page already serves, so the two
+    // surfaces say one thing; the API route descriptions carry the same sentence.
+    const result = formatSubsurfaceBreakdown(full);
+    expect(result).toContain(
+      "Some terrains with status 'active' carry a valid_until already in the past, because the register entry can lag behind the expiry of a concession.",
+    );
+  });
+
+  it("renders the per-object cap only when the API says the list reached it", () => {
+    const capped: SubsurfaceBreakdownResponse = {
+      data: [{ ...full.data[0]!, mining_terrains_capped: true, groundwater_bodies_capped: true }],
+      truncated: false,
+    };
+    const result = formatSubsurfaceBreakdown(capped);
+    expect(result).toContain("terrains: Lubin, oversight: Okręgowy Urząd Górniczy - Wrocław, valid until 2030-12-31 (list reached the 5-entry cap)");
+    expect(result).toContain("(list reached the 5-entry cap)");
+    // The cap is a fact about OUR list, never a claim about how many objects are out there.
+    expect(result).not.toMatch(/more (objects|terrains|reservoirs)/i);
+  });
+
+  it("an uncapped list — and a payload from an API build without the flag — renders no cap note", () => {
+    // `full` carries neither flag, which is exactly the shape an older API build sends. An absent
+    // flag must read as "no cap statement", never as a cap.
+    expect(formatSubsurfaceBreakdown(full)).not.toContain("5-entry cap");
+    const explicitlyFalse: SubsurfaceBreakdownResponse = {
+      data: [{ ...full.data[0]!, mining_terrains_capped: false, groundwater_bodies_capped: false }],
+      truncated: false,
+    };
+    expect(formatSubsurfaceBreakdown(explicitlyFalse)).not.toContain("5-entry cap");
+  });
+
+  it("two-state empty data → neutral message that never asserts safety", () => {
+    const result = formatSubsurfaceBreakdown({ data: [], truncated: false });
+    expect(result).toContain("No mapped mining terrain or major groundwater reservoir overlaps this transaction's parcels");
+    expect(result).toContain("never asserted as 'safe'");
+  });
+
+  it("singular 'parcel' when there is exactly one", () => {
+    const one: SubsurfaceBreakdownResponse = { data: [full.data[0]!], truncated: false };
+    const result = formatSubsurfaceBreakdown(one);
+    expect(result).toContain("(1 parcel overlapping");
+    expect(result).not.toContain("(1 parcels");
+  });
+
+  it("truncated → appends the 500-parcel note", () => {
+    const result = formatSubsurfaceBreakdown({ ...full, truncated: true });
+    expect(result).toContain("first 500 parcels");
+  });
+
+  it("defense-in-depth: a both-null row is skipped, never a bare 'N.' line, numbering stays contiguous", () => {
+    const withEmpty: SubsurfaceBreakdownResponse = {
+      data: [
+        { mining_status: null, mineral_class: null, mining_overlap_pct: null, mining_terrains: null,
+          groundwater_status: null, groundwater_overlap_pct: null, groundwater_bodies: null },
+        full.data[0]!,
+      ],
+      truncated: false,
+    };
+    const result = formatSubsurfaceBreakdown(withEmpty);
+    expect(result).not.toMatch(/^\d+\.\s*$/m); // no empty numbered line
+    expect(result).toContain("1. mining terrain: active"); // the real row is numbered 1, not 2
+    expect(result).not.toContain("2.");
+  });
+
+  it("renders only neutral vocabulary — no source-dataset attribution in the formatter's own strings", () => {
+    // The formatter's labels + closing note stay register-agnostic: it names neither the source dataset
+    // nor its publisher, and renders only the neutral domain terms plus the values the API already
+    // scrubbed. (No source-dataset acronym is spelled out here — that keeps this public test clean too.)
+    const result = formatSubsurfaceBreakdown(full);
+    expect(result).toContain("mining terrain");
+    expect(result).toContain("groundwater reservoir");
+    expect(result).not.toMatch(/\bsource\b|\bpublisher\b|\bdataset\b|\bregistry\b|©/i);
   });
 });
 
@@ -1592,6 +1959,76 @@ describe("formatPriceSpreadLocations", () => {
   });
 });
 
+describe("formatFloodRisk", () => {
+  const full: FloodRiskResponse = {
+    location: { name: "Warszawa", country_code: "PL", location_type: "city", teryt: "1465" },
+    metric: "flood_exposure_share",
+    result: { flood_share_pct: 18.5, by_severity: { low: 10, medium: 60, high: 30 } },
+    inputs: { assessed_sample_n: 540, window: "all_time" },
+    quality: { coverage: "full", confidence: "high", as_of: "2026-06-01", stale: false, notes: ["aggregated over the county's whole transaction history (all-time, no date window)"] },
+  };
+
+  it("renders share, severity breakdown and samples", () => {
+    const result = formatFloodRisk(full);
+    expect(result).toContain("Flood-hazard exposure — Warszawa");
+    expect(result).toContain("18.5% of assessed transactions");
+    expect(result).toContain("High (~1-in-10-year): 30");
+    expect(result).toContain("Medium (~1-in-100-year): 60");
+    expect(result).toContain("Low (~1-in-500-year): 10");
+    expect(result).toContain("Assessed transactions: 540 (all-time)");
+    expect(result).toContain("Coverage: full | Confidence: high");
+  });
+
+  it("suppressed: N/A share, no severity block", () => {
+    const suppressed: FloodRiskResponse = {
+      ...full,
+      result: { flood_share_pct: null, by_severity: { low: null, medium: null, high: null } },
+      quality: { ...full.quality, coverage: "suppressed" },
+    };
+    const result = formatFloodRisk(suppressed);
+    expect(result).toContain("N/A (coverage: suppressed)");
+    expect(result).not.toContain("High (~1-in-10-year)");
+  });
+
+  it("stale flag surfaces the publication-lag note", () => {
+    const result = formatFloodRisk({ ...full, quality: { ...full.quality, stale: true } });
+    expect(result).toContain("transaction data lags publication");
+  });
+
+  it("never leaks the flood-data source brand", () => {
+    // findGuardToken already covers the source-authority / map-layer tokens (see guard-tokens.ts) —
+    // asserting against the shared list, not literals here, keeps those brand strings out of the repo.
+    const result = formatFloodRisk(full).toLowerCase();
+    expect(findGuardToken(result)).toBeNull();
+  });
+});
+
+describe("formatFloodRiskLocations", () => {
+  const catalog: FloodRiskLocationsResponse = {
+    data: [
+      { location: "Warszawa", county_code: "1465", voivodeship: "Mazowieckie", type: "city", assessed_sample_n: 5000, confidence: "high" },
+      { location: "Kraków", county_code: "1261", voivodeship: "Małopolskie", type: "city", assessed_sample_n: 900, confidence: "high" },
+    ],
+    meta: { total: 2, snapshot_date: "2026-06-02" },
+  };
+
+  it("renders header with count + one line per location", () => {
+    const result = formatFloodRiskLocations(catalog);
+    expect(result).toContain("2 locations");
+    expect(result).toContain("Warszawa (teryt 1465, Mazowieckie, city) — n=5000, high confidence");
+  });
+
+  it("empty data → friendly no-match message", () => {
+    const result = formatFloodRiskLocations({ data: [], meta: { total: 0, snapshot_date: null } });
+    expect(result).toContain("No flood-risk-covered locations match");
+  });
+
+  it("never leaks the data source brand", () => {
+    const result = formatFloodRiskLocations(catalog).toLowerCase();
+    expect(findGuardToken(result)).toBeNull();
+  });
+});
+
 describe("formatValuation", () => {
   const covered: ValuationResponse = {
     location: { country_code: "PL", lat: 52.2297, lng: 21.0122, county_code: "1465" },
@@ -1797,9 +2234,24 @@ describe("formatParcelResolve", () => {
     expect(result).toContain("2026-06-30");
   });
 
+  it("states the cost on a successful resolve, not only on a refunded miss", () => {
+    // The success path used to say nothing about price; the free-tool cost is now stated here so a
+    // caller sees it whatever the outcome (the miss branches already carry the "refunded" wording).
+    const result = formatParcelResolve(base);
+    expect(result).toContain("Query cost: 0 API tokens");
+    expect(result).toContain("free");
+  });
+
   it("reports not_covered as a refunded miss", () => {
     const result = formatParcelResolve({ ...base, coverage: "not_covered", matches: [], as_of: null });
     expect(result).toContain("No parcel matched");
+    expect(result).toContain("refunded");
+  });
+
+  it("keeps not_computed distinct from a miss — it asserts nothing about existence", () => {
+    const result = formatParcelResolve({ ...base, coverage: "not_computed", matches: [], as_of: null });
+    expect(result).not.toContain("No parcel matched");
+    expect(result).toContain("could not be completed");
     expect(result).toContain("refunded");
   });
 
@@ -2021,23 +2473,23 @@ describe("formatFarmland", () => {
 
 describe("formatLocationHierarchy", () => {
   const voivodeships: LocationItem[] = [
-    { code: "02", name: "dolnośląskie", typeName: null, level: "voivodeship" },
-    { code: "14", name: "mazowieckie", typeName: null, level: "voivodeship" },
+    { code: "02", name: "dolnośląskie", typeName: null, level: "voivodeship", parent_name: null },
+    { code: "14", name: "mazowieckie", typeName: null, level: "voivodeship", parent_name: null },
   ];
 
   const counties: LocationItem[] = [
-    { code: "1401", name: "Warszawa", typeName: null, level: "county" },
-    { code: "1402", name: "ciechanowski", typeName: null, level: "county" },
+    { code: "1401", name: "Warszawa", typeName: null, level: "county", parent_name: null },
+    { code: "1402", name: "ciechanowski", typeName: null, level: "county", parent_name: null },
   ];
 
   const municipalities: LocationItem[] = [
-    { code: "140101", name: "Warszawa", typeName: "gmina miejska", level: "municipality" },
-    { code: "321705", name: "Wałcz", typeName: "gmina wiejska", level: "municipality" },
+    { code: "140101", name: "Warszawa", typeName: "gmina miejska", level: "municipality", parent_name: null },
+    { code: "321705", name: "Wałcz", typeName: "gmina wiejska", level: "municipality", parent_name: null },
   ];
 
   const precincts: LocationItem[] = [
-    { code: "321705_2.0054", name: "Strączno", typeName: null, level: "precinct" },
-    { code: "321705_2.0055", name: "Szwecja", typeName: null, level: "precinct" },
+    { code: "321705_2.0054", name: "Strączno", typeName: null, level: "precinct", parent_name: null },
+    { code: "321705_2.0055", name: "Szwecja", typeName: null, level: "precinct", parent_name: null },
   ];
 
   it("formats voivodeships without parent", () => {
@@ -2099,14 +2551,105 @@ describe("formatLocationHierarchy", () => {
 
   it("uses first item level for header when items have mixed levels", () => {
     const mixed: LocationItem[] = [
-      { code: "1401", name: "Warszawa", typeName: null, level: "county" },
-      { code: "140101", name: "Warszawa", typeName: "gmina miejska", level: "municipality" },
+      { code: "1401", name: "Warszawa", typeName: null, level: "county", parent_name: null },
+      { code: "140101", name: "Warszawa", typeName: "gmina miejska", level: "municipality", parent_name: null },
     ];
     const result = formatLocationHierarchy(mixed, "14");
     expect(result).toContain("level: county");
     expect(result).toContain("counties");
     expect(result).toContain("1401 - Warszawa");
     expect(result).toContain("140101 - Warszawa");
+  });
+});
+
+describe("formatLocationSearch", () => {
+  const county: LocationSearchItem = {
+    code: "2217", name: "wejherowski", typeName: "powiat", level: "county",
+    parent_name: "pomorskie", rcn_district: false,
+  };
+  const municipality: LocationSearchItem = {
+    code: "221701", name: "Wejherowo", typeName: "gmina miejska", level: "municipality",
+    parent_name: "wejherowski", rcn_district: true,
+  };
+  const voivodeship: LocationSearchItem = {
+    code: "22", name: "pomorskie", typeName: null, level: "voivodeship",
+    parent_name: null, rcn_district: false,
+  };
+  const precinct: LocationSearchItem = {
+    code: "221701_1.0001", name: "Śmiechowo", typeName: null, level: "precinct",
+    parent_name: "Wejherowo", rcn_district: false,
+  };
+
+  it("groups by level and shows code, name, typeName and parent_name", () => {
+    const result = formatLocationSearch([county, municipality], [], "Wejherowo");
+    expect(result).toContain("Counties:");
+    expect(result).toContain("2217 - wejherowski (powiat), pomorskie");
+    expect(result).toContain("Municipalities:");
+    expect(result).toContain("221701 - Wejherowo (gmina miejska), wejherowski");
+  });
+
+  it("prints teryt and parcel calls for every row", () => {
+    const result = formatLocationSearch([municipality], [], "x");
+    expect(result).toContain('search_transactions(teryt="221701")');
+    expect(result).toContain('list_parcels_in_area(teryt="221701")');
+  });
+
+  it("prints list_locations(parent=) for county and municipality only", () => {
+    const result = formatLocationSearch([county, voivodeship, precinct], [], "x");
+    expect(result).toContain('list_locations(parent="2217")');
+    expect(result).not.toContain('list_locations(parent="22")');
+    expect(result).not.toContain('list_locations(parent="221701_1.0001")');
+  });
+
+  it("prints get_demographics for voivodeship/county/municipality but not precinct", () => {
+    expect(formatLocationSearch([voivodeship], [], "x")).toContain('get_demographics(teryt="22")');
+    expect(formatLocationSearch([county], [], "x")).toContain('get_demographics(teryt="2217")');
+    expect(formatLocationSearch([precinct], [], "x")).not.toContain("get_demographics");
+  });
+
+  it("prints get_infrastructure_signals for county/municipality only", () => {
+    expect(formatLocationSearch([county], [], "x")).toContain('get_infrastructure_signals(teryt="2217")');
+    expect(formatLocationSearch([voivodeship], [], "x")).not.toContain("get_infrastructure_signals");
+    expect(formatLocationSearch([precinct], [], "x")).not.toContain("get_infrastructure_signals");
+  });
+
+  it("prints name-based calls only when rcn_district is true", () => {
+    const withRcn = formatLocationSearch([municipality], [], "x");
+    expect(withRcn).toContain('search_transactions(location="Wejherowo")');
+    expect(withRcn).toContain("compare_locations(");
+    expect(withRcn).toContain('get_price_statistics(location="Wejherowo")');
+    const noRcn = formatLocationSearch([county], [], "x");
+    expect(noRcn).not.toContain('search_transactions(location="wejherowski")');
+    expect(noRcn).not.toContain("compare_locations(");
+  });
+
+  it("never prints experimental catalogues (yield/spread/flood)", () => {
+    const result = formatLocationSearch([county, municipality], [], "x");
+    expect(result).not.toContain("rental_yield");
+    expect(result).not.toContain("price_spread");
+    expect(result).not.toContain("flood");
+  });
+
+  it("lists RCN-only names with a location= call", () => {
+    const result = formatLocationSearch([county], ["BEŁCHATÓW MIASTO_ZINTEGROWANA"], "bełchatów");
+    expect(result).toContain("RCN district names without a TERYT code:");
+    expect(result).toContain('search_transactions(location="BEŁCHATÓW MIASTO_ZINTEGROWANA")');
+  });
+
+  it("handles both sources empty without throwing and without a 'type more letters' hint", () => {
+    const result = formatLocationSearch([], [], "nomatch");
+    expect(() => formatLocationSearch([], [], "nomatch")).not.toThrow();
+    expect(result).not.toContain("type more letters");
+    expect(result).not.toContain("RCN district names without a TERYT code:");
+  });
+
+  it("appends the 'type more letters' hint at exactly 50 rows", () => {
+    const items: LocationSearchItem[] = Array.from({ length: 50 }, (_, i) => ({
+      code: String(1000 + i), name: `place-${i}`, typeName: "powiat", level: "county",
+      parent_name: "x", rcn_district: false,
+    }));
+    expect(formatLocationSearch(items, [], "x")).toContain("type more letters");
+    expect(formatLocationSearch(items.slice(0, 49), [], "x")).not.toContain("type more letters");
   });
 });
 
@@ -2200,6 +2743,148 @@ describe("formatCompareResults — demographics enrichment", () => {
   });
 });
 
+describe("formatRoads", () => {
+  const full: RoadsBreakdownResponse = {
+    data: [
+      {
+        assessed: true,
+        access_indicator: "likely",
+        access_rule_version: 1,
+        // Distances may arrive as strings over the wire (REAL → driver/serializer variance).
+        public_road_distance_m: "8.20",
+        public_road_edge_distance_m: "4.70",
+        public_road_category: "municipal",
+        public_road_class: "local",
+        public_road_at_grade: true,
+        any_road_distance_m: "8.20",
+        major_road_distance_m: 1400,
+        source_as_of: "2025-04-01",
+      },
+      {
+        assessed: true,
+        access_indicator: "uncertain",
+        access_rule_version: 1,
+        public_road_distance_m: 61,
+        // No carriageway width in the source → no edge estimate, and NEVER a substituted median.
+        public_road_edge_distance_m: null,
+        public_road_category: "national",
+        public_road_class: "expressway",
+        public_road_at_grade: false,
+        any_road_distance_m: 61,
+        major_road_distance_m: 61,
+        source_as_of: null,
+      },
+      {
+        assessed: true,
+        access_indicator: "unlikely",
+        access_rule_version: 1,
+        public_road_distance_m: null,
+        public_road_edge_distance_m: null,
+        public_road_category: null,
+        public_road_class: null,
+        public_road_at_grade: null,
+        any_road_distance_m: null,
+        major_road_distance_m: null,
+        source_as_of: null,
+      },
+      {
+        assessed: false,
+        access_indicator: null,
+        access_rule_version: null,
+        public_road_distance_m: null,
+        public_road_edge_distance_m: null,
+        public_road_category: null,
+        public_road_class: null,
+        public_road_at_grade: null,
+        any_road_distance_m: null,
+        major_road_distance_m: null,
+        source_as_of: null,
+      },
+    ],
+    truncated: false,
+  };
+
+  it("renders one numbered line per plot, with the road's kind and the carriageway-edge estimate", () => {
+    const result = formatRoads(full);
+    expect(result).toContain("Per-parcel road access (4 plots;");
+    expect(result).toContain("1. access likely | rule v1 | public road: ~8 m (municipal, local), ~5 m to the carriageway edge");
+    expect(result).toContain("any road: ~8 m");
+    expect(result).toContain("major road: ~1400 m");
+  });
+
+  it("no carriageway width → no edge estimate, and a grade separation is called out", () => {
+    const result = formatRoads(full);
+    expect(result).toContain("2. access uncertain | rule v1 | public road: ~61 m (national, expressway)");
+    expect(result).not.toContain("~61 m (national, expressway), ~");
+    expect(result).toContain("that road crosses on a viaduct or in a tunnel");
+  });
+
+  it("absences are bounded by the search radius, never rendered as 'no road exists'", () => {
+    const result = formatRoads(full);
+    expect(result).toContain("3. access unlikely | rule v1 | public road: none within 500 m | any road: none within 500 m | major road: none within 3 km");
+  });
+
+  it("assessed=false → 'not assessed yet' line with no distance claims", () => {
+    const result = formatRoads(full);
+    expect(result).toContain("4. not assessed yet");
+    expect(result).not.toContain("4. access");
+  });
+
+  it("carries the evidence-not-determination framing on every rendering", () => {
+    // This is the product decision, not decoration: the indicator is a lead to verify, and a reader who
+    // takes it for a legal answer is the failure mode the whole three-state design guards against.
+    const result = formatRoads(full);
+    expect(result).toContain("does NOT determine legal access");
+    expect(result).toContain("easements or rights of way");
+  });
+
+  it("two-state empty data → neutral message (no linked plots or unknown id)", () => {
+    expect(formatRoads({ data: [], truncated: false })).toContain("No road-access data is available");
+  });
+
+  // The tool description and TOOLS.md both promise the rule version and the snapshot date. A promise the
+  // formatter does not keep is worse than no promise: a later recalibration would change what
+  // "access likely" means with nothing in the output to show it.
+  it("carries the rule version next to the indicator and the snapshot date once per response", () => {
+    const result = formatRoads(full);
+    expect(result).toContain("access likely | rule v1");
+    expect(result).toContain("access uncertain | rule v1");
+    expect(result).toContain("Reference road-network snapshot as of 2025-04-01 (oldest of the plots shown).");
+  });
+
+  // A transaction can span counties loaded on different dates. Reporting the freshest of them would
+  // overstate how current the whole answer is, so the line carries the oldest.
+  it("reports the oldest snapshot date when plots come from counties loaded on different dates", () => {
+    const mixed = {
+      data: [
+        { ...full.data[0]!, source_as_of: "2025-04-01" },
+        { ...full.data[1]!, source_as_of: "2024-11-15" },
+      ],
+    };
+    expect(formatRoads(mixed)).toContain("snapshot as of 2024-11-15 (oldest of the plots shown).");
+  });
+
+  it("omits the rule version when the service did not send one, and the snapshot line when no row carries a date", () => {
+    const noVersion = { data: [{ ...full.data[0]!, access_rule_version: null, source_as_of: null }] };
+    const result = formatRoads(noVersion);
+    expect(result).not.toContain("rule v");
+    expect(result).not.toContain("snapshot as of");
+    expect(result).toContain("access likely | public road:");
+  });
+
+  // A newer service may classify with a value this client has never seen. Slot 1 has to keep reading as
+  // an indicator, not as a bare token.
+  it("keeps the 'access' prefix for an indicator it does not know", () => {
+    const unknown = { data: [{ ...full.data[0]!, access_indicator: "contested" }] };
+    expect(formatRoads(unknown)).toContain("1. access contested | rule v1 |");
+  });
+
+  it("singular 'plot' when there is exactly one; truncated appends the 500-plot note", () => {
+    expect(formatRoads({ data: [full.data[0]!] })).toContain("(1 plot;");
+    expect(formatRoads({ ...full, truncated: true })).toContain("first 500 plots");
+  });
+});
+
 // ── Parcel report ──────────────────────────────────────────────────
 
 describe("formatParcelReport", () => {
@@ -2220,12 +2905,16 @@ describe("formatParcelReport", () => {
         flood: { coverage: "covered", as_of: "2026-04-01", flood_risk: "medium", pct_in_zone: 40 },
         heritage: { coverage: "covered_no_data", as_of: null, heritage_status: null, site_count: null },
         landslide: { coverage: "not_covered", as_of: null, landslide_risk: null },
+        subsurface: { coverage: "covered", as_of: "2026-04-01", mining_status: "active", mineral_class: "subsidence", mining_overlap_pct: 55, mining_terrains: [], groundwater_status: "documented", groundwater_overlap_pct: 80, groundwater_bodies: [] },
         surroundings: { coverage: "covered", as_of: "2026-04-01", cemetery_distance_m: 320, landfill_distance_m: null, sewage_treatment_distance_m: 1200, industrial_area_distance_m: null, industrial_plant_distance_m: null, livestock_farm_distance_m: null },
         transit: { coverage: "covered", as_of: "2026-04-01", bus_distance_m: 150, tram_distance_m: 600, rail_distance_m: null, metro_distance_m: null },
         planning: { coverage: "covered", as_of: "2026-03-01", data: [{ zone_symbol: "MW", zone_name: "zabudowa mieszkaniowa" }], truncated: false },
         buildings: { coverage: "covered", as_of: "2026-02-01", data: [{}, {}], truncated: false },
         permits: { coverage: "not_computed", as_of: null, data: [], truncated: false },
         farmland: { coverage: "covered_no_data", as_of: null, eligible_area_m2: null, pct_of_parcel: null, feature_count: null },
+        land_class: { coverage: "covered", as_of: "2026-08-01", use_codes: ["R"], use_names: ["grunty orne"], soil_classes: ["IIIa"], protected_class_present: true, in_city: true, legal_note: "Działka zawiera grunt rolny klasy chronionej (I-III).", legal_state_as_of: "2026-08-12" },
+        nature: { coverage: "covered", as_of: "2026-04-01", forest_distance_m: 0, forest_overlap_pct: 30, protection_rank: 2, building_restriction: "statutory_ban", protected_overlap_pct: 60, protected_forms: ["nature_reserve"], protected_areas: [{ form: "nature_reserve", name: "Las Kabacki", overlap_pct: 60 }] },
+        roads: { coverage: "covered", as_of: "2026-04-01", access_indicator: "likely", access_rule_version: 1, public_road_distance_m: 8.2, public_road_edge_distance_m: 4.7, public_road_category: "municipal", public_road_class: "local", public_road_at_grade: true, any_road_distance_m: 8.2, major_road_distance_m: 1400, source_as_of: "2025-04-01" },
         market_context: {
           coverage: "full", as_of: null,
           county: { coverage: "full", median_price_per_m2: 15200, n: 4200, county_code: "1412" },
@@ -2257,11 +2946,13 @@ describe("formatParcelReport", () => {
     expect(out).toContain("Flood risk: covered — medium risk, 40% of the parcel in the mapped zone");
     expect(out).toContain("Heritage listing: covered_no_data (checked — nothing found, still billed)");
     expect(out).toContain("Landslide risk: not_covered (outside our data — refunded)");
+    expect(out).toContain("Subsurface constraints: covered — mining terrain active (subsidence); groundwater reservoir documented");
     expect(out).toContain("Building activity: not_computed (could not finish in time — refunded, retry)");
     expect(out).toContain("Nuisance surroundings: covered — cemetery 320 m, sewage treatment 1200 m");
     expect(out).toContain("Public transport: covered — bus 150 m, tram 600 m");
     expect(out).toContain("Planning (general plan): covered — zones: MW");
     expect(out).toContain("Buildings: covered — 2 building(s) on the parcel");
+    expect(out).toContain("Nature (forest & protected areas): covered — nature reserve (statutory build ban), overlaps forest");
     // Transaction history + price context + municipal context.
     expect(out).toContain("Transaction history: covered");
     expect(out).toContain("- County:");
@@ -2315,5 +3006,315 @@ describe("formatParcelReport", () => {
     r.sections.market_context.county = { coverage: "suppressed", median_price_per_m2: null, n: 3, county_code: "1412" };
     const out = formatParcelReport(r);
     expect(out).toContain("County: withheld (only 3 sale(s) — too few to publish)");
+  });
+
+  // REPORT_LAYER_ORDER is a standing merge hazard: branches that add a layer in parallel all append
+  // their entry to the same spot, and the render loop reads `sections[key as ...]` through a cast — so a
+  // conflict resolved by taking one side drops the other side's layer out of every rendered report,
+  // with a green compiler and (until these three tests) a green suite.
+  //
+  // The pair below pins the list against the fixture in BOTH directions, and is parametrised by the
+  // list's own contents rather than by a hardcoded roster — a layer added later is covered without
+  // anyone remembering to come back here.
+  const NON_LAYER_SECTIONS = new Set(["transactions", "market_context", "location_context"]);
+
+  it.each(REPORT_LAYER_ORDER)("renders the label of the %s layer", (key, label) => {
+    const report = makeReport();
+    // Direction 1: everything in the order list has a fixture section and reaches the output.
+    expect(Object.keys(report.sections)).toContain(key);
+    expect(formatParcelReport(report)).toContain(`- ${label}:`);
+  });
+
+  it("carries every enrichment section of the report in REPORT_LAYER_ORDER", () => {
+    // Direction 2: nothing the report carries is missing from the order list. This is the one that
+    // fails when a merge silently drops a layer from the list while the response still has it.
+    const sectionKeys = Object.keys(makeReport().sections).filter((k) => !NON_LAYER_SECTIONS.has(k));
+    expect(REPORT_LAYER_ORDER.map(([k]) => k).sort()).toEqual(sectionKeys.sort());
+  });
+
+  it("keeps the nature layer, with its label, in the report", () => {
+    expect(REPORT_LAYER_ORDER).toContainEqual(["nature", "Nature (forest & protected areas)"]);
+  });
+
+  // Twin of the assertion above. `land_class` and `nature` claim the SAME slot of the list — both sit
+  // directly after `farmland` — so a conflict there is easy to resolve by taking one side only, which
+  // leaves list and fixture consistent: the two direction tests above stay green while a layer the
+  // service still returns vanishes from every report. Both literals (slug and label) are pinned so
+  // that a one-sided resolution goes red instead of silent.
+  it("keeps the land_class layer, with its label, in the report", () => {
+    expect(REPORT_LAYER_ORDER).toContainEqual(["land_class", "Land use & soil class"]);
+  });
+
+  it("keeps the roads layer, with its label, in the report", () => {
+    expect(REPORT_LAYER_ORDER).toContainEqual(["roads", "Road access"]);
+  });
+
+  it("glosses the road-access indicator with the distance that produced it", () => {
+    const out = formatParcelReport(makeReport());
+    expect(out).toContain("- Road access: covered — access likely (~5 m to the nearest public road's carriageway edge)");
+  });
+
+  // The single most load-bearing test of the report renderer, and it is about a response we do not
+  // control: a client that knows a layer can always end up talking to an older service, which need not
+  // send every section this client knows about. Reading the section blind would throw and take down the
+  // formatting of the WHOLE report over one absent key, so a missing section must cost its own line and
+  // nothing else.
+  it("skips a section the service did not send instead of throwing on the whole report", () => {
+    const report = makeReport();
+    delete (report.sections as Partial<typeof report.sections>).roads;
+    const out = formatParcelReport(report);
+    expect(out).not.toContain("- Road access:");
+    expect(out).toContain("- Flood risk:");
+    expect(out).toContain("Transaction history:");
+  });
+});
+
+describe("formatParcelLandClass", () => {
+  // The exact note the server ships when a parcel has no public cadastral id. The render passes it
+  // through verbatim, so a fixture with `note: null` asserts nothing about what a caller actually reads.
+  // Keep this byte-identical to the note the server sends: a paraphrase here tests a string nobody gets.
+  const NO_KEY_NOTE =
+    "This parcel is addressed only by an internal identifier and carries no public cadastral id, which this layer matches on — the layer could not be evaluated for it.";
+
+  function makeLandClass(overrides: Partial<ParcelLandClassResponse> = {}): ParcelLandClassResponse {
+    const base: ParcelLandClassResponse = {
+      parcel: { id: "uuid-1", parcel_id: "142907_2.0014.342/5", parcel_key: "142907_2.0014.342-5" },
+      coverage: "covered",
+      as_of: "2026-08-01",
+      use_codes: ["R", "Ls"],
+      use_names: ["grunty orne", "lasy"],
+      soil_classes: ["IIIa", "IVb"],
+      protected_class_present: true,
+      in_city: false,
+      legal_note: "Działka zawiera grunt rolny klasy chronionej (I-III). Informacja nie stanowi porady prawnej.",
+      legal_state_as_of: "2026-08-12",
+      note: null,
+    };
+    return { ...base, ...overrides };
+  }
+
+  it("renders the sets, the protected-grade answer and both dates", () => {
+    const out = formatParcelLandClass(makeLandClass());
+
+    expect(out).toContain("Land-use and soil-quality classification: 142907_2.0014.342/5");
+    expect(out).toContain("grunty orne, lasy; soil class IIIa, IVb");
+    expect(out).toContain("Use codes: R, Ls");
+    expect(out).toContain("Protected soil grade (I-III) present: yes");
+    expect(out).toContain("Inside a city's administrative boundary: no");
+    expect(out).toContain("Re-designation: Działka zawiera grunt rolny klasy chronionej (I-III).");
+    expect(out).toContain("Legal state verified as of 2026-08-12.");
+    expect(out).toContain("Classification data as of 2026-08-01.");
+  });
+
+  it("reads an undetermined city flag as a third answer, not as 'no'", () => {
+    // The flag is derived from the parcel id. When the id does not yield it, saying "no" would assert
+    // the rural rule applies — a different legal outcome from "we could not tell".
+    const out = formatParcelLandClass(makeLandClass({ in_city: null }));
+    expect(out).toContain("Inside a city's administrative boundary: could not be determined from the parcel id");
+  });
+
+  it("tells covered_no_data apart from not_covered, and bills only the first", () => {
+    // This distinction is the whole answer for a caller deciding whether to look elsewhere: one says
+    // the county publishes nothing, the other says it publishes and this parcel simply has no entry.
+    const checkedNegative = formatParcelLandClass(makeLandClass({
+      coverage: "covered_no_data",
+      use_codes: [], use_names: [], soil_classes: [],
+      protected_class_present: false, legal_note: null,
+    }));
+    expect(checkedNegative).toContain("The county publishes the classification, but parcel");
+    expect(checkedNegative).toContain("(county data as of 2026-08-01)");
+    expect(checkedNegative).toContain("billed as an answer");
+    expect(checkedNegative).not.toContain("refunded");
+
+    const uncovered = formatParcelLandClass(makeLandClass({
+      coverage: "not_covered", as_of: null,
+      use_codes: [], use_names: [], soil_classes: [],
+      protected_class_present: false, in_city: null, legal_note: null, legal_state_as_of: null,
+    }));
+    expect(uncovered).toContain("No land-use or soil-quality classification is available");
+    expect(uncovered).toContain("the tokens are refunded");
+    // Three causes share this state, so the lead must not settle on one of them: a parcel we simply do
+    // not hold may well sit in a county that publishes the classification in full.
+    expect(uncovered).toContain("Either the county does not publish one, or we hold no classification");
+  });
+
+  it("refuses to render a state it does not know instead of degrading to the full classification", () => {
+    // A published package is pinned and immutable, so a fifth state added later meets THIS code on
+    // already-installed clients. Falling through to the covered branch would print "Protected soil
+    // grade (I-III) present: no" out of an empty body — a categorical legal claim built from no data.
+    const out = formatParcelLandClass(makeLandClass({
+      coverage: "quiesced", as_of: null,
+      use_codes: [], use_names: [], soil_classes: [],
+      protected_class_present: false, legal_note: null, legal_state_as_of: null,
+    }));
+    expect(out).toContain("state this client does not recognise (quiesced)");
+    expect(out).not.toContain("Protected soil grade");
+    expect(out).not.toContain("Use codes");
+  });
+
+  it("survives a covered answer whose arrays or dates are not what the type says", () => {
+    // Wire data is not a type check. A throw here would land AFTER the call was billed, and a non-string
+    // member would reach the caller as "[object Object]".
+    const wrong = {
+      ...makeLandClass(),
+      use_names: undefined, soil_classes: [{ x: 1 }, "IIIa"], use_codes: [1, "R"], as_of: 20260801,
+    } as unknown as ParcelLandClassResponse;
+    const out = formatParcelLandClass(wrong);
+    expect(out).toContain("soil class IIIa");
+    expect(out).toContain("Use codes: R");
+    expect(out).not.toContain("[object Object]");
+    expect(out).not.toContain("Classification data as of");
+  });
+
+  it("does not tell a paying caller to upgrade for an id the parcel does not have", () => {
+    // A municipal parcel is addressed by an internal id only, so both cadastral fields are null by
+    // nature rather than by gating; the internal id is the truthful thing to name.
+    const out = formatParcelLandClass(makeLandClass({
+      parcel: { id: "9b3a5253-e1eb-c928-14c4-2d0856b143fe", parcel_id: null, parcel_key: null },
+      coverage: "not_covered", as_of: null,
+    }));
+    expect(out).toContain("9b3a5253-e1eb-c928-14c4-2d0856b143fe");
+    expect(out).not.toContain("paid plan");
+  });
+
+  it("passes the server's reason for an uncomputable parcel through instead of guessing it", () => {
+    const out = formatParcelLandClass(makeLandClass({
+      coverage: "not_covered", as_of: null,
+      use_codes: [], use_names: [], soil_classes: [],
+      protected_class_present: false, in_city: null, legal_note: null, legal_state_as_of: null,
+      // The note the server actually sends, not a paraphrase of it: a shortened copy would let this
+      // pass while the real sentence renders differently, which is the whole thing being asserted.
+      note: NO_KEY_NOTE,
+    }));
+    expect(out).toContain(NO_KEY_NOTE);
+  });
+
+  it("keeps a timed-out lookup from reading as a finding about the parcel", () => {
+    const out = formatParcelLandClass(makeLandClass({
+      coverage: "not_computed", as_of: null,
+      use_codes: [], use_names: [], soil_classes: [],
+      protected_class_present: false, legal_note: null, legal_state_as_of: null,
+    }));
+    expect(out).toContain("could not be completed");
+    expect(out).toContain("says nothing about what is recorded for it");
+    expect(out).toContain("Retry shortly");
+    expect(out).not.toContain("Protected soil grade");
+    expect(out).not.toContain("Use codes");
+  });
+
+  it("never names a prevailing category and never gives a share", () => {
+    // The source records no area for any category, so a ranking or a percentage here could only be
+    // invented. The render states that instead of leaving a reader to infer an order from the listing.
+    const out = formatParcelLandClass(makeLandClass());
+    expect(out).toContain("the source records no area for any of them, so this cannot say which prevails");
+    expect(out).not.toContain("%");
+    expect(out).not.toMatch(/dominant|dominując|prevailing category is/i);
+  });
+
+  it("adds no legal claim of its own beyond the note it was given", () => {
+    // Each phrase below is a claim the layer would be wrong to make, and every one of them is a
+    // plausible thing to write: a repealed area threshold, an absolute impossibility, an over-broad
+    // city exemption, deadlines and tacit-consent rules that do not apply, a superseded planning
+    // instrument, a per-parcel amount. The API's note carries none of them; the render must not add one.
+    const forbidden = ["0,5 ha", "nie da się odrolnić", "nie stosuje się do gruntów rolnych w miastach",
+      "milcząca zgoda", "60 dni", "120 dni", "studium", " zł"];
+    const rendered = [
+      formatParcelLandClass(makeLandClass()),
+      formatParcelLandClass(makeLandClass({ coverage: "covered_no_data", legal_note: null })),
+      formatParcelLandClass(makeLandClass({ coverage: "not_covered", legal_note: null })),
+      formatParcelLandClass(makeLandClass({ coverage: "not_computed", legal_note: null })),
+    ].join("\n").toLowerCase();
+    for (const phrase of forbidden) {
+      expect(rendered, `render must not claim "${phrase}"`).not.toContain(phrase.toLowerCase());
+    }
+  });
+
+  it("carries no guarded term in any of the four states", () => {
+    // Every state gets the real server note, not `note: null`. Two states render it today (covered and
+    // not_covered); the other two carry it on purpose, so a future edit that starts printing the note
+    // there is checked here too instead of slipping past a fixture that renders nothing.
+    const rendered = [
+      formatParcelLandClass(makeLandClass({ note: NO_KEY_NOTE })),
+      formatParcelLandClass(makeLandClass({ coverage: "covered_no_data", note: NO_KEY_NOTE })),
+      formatParcelLandClass(makeLandClass({ coverage: "not_covered", note: NO_KEY_NOTE })),
+      formatParcelLandClass(makeLandClass({ coverage: "not_computed", note: NO_KEY_NOTE })),
+    ].join("\n");
+    expect(rendered, "the note never reached the render, so the check below sees nothing").toContain(NO_KEY_NOTE);
+    expect(findGuardToken(rendered)).toBeNull();
+  });
+});
+
+// ── formatCorpusCoverage ───────────────────────────────────────────
+//
+// The block is a caveat printed next to numbers a caller will act on, so what it must never do is
+// state something the data does not support: a share without its date, a scope it cannot count, or
+// advice to ask the way the caller already asked.
+
+describe("formatCorpusCoverage", () => {
+  const measured: CorpusCoverage = {
+    basis: "cadastral_partial",
+    held_parcels: 1_600,
+    source_parcels: 10_000,
+    held_pct: 16,
+    counties: 3,
+    as_of: "2026-09-02T10:48:09.000Z",
+    note: "We hold near-complete coverage of the cadastral register, though not the whole of it and not live.",
+  };
+
+  it("prints the figures, the scope and the day they were measured", () => {
+    const out = formatCorpusCoverage(measured);
+    expect(out).toContain("we hold 1,600 of the 10,000 parcels");
+    expect(out).toContain("these 3 counties");
+    expect(out).toContain("16.0%, measured 2026-09-02");
+  });
+
+  it("says nothing at all for a scope we hold in full", () => {
+    expect(formatCorpusCoverage({ ...measured, held_parcels: 10_000, held_pct: 100 })).toBe("");
+  });
+
+  it("does not round a real gap up to a flat 100%", () => {
+    const out = formatCorpusCoverage({ ...measured, held_parcels: 9_999, held_pct: 100 });
+    expect(out).toContain(">99.9%");
+    expect(out).not.toContain("100.0%");
+  });
+
+  it("does not round a real holding down to nothing", () => {
+    const out = formatCorpusCoverage({ ...measured, held_parcels: 1, source_parcels: 8_000, held_pct: 0 });
+    expect(out).toContain("<0.1%");
+    expect(out).not.toContain("0.0%");
+  });
+
+  it("survives figures arriving as strings instead of numbers", () => {
+    const wrong = { ...measured, held_pct: "16" } as unknown as CorpusCoverage;
+    expect(() => formatCorpusCoverage(wrong)).not.toThrow();
+    expect(formatCorpusCoverage(wrong)).toContain("16.0%");
+  });
+
+  it("describes an uncountable scope instead of printing a null count", () => {
+    const out = formatCorpusCoverage({ ...measured, counties: null });
+    expect(out).toContain("the counties this query addresses");
+    expect(out).not.toContain("null");
+  });
+
+  it("passes the server note through when there is nothing measured to print", () => {
+    const note = "We have no coverage measurement for the counties this query addresses.";
+    const out = formatCorpusCoverage({
+      ...measured, held_parcels: null, source_parcels: null, held_pct: null, counties: 0, as_of: null, note,
+    });
+    expect(out).toContain(note);
+    // The wrong branch used to land here and call a teryt query "an area query".
+    expect(out).not.toContain("For an area query");
+  });
+
+  it("hedges on its own when an unmeasured answer carries no note", () => {
+    const out = formatCorpusCoverage({
+      ...measured, held_parcels: null, source_parcels: null, held_pct: null, counties: 0, as_of: null, note: "",
+    });
+    expect(out).toContain("not measured");
+  });
+
+  it("renders nothing for a missing block", () => {
+    expect(formatCorpusCoverage(null)).toBe("");
+    expect(formatCorpusCoverage(undefined)).toBe("");
   });
 });

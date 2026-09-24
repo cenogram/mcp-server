@@ -144,6 +144,35 @@ describe("api-client", () => {
     expect(url).toMatch(/ownershipType=1(%2C|,)2(%2C|,)8/);
   });
 
+  it("getTransactions passes landUse and buildingStoreys filters", async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve({ data: [], pagination: {}, summary: null }),
+    });
+
+    const { getTransactions } = await import("../api-client.js");
+    await getTransactions({ district: "Gdańsk", landUse: "gruntyRolne,unknown", buildingStoreys: "1,3plus" });
+
+    const url = mockFetch.mock.calls[0]![0] as string;
+    // comma may be URL-encoded (%2C) or literal — anchor to each key.
+    expect(url).toMatch(/landUse=gruntyRolne(%2C|,)unknown/);
+    expect(url).toMatch(/buildingStoreys=1(%2C|,)3plus/);
+  });
+
+  it("getTransactions passes minFootprintArea and maxFootprintArea filters", async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve({ data: [], pagination: {}, summary: null }),
+    });
+
+    const { getTransactions } = await import("../api-client.js");
+    await getTransactions({ district: "Gdańsk", minFootprintArea: 100, maxFootprintArea: 200 });
+
+    const url = mockFetch.mock.calls[0]![0] as string;
+    expect(url).toContain("minFootprintArea=100");
+    expect(url).toContain("maxFootprintArea=200");
+  });
+
   it("getTransactionHeritage hits the per-transaction heritage endpoint", async () => {
     mockFetch.mockResolvedValueOnce({
       ok: true,
@@ -472,6 +501,49 @@ describe("api-client", () => {
     expect(url).not.toContain("location=");
   });
 
+  it("getFloodRisk passes location to the flood-risk endpoint", async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve({ location: { name: "Warszawa" }, metric: "flood_exposure_share" }),
+    });
+
+    const { getFloodRisk } = await import("../api-client.js");
+    await getFloodRisk({ location: "Warszawa" });
+
+    const url = mockFetch.mock.calls[0]![0] as string;
+    expect(url).toContain("/api/v1/flood-risk");
+    expect(url).toContain("location=Warszawa");
+  });
+
+  it("getFloodRisk passes teryt (and omits empty location)", async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve({ location: { name: "Kraków" }, metric: "flood_exposure_share" }),
+    });
+
+    const { getFloodRisk } = await import("../api-client.js");
+    await getFloodRisk({ teryt: "1261" });
+
+    const url = mockFetch.mock.calls[0]![0] as string;
+    expect(url).toContain("/api/v1/flood-risk");
+    expect(url).toContain("teryt=1261");
+    expect(url).not.toContain("location=");
+  });
+
+  it("getFloodRiskLocations hits the flood-risk locations catalog with search", async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve({ data: [], meta: { total: 0, snapshot_date: null } }),
+    });
+
+    const { getFloodRiskLocations } = await import("../api-client.js");
+    await getFloodRiskLocations({ search: "gda" });
+
+    const url = mockFetch.mock.calls[0]![0] as string;
+    expect(url).toContain("/api/v1/flood-risk/locations");
+    expect(url).toContain("search=gda");
+  });
+
   it("returns creditInfo when response headers present", async () => {
     mockFetch.mockResolvedValueOnce({
       ok: true,
@@ -596,6 +668,29 @@ describe("api-client", () => {
     const url = mockFetch.mock.calls[0]![0] as string;
     // Same drift guard: a summary that drops the filter reports an unfiltered total.
     expect(url).toMatch(/ownershipType=2(%2C|,)8/);
+  });
+
+  it("getTransactionsSummary forwards landUse/buildingStoreys/footprint (count must match filtered rows)", async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve({ median_price_m2: 15000, avg_area: 55, total: 100 }),
+    });
+
+    const { getTransactionsSummary } = await import("../api-client.js");
+    await getTransactionsSummary({
+      district: "Kraków",
+      landUse: "gruntyRolne",
+      buildingStoreys: "1",
+      minFootprintArea: 100,
+      maxFootprintArea: 200,
+    });
+
+    const url = mockFetch.mock.calls[0]![0] as string;
+    // Same drift guard as floodRisk: a summary that drops any of these reports an unfiltered total.
+    expect(url).toContain("landUse=gruntyRolne");
+    expect(url).toContain("buildingStoreys=1");
+    expect(url).toContain("minFootprintArea=100");
+    expect(url).toContain("maxFootprintArea=200");
   });
 
   it("fetchApiPost sends POST with JSON body", async () => {
@@ -733,6 +828,30 @@ describe("api-client", () => {
     const opts = mockFetch.mock.calls[0]![1] as RequestInit;
     const body = JSON.parse(opts.body as string) as Record<string, unknown>;
     expect(body.ownershipType).toBe("2,8");
+  });
+
+  it("searchByPolygon forwards landUse/buildingStoreys/footprint in the POST body", async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve({ type: "FeatureCollection", features: [], total: 0, truncated: false }),
+    });
+
+    const { searchByPolygon } = await import("../api-client.js");
+    await searchByPolygon({
+      polygon: { type: "Polygon", coordinates: [[[21, 52], [21.01, 52], [21.01, 52.01], [21, 52.01], [21, 52]]] },
+      landUse: "gruntyRolne,unknown",
+      buildingStoreys: "1,3plus",
+      minFootprintArea: 100,
+      maxFootprintArea: 200,
+    });
+
+    const opts = mockFetch.mock.calls[0]![1] as RequestInit;
+    const body = JSON.parse(opts.body as string) as Record<string, unknown>;
+    expect(body.landUse).toBe("gruntyRolne,unknown");
+    expect(body.buildingStoreys).toBe("1,3plus");
+    // Footprint bounds go over the wire as numbers; the /spatial handler accepts number|string.
+    expect(body.minFootprintArea).toBe(100);
+    expect(body.maxFootprintArea).toBe(200);
   });
 
   it("402 + OAuth ctx: 'na koncie' wording (no 'kluczem')", async () => {

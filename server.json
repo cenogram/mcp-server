@@ -3,7 +3,7 @@
   "name": "pl.cenogram/mcp-server",
   "title": "Cenogram - Polish Real Estate Prices & Parcel Data",
   "description": "Polish real estate for AI: 8M+ deed transaction prices (RCN) + per-parcel context by cadastral ID",
-  "version": "0.6.0",
+  "version": "0.11.0",
   "websiteUrl": "https://cenogram.pl/en/mcp?src=mcpregistry",
   "repository": {
     "url": "https://github.com/cenogram/mcp-server",
@@ -13,7 +13,7 @@
     {
       "registryType": "npm",
       "identifier": "@cenogram/mcp-server",
-      "version": "0.6.0",
+      "version": "0.11.0",
       "transport": {
         "type": "stdio"
       },
