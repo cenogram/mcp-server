@@ -1,7 +1,7 @@
 {
   "name": "@cenogram/mcp-server",
-  "version": "0.6.0",
-  "description": "MCP server for Polish real estate: 8M+ transaction prices from notarial deeds (RCN registry, not listings), plus per-parcel context by cadastral ID - zoning, flood risk, heritage, building permits, agricultural land and transit",
+  "version": "0.11.0",
+  "description": "MCP server for Polish real estate: 8M+ transaction prices from notarial deeds (RCN registry, not listings), plus per-parcel context by cadastral ID - zoning, flood risk, heritage, building permits, agricultural land, land use and soil class, transit, nature, mining terrains and groundwater reservoirs",
   "type": "module",
   "bin": {
     "cenogram-mcp": "./dist/index.js"
@@ -12,6 +12,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "dev": "tsx src/index.ts",
+    "docs:generate": "tsx scripts/generate-tool-reference.ts",
     "test": "vitest run",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",

@@ -84,11 +84,18 @@ export function authErrorMessage(status: number, mode: AuthMode, body: ErrorBody
       // fails. The API states that case itself; relay it instead of doing arithmetic on it.
       // Only `message` will do here: `specific` falls back to `error`, which in this branch is
       // the bare code "trial_expired" - relaying that would be worse than the wrong template.
+      // Relay the API's own sentence whenever there IS one, not only for trial_expired. The free
+      // tier grants a recurring token allowance, so a 402 there means "the current allowance is
+      // used up and the next one arrives on <date>" - information the local template cannot
+      // reconstruct and which the reader needs more than the arithmetic. Gating the relay on one
+      // error code meant every future 402 shape silently lost its explanation.
       const explanation = specificField(body.message);
-      if (body.error === "trial_expired" && explanation) {
+      if (explanation) {
         const upgrade = specificField(body.upgrade);
         return upgrade && !explanation.includes(upgrade) ? `${sentence(explanation)} (${upgrade})` : explanation;
       }
+      // Reached only when the API sent no message at all. `?? 0` is a last-resort default, not a
+      // claim about the account - an absent balance is unknown, not zero.
       const balance = body.currentBalance ?? 0;
       const required = body.creditsRequired ?? "?";
       if (mode === "oauth") {

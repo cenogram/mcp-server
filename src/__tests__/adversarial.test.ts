@@ -4,7 +4,18 @@ import {
   buildNormalizedMap,
   stripDiacritics,
   CITY_SUBDISTRICTS,
+  filterByLocation,
+  tryResolveCityKey,
 } from "../mappings.js";
+
+// Adversarial coverage for the location-name primitives. Reviewed block-by-block against the
+// search-merge change: list_locations(search=) now merges a TERYT source with the RCN branch,
+// but the RCN branch — tryResolveCityKey → getDistricts → filterByLocation, and the resolveDistrict
+// path search_transactions(location=) still uses — is UNCHANGED. Verdict per block:
+//   • resolveDistrict / stripDiacritics / buildNormalizedMap: RCN-branch primitives, untouched by the
+//     merge and still live → KEPT (category a). Removing them would only shrink coverage.
+//   • filterByLocation / tryResolveCityKey: the exact functions the merged tool calls for its RCN
+//     sub-branch (tools.ts) and had ZERO adversarial coverage → ADDED below (category b).
 
 const SAMPLE_DISTRICTS = [
   "Kraków-Podgórze",
@@ -312,6 +323,76 @@ describe("stripDiacritics — regex boundary", () => {
     // The combining mark is preserved because it's outside the regex range
     expect(result).toContain("҃");
     expect(result).not.toBe("Krakow");
+  });
+});
+
+// ── Merged list_locations RCN sub-branch — adversarial ─────────────
+// filterByLocation is what the merged tool runs over /api/districts for non-city-key queries
+// (tools.ts), and tryResolveCityKey is the zero-round-trip path for Warszawa/Kraków/Łódź. Both feed
+// the dedup against the TERYT side, so their robustness gates the whole merged answer.
+describe("filterByLocation — adversarial (merged RCN sub-branch)", () => {
+  const DISTRICTS = ["Wola", "Wolica", "Mokotów", "Śródmieście", "Kraków-Podgórze", "Bełchatów"];
+
+  it("is an infix, case- and diacritics-insensitive includes — never a wildcard", () => {
+    expect(filterByLocation("wol", DISTRICTS)).toEqual(["Wola", "Wolica"]);
+    expect(filterByLocation("WOL", DISTRICTS)).toEqual(["Wola", "Wolica"]);
+    // A bare fragment with no diacritics still finds the accented name.
+    expect(filterByLocation("belchatow", DISTRICTS)).toEqual(["Bełchatów"]);
+    expect(filterByLocation("srodmiescie", DISTRICTS)).toEqual(["Śródmieście"]);
+  });
+
+  it("treats LIKE/regex metacharacters as literal text (no injection, no throw)", () => {
+    expect(() => filterByLocation("%", DISTRICTS)).not.toThrow();
+    expect(filterByLocation("%", DISTRICTS)).toEqual([]); // literal '%' is in no district name
+    expect(filterByLocation("_", DISTRICTS)).toEqual([]);
+    expect(filterByLocation(".*", DISTRICTS)).toEqual([]);
+    expect(filterByLocation("'; DROP TABLE districts; --", DISTRICTS)).toEqual([]);
+  });
+
+  it("empty needle matches everything (the API's 2-char floor, not this helper, guards that)", () => {
+    // Documents the boundary: list_locations skips the TERYT branch under 2 chars but still runs
+    // this RCN filter, so an empty needle returning all rows is by design, not a bug.
+    expect(filterByLocation("", DISTRICTS)).toEqual(DISTRICTS);
+  });
+
+  it("does not throw on a 10000-char needle and returns no spurious match", () => {
+    const huge = "wola".repeat(2500);
+    expect(() => filterByLocation(huge, DISTRICTS)).not.toThrow();
+    expect(filterByLocation(huge, DISTRICTS)).toEqual([]);
+  });
+
+  it("a Cyrillic homoglyph needle does NOT match its Latin lookalike", () => {
+    // Cyrillic 'о' (U+043E) in the fragment must not match Latin 'o' in the district names.
+    expect(filterByLocation("Мокотów", DISTRICTS)).toEqual([]);
+  });
+});
+
+describe("tryResolveCityKey — adversarial (city-key fast path)", () => {
+  it("resolves the three known keys case- and diacritics-insensitively", () => {
+    expect(tryResolveCityKey("warszawa")).toEqual(CITY_SUBDISTRICTS.get("Warszawa")!.slice());
+    expect(tryResolveCityKey("KRAKÓW")).toEqual(CITY_SUBDISTRICTS.get("Kraków")!.slice());
+    expect(tryResolveCityKey("Lodz")).toEqual(CITY_SUBDISTRICTS.get("Łódź")!.slice());
+    expect(tryResolveCityKey("  Warszawa  ")).toEqual(CITY_SUBDISTRICTS.get("Warszawa")!.slice());
+  });
+
+  it("returns null for a partial or decorated key (only an EXACT key is the fast path)", () => {
+    expect(tryResolveCityKey("wars")).toBeNull();       // prefix, not exact
+    expect(tryResolveCityKey("XXWarszawa")).toBeNull();
+    expect(tryResolveCityKey("Warszawa-Wola")).toBeNull();
+    expect(tryResolveCityKey("")).toBeNull();
+  });
+
+  it("returns a fresh array each call (no shared-mutation of the static map)", () => {
+    const a = tryResolveCityKey("Warszawa")!;
+    const b = tryResolveCityKey("Warszawa")!;
+    expect(a).not.toBe(b);
+    a.push("mutated");
+    expect(tryResolveCityKey("Warszawa")).not.toContain("mutated");
+  });
+
+  it("does not throw on adversarial input and returns null", () => {
+    expect(() => tryResolveCityKey("'; DROP TABLE --")).not.toThrow();
+    expect(tryResolveCityKey("Кraków")).toBeNull(); // Cyrillic К ≠ Latin K
   });
 });
 

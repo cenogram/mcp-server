@@ -10,6 +10,10 @@ import type {
   HistogramBin,
   ParcelSearchResponse,
   ParcelResolveResponse,
+  ParcelListResponse,
+  StreetListResponse,
+  ParcelLandClassResponse,
+  ParcelFeatureCollection,
   SpatialSearchResponse,
   CompareResponse,
   CreditInfo,
@@ -17,7 +21,8 @@ import type {
   LocationItem,
   ValuationResponse,
 } from "../api-client.js";
-import { encodeOAuthCtx } from "../api-client.js";
+import { encodeOAuthCtx, ApiHttpError } from "../api-client.js";
+import { formatStreetList } from "../formatters.js";
 
 // ── Mock api-client (replaces entire module, including module-level API_KEY) ──
 
@@ -27,8 +32,12 @@ const mockGetStats = vi.fn();
 const mockGetPricePerM2 = vi.fn();
 const mockGetDistricts = vi.fn();
 const mockGetLocations = vi.fn();
+const mockSearchLocations = vi.fn();
 const mockGetPriceHistogram = vi.fn();
 const mockSearchParcels = vi.fn();
+const mockListParcels = vi.fn();
+const mockGetParcelsMap = vi.fn();
+const mockSearchParcelsByPolygon = vi.fn();
 const mockResolveParcel = vi.fn();
 const mockSearchByPolygon = vi.fn();
 const mockCompareLocations = vi.fn();
@@ -41,11 +50,14 @@ const mockGetBuildingBreakdown = vi.fn();
 const mockGetTransactionFlood = vi.fn();
 const mockGetTransactionHeritage = vi.fn();
 const mockGetTransactionLandslide = vi.fn();
+const mockGetTransactionNature = vi.fn();
 const mockGetTransactionSurroundings = vi.fn();
+const mockGetTransactionRoads = vi.fn();
 const mockGetTransactionTransit = vi.fn();
 const mockGetTransactionFarmland = vi.fn();
 const mockGetDemographics = vi.fn();
 const mockGetInfrastructureSignals = vi.fn();
+const mockGetParcelLandClass = vi.fn();
 
 // tools.ts imports decodeOAuthCtx + OAUTH_CTX_PREFIX from api-client for identity logging, and the
 // identity tests below build OAuth keys via encodeOAuthCtx — pass those three through from the real
@@ -56,14 +68,21 @@ vi.mock("../api-client.js", async () => {
   encodeOAuthCtx: actual.encodeOAuthCtx,
   decodeOAuthCtx: actual.decodeOAuthCtx,
   OAUTH_CTX_PREFIX: actual.OAUTH_CTX_PREFIX,
+  // Real implementations: the reporting policy under test lives here, and tools.ts calls it.
+  ApiHttpError: actual.ApiHttpError,
+  isExpectedApiError: actual.isExpectedApiError,
   getTransactions: (...args: unknown[]) => mockGetTransactions(...args),
   getTransactionsSummary: (...args: unknown[]) => mockGetTransactionsSummary(...args),
   getStats: (...args: unknown[]) => mockGetStats(...args),
   getPricePerM2: (...args: unknown[]) => mockGetPricePerM2(...args),
   getDistricts: (...args: unknown[]) => mockGetDistricts(...args),
   getLocations: (...args: unknown[]) => mockGetLocations(...args),
+  searchLocations: (...args: unknown[]) => mockSearchLocations(...args),
   getPriceHistogram: (...args: unknown[]) => mockGetPriceHistogram(...args),
   searchParcels: (...args: unknown[]) => mockSearchParcels(...args),
+  listParcels: (...args: unknown[]) => mockListParcels(...args),
+  getParcelsMap: (...args: unknown[]) => mockGetParcelsMap(...args),
+  searchParcelsByPolygon: (...args: unknown[]) => mockSearchParcelsByPolygon(...args),
   resolveParcel: (...args: unknown[]) => mockResolveParcel(...args),
   searchByPolygon: (...args: unknown[]) => mockSearchByPolygon(...args),
   compareLocations: (...args: unknown[]) => mockCompareLocations(...args),
@@ -76,11 +95,14 @@ vi.mock("../api-client.js", async () => {
   getTransactionFlood: (...args: unknown[]) => mockGetTransactionFlood(...args),
   getTransactionHeritage: (...args: unknown[]) => mockGetTransactionHeritage(...args),
   getTransactionLandslide: (...args: unknown[]) => mockGetTransactionLandslide(...args),
+  getTransactionNature: (...args: unknown[]) => mockGetTransactionNature(...args),
   getTransactionSurroundings: (...args: unknown[]) => mockGetTransactionSurroundings(...args),
+  getTransactionRoads: (...args: unknown[]) => mockGetTransactionRoads(...args),
   getTransactionTransit: (...args: unknown[]) => mockGetTransactionTransit(...args),
   getTransactionFarmland: (...args: unknown[]) => mockGetTransactionFarmland(...args),
   getDemographics: (...args: unknown[]) => mockGetDemographics(...args),
   getInfrastructureSignals: (...args: unknown[]) => mockGetInfrastructureSignals(...args),
+  getParcelLandClass: (...args: unknown[]) => mockGetParcelLandClass(...args),
   };
 });
 
@@ -233,6 +255,9 @@ beforeAll(async () => {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // list_locations(search) reads two sources on every call; default the TERYT side to an empty,
+  // zero-cost result (the search route is free) so tests exercising only the RCN side don't stub it.
+  mockSearchLocations.mockResolvedValue({ data: [], creditInfo: { balance: 48, cost: 0 } });
 });
 
 // ── Helper ─────────────────────────────────────────────────────────
@@ -258,6 +283,7 @@ describe("tool discovery", () => {
       "get_demographics",
       "get_infrastructure_signals",
       "get_market_overview",
+      "get_parcel_land_class",
       "get_parcel_report",
       "get_price_distribution",
       "get_price_statistics",
@@ -265,11 +291,15 @@ describe("tool discovery", () => {
       "get_transaction_flood",
       "get_transaction_heritage",
       "get_transaction_landslide",
+      "get_transaction_nature",
       "get_transaction_permits",
       "get_transaction_planning",
+      "get_transaction_roads",
+      "get_transaction_subsurface",
       "get_transaction_surroundings",
       "get_transaction_transit",
       "list_locations",
+      "list_parcels_in_area",
       "resolve_parcel",
       "search_by_area",
       "search_by_polygon",
@@ -322,6 +352,77 @@ describe("tool discovery", () => {
     }
   });
 
+  it("points the parcel-sounding transaction tools at the parcel collection tool", async () => {
+    // search_by_area / search_by_polygon answer with DEEDS, and their names say nothing of the sort.
+    // With a tool that really does return parcels in an area now on the surface, the two read as
+    // near-synonyms; the cross-link is what keeps the model from picking by name alone.
+    const { tools } = await client.listTools();
+    for (const name of ["search_by_area", "search_by_polygon", "search_parcels"]) {
+      const desc = tools.find((t) => t.name === name)?.description ?? "";
+      expect(desc, `${name} does not point at list_parcels_in_area`).toContain("list_parcels_in_area");
+    }
+    // Both transaction tools carry the same disclaimer line; assert it on both, or a half-applied
+    // edit passes on the strength of the other one.
+    for (const name of ["search_by_area", "search_by_polygon"]) {
+      const desc = tools.find((t) => t.name === name)?.description ?? "";
+      expect(desc, `${name} does not say what it returns`).toContain("Returns TRANSACTIONS");
+    }
+  });
+
+  it("registers no street catalogue, and no description points at one", async () => {
+    // The catalogue answers over REST and is deliberately not a tool. This assertion guards the half
+    // of that decision which is easy to undo by accident: a dangling cross-link.
+    // A description naming a tool that is not in the registry is worse than no link at all — the
+    // assistant spends a turn calling something that does not exist, and the error it gets back says
+    // nothing about what to do instead.
+    const { tools } = await client.listTools();
+    expect(tools.map((t) => t.name)).not.toContain("list_streets");
+    for (const tool of tools) {
+      expect(tool.description ?? "", `${tool.name} still points at the unregistered catalogue`)
+        .not.toContain("list_streets");
+    }
+  });
+
+  it("asks for the nominative and says matching folds case and accents", async () => {
+    // Case and accents are now folded, so the only remaining trap is inflection: a name passed as it
+    // appeared in the question ('Karmelickiej'). The description must ask for the nominative and must
+    // NOT warn about diacritics, which no longer matter.
+    const { tools } = await client.listTools();
+    const desc = (name: string) => tools.find((t) => t.name === name)?.description ?? "";
+    expect(desc("list_parcels_in_area"), "does not ask for the nominative").toMatch(/nominative/i);
+    expect(desc("list_parcels_in_area"), "does not say matching is accent-insensitive").toMatch(/accent-insensitive/i);
+  });
+
+  it("tells resolve_parcel callers it is not a street address, and points at the address tool", async () => {
+    // The measured trap: a caller reads 'locality name + parcel number' and passes a street name +
+    // building number ('Marszałkowska 12'), which resolve_parcel cannot answer. The description must
+    // cut that off explicitly and name the tool that does take a street address.
+    const { tools } = await client.listTools();
+    const desc = tools.find((t) => t.name === "resolve_parcel")?.description ?? "";
+    expect(desc, "does not say q is not a street address").toMatch(/not a street address/i);
+    expect(desc, "does not point at the street-address tool").toContain("list_parcels_in_area");
+  });
+
+  it("warns that RCN building numbers are often compound, so an exact number misses", async () => {
+    // buildingNumber matches exactly, but RCN records split numbers like '84/92'; a caller passing
+    // '84' gets a silent empty answer. The description must warn about the compound form.
+    const { tools } = await client.listTools();
+    const desc = tools.find((t) => t.name === "list_parcels_in_area")?.description ?? "";
+    expect(desc, "does not warn about compound building numbers").toContain("84/92");
+  });
+
+  it("sends both address-bearing tools to the precinct lookup for rural parcels", async () => {
+    // The two entrances are complementary and the gap between them is geographically biased: an
+    // address reaches a town, a precinct name reaches everywhere else. A caller who is not told
+    // this reads an empty answer in the countryside as "that parcel is not in your data".
+    const { tools } = await client.listTools();
+    for (const name of ["list_parcels_in_area"]) {
+      const desc = tools.find((t) => t.name === name)?.description ?? "";
+      expect(desc, `${name} does not name the precinct-name way in`).toContain("resolve_parcel");
+      expect(desc, `${name} does not say coverage is a town story`).toMatch(/rural|outside towns/i);
+    }
+  });
+
   it("has all expected tool names (default set, no optional tools)", async () => {
     const { tools } = await client.listTools();
     const names = tools.map((t) => t.name).sort();
@@ -332,6 +433,7 @@ describe("tool discovery", () => {
       "get_demographics",
       "get_infrastructure_signals",
       "get_market_overview",
+      "get_parcel_land_class",
       "get_parcel_report",
       "get_price_distribution",
       "get_price_statistics",
@@ -339,11 +441,15 @@ describe("tool discovery", () => {
       "get_transaction_flood",
       "get_transaction_heritage",
       "get_transaction_landslide",
+      "get_transaction_nature",
       "get_transaction_permits",
       "get_transaction_planning",
+      "get_transaction_roads",
+      "get_transaction_subsurface",
       "get_transaction_surroundings",
       "get_transaction_transit",
       "list_locations",
+      "list_parcels_in_area",
       "resolve_parcel",
       "search_by_area",
       "search_by_polygon",
@@ -355,7 +461,7 @@ describe("tool discovery", () => {
   it("does NOT register the optional tools by default", async () => {
     const { tools } = await client.listTools();
     const names = tools.map((t) => t.name);
-    for (const gated of ["get_rental_yield", "list_rental_yield_locations", "get_price_spread", "list_price_spread_locations"]) {
+    for (const gated of ["get_rental_yield", "list_rental_yield_locations", "get_price_spread", "list_price_spread_locations", "get_flood_risk", "list_flood_risk_locations"]) {
       expect(names, `${gated} should be gated off`).not.toContain(gated);
     }
   });
@@ -501,6 +607,54 @@ describe("search_transactions", () => {
       expect.objectContaining({ floor: "10Plus,UNKNOWN" }),
       "test-api-key",
     );
+  });
+
+  it("forwards landUse and buildingStoreys (joined) to both rows and summary", async () => {
+    mockGetTransactions.mockResolvedValueOnce(withCredits(sampleTransactionsResponse));
+    mockGetTransactionsSummary.mockResolvedValueOnce(withCredits(sampleSummary));
+
+    await client.callTool({
+      name: "search_transactions",
+      arguments: { location: "Gdańsk", landUse: ["gruntyRolne", "unknown"], buildingStoreys: ["1", "3plus"] },
+    });
+
+    expect(mockGetTransactions).toHaveBeenCalledWith(
+      expect.objectContaining({ landUse: "gruntyRolne,unknown", buildingStoreys: "1,3plus" }),
+      "test-api-key",
+    );
+    // Summary must carry the same filters so the "Found N" count matches the rows.
+    expect(mockGetTransactionsSummary).toHaveBeenCalledWith(
+      expect.objectContaining({ landUse: "gruntyRolne,unknown", buildingStoreys: "1,3plus" }),
+      "test-api-key",
+    );
+  });
+
+  it("forwards minFootprintArea and maxFootprintArea to backend", async () => {
+    mockGetTransactions.mockResolvedValueOnce(withCredits(sampleTransactionsResponse));
+    mockGetTransactionsSummary.mockResolvedValueOnce(withCredits(sampleSummary));
+
+    await client.callTool({
+      name: "search_transactions",
+      arguments: { location: "Gdańsk", propertyType: "developed_land", minFootprintArea: 100, maxFootprintArea: 200 },
+    });
+
+    expect(mockGetTransactions).toHaveBeenCalledWith(
+      expect.objectContaining({ minFootprintArea: 100, maxFootprintArea: 200 }),
+      "test-api-key",
+    );
+  });
+
+  it("rejects malformed buildingStoreys tokens at the schema (no silent full-set)", async () => {
+    // Mirrors the floor front-gate: a garbage token surfaces an actionable error instead of
+    // silently vanishing and returning the full unfiltered set.
+    const result = await client.callTool({
+      name: "search_transactions",
+      arguments: { location: "Gdańsk", buildingStoreys: ["3abc"] },
+    });
+
+    expect(result.isError).toBe(true);
+    expect(getTextContent(result)).toContain("Invalid buildingStoreys token");
+    expect(mockGetTransactions).not.toHaveBeenCalled();
   });
 });
 
@@ -735,6 +889,24 @@ describe("search_by_area", () => {
       "test-api-key",
     );
   });
+
+  it("forwards landUse/buildingStoreys/footprint to both rows and summary", async () => {
+    mockGetTransactions.mockResolvedValueOnce(withCredits(sampleTransactionsResponse));
+    mockGetTransactionsSummary.mockResolvedValueOnce(withCredits(sampleSummary));
+
+    await client.callTool({
+      name: "search_by_area",
+      arguments: {
+        latitude: 52.23, longitude: 21.01, radiusKm: 2,
+        landUse: ["gruntyRolne"], buildingStoreys: ["1"], minFootprintArea: 100, maxFootprintArea: 200,
+      },
+    });
+
+    const expected = { landUse: "gruntyRolne", buildingStoreys: "1", minFootprintArea: 100, maxFootprintArea: 200 };
+    expect(mockGetTransactions).toHaveBeenCalledWith(expect.objectContaining(expected), "test-api-key");
+    // Summary must carry the same filters so the "Found N" count matches the rows.
+    expect(mockGetTransactionsSummary).toHaveBeenCalledWith(expect.objectContaining(expected), "test-api-key");
+  });
 });
 
 // ── Tests: get_market_overview ─────────────────────────────────────
@@ -777,8 +949,8 @@ describe("get_market_overview", () => {
 describe("list_locations", () => {
   it("returns voivodeships when called without params (hierarchy mode)", async () => {
     const voivodeships: LocationItem[] = [
-      { code: "02", name: "dolnośląskie", typeName: null, level: "voivodeship" },
-      { code: "14", name: "mazowieckie", typeName: null, level: "voivodeship" },
+      { code: "02", name: "dolnośląskie", typeName: null, level: "voivodeship", parent_name: null },
+      { code: "14", name: "mazowieckie", typeName: null, level: "voivodeship", parent_name: null },
     ];
     mockGetLocations.mockResolvedValueOnce(withCredits(voivodeships));
 
@@ -841,12 +1013,11 @@ describe("list_locations lazy city key", () => {
     const text = getTextContent(result);
 
     expect(mockGetDistricts).not.toHaveBeenCalled();
-    expect(text).toContain("Found 19 locations");
     expect(text).toContain("Mokotów");
     expect(text).toContain("Żoliborz");
     expect(text).toContain("Praga-Południe");
-    // No credit footer for city-key matches (zero API call = zero cost)
-    expect(text).not.toContain("API tokens");
+    // Merged search always reads the free TERYT source too → a zero-cost footer.
+    expect(text).toContain("query cost: 0)");
   });
 
   it("trailing whitespace 'Warszawa ' still resolves lazily", async () => {
@@ -854,7 +1025,7 @@ describe("list_locations lazy city key", () => {
     const text = getTextContent(result);
 
     expect(mockGetDistricts).not.toHaveBeenCalled();
-    expect(text).toContain("Found 19 locations");
+    expect(text).toContain("Mokotów");
   });
 
   it("lowercase 'warszawa' still resolves lazily", async () => {
@@ -862,7 +1033,7 @@ describe("list_locations lazy city key", () => {
     const text = getTextContent(result);
 
     expect(mockGetDistricts).not.toHaveBeenCalled();
-    expect(text).toContain("Found 19 locations");
+    expect(text).toContain("Mokotów");
   });
 
   it("'Kraków' returns 5 sub-districts without getDistricts", async () => {
@@ -870,7 +1041,6 @@ describe("list_locations lazy city key", () => {
     const text = getTextContent(result);
 
     expect(mockGetDistricts).not.toHaveBeenCalled();
-    expect(text).toContain("Found 5 locations");
     expect(text).toContain("Kraków-Podgórze");
   });
 
@@ -879,7 +1049,6 @@ describe("list_locations lazy city key", () => {
     const text = getTextContent(result);
 
     expect(mockGetDistricts).not.toHaveBeenCalled();
-    expect(text).toContain("Found 6 locations");
     expect(text).toContain("Łódź-Bałuty");
   });
 
@@ -930,11 +1099,16 @@ describe("search_parcels", () => {
 
 describe("resolve_parcel", () => {
   it("passes q to the API and formats matches", async () => {
-    mockResolveParcel.mockResolvedValueOnce(withCredits(sampleParcelResolve));
+    // Resolve is free, and the server sends no credit header on a free call, so creditInfo is null
+    // in production (unlike the billed tools). Model that here rather than forcing a footer with a
+    // contradictory cost, so the only cost the output states is the "0 tokens" line the formatter adds.
+    mockResolveParcel.mockResolvedValueOnce({ data: sampleParcelResolve, creditInfo: null });
 
     const result = await client.callTool({ name: "resolve_parcel", arguments: { q: "Wawer 27" } });
     const text = getTextContent(result);
 
+    // Backward compat: the call shape passed to resolveParcel is unchanged by the description/output
+    // edits — q alone still resolves, with the other modes left undefined.
     expect(mockResolveParcel).toHaveBeenCalledWith(
       { q: "Wawer 27", parcelId: undefined, lat: undefined, lng: undefined },
       "test-api-key",
@@ -942,7 +1116,8 @@ describe("resolve_parcel", () => {
     expect(text).toContain("146518_8.0108.27");
     expect(text).toContain("Wawer");
     expect(text).toContain("52.1234");
-    expect(text).toContain("API tokens: 48 remaining");
+    // The success path now states the (free) cost, not only the miss path via "refunded".
+    expect(text).toContain("Query cost: 0 API tokens");
   });
 
   it("passes parcelId to the API", async () => {
@@ -1182,6 +1357,40 @@ describe("search_by_polygon", () => {
     );
   });
 
+  it("forwards landUse (joined), buildingStoreys (joined) and footprint bounds", async () => {
+    mockSearchByPolygon.mockResolvedValueOnce(withCredits(sampleSpatialResponse));
+
+    await client.callTool({
+      name: "search_by_polygon",
+      arguments: {
+        polygon,
+        landUse: ["gruntyRolne", "unknown"], buildingStoreys: ["1", "3plus"],
+        minFootprintArea: 100, maxFootprintArea: 200,
+      },
+    });
+
+    expect(mockSearchByPolygon).toHaveBeenCalledWith(
+      expect.objectContaining({
+        landUse: "gruntyRolne,unknown",
+        buildingStoreys: "1,3plus",
+        minFootprintArea: 100,
+        maxFootprintArea: 200,
+      }),
+      "test-api-key",
+    );
+  });
+
+  it("rejects malformed buildingStoreys tokens at the schema", async () => {
+    const result = await client.callTool({
+      name: "search_by_polygon",
+      arguments: { polygon, buildingStoreys: ["3abc"] },
+    });
+
+    expect(result.isError).toBe(true);
+    expect(getTextContent(result)).toContain("Invalid buildingStoreys token");
+    expect(mockSearchByPolygon).not.toHaveBeenCalled();
+  });
+
   it("shows truncation warning when response is truncated", async () => {
     const truncated: SpatialSearchResponse = {
       ...sampleSpatialResponse,
@@ -1226,15 +1435,17 @@ describe("optional tools (flag on)", () => {
     else process.env.CENOGRAM_EXPERIMENTAL_TOOLS = prevFlag;
   });
 
-  it("registers all 27 tools including the 4 optional tools", async () => {
+  it("registers all 34 tools including the 6 optional tools", async () => {
     const { tools } = await client.listTools();
-    expect(tools).toHaveLength(27);
+    expect(tools).toHaveLength(34);
     const names = tools.map((t) => t.name);
     expect(names).toEqual(expect.arrayContaining([
       "get_rental_yield",
       "list_rental_yield_locations",
       "get_price_spread",
       "list_price_spread_locations",
+      "get_flood_risk",
+      "list_flood_risk_locations",
     ]));
   });
 
@@ -2021,6 +2232,67 @@ describe("get_transaction_landslide", () => {
   });
 });
 
+// ── Tests: get_transaction_nature ──────────────────────────────────
+
+describe("get_transaction_nature", () => {
+  const VALID_UUID = "11111111-2222-3333-4444-555555555555";
+
+  it("renders a per-parcel nature breakdown with credit footer", async () => {
+    mockGetTransactionNature.mockResolvedValueOnce(withCredits({
+      data: [
+        // Already-scrubbed shape (canonical EN forms + official names; no source-register fingerprint).
+        {
+          forest_distance_m: 0, forest_overlap_pct: "35.00", protection_rank: 1,
+          building_restriction: "statutory_ban", protected_overlap_pct: "60.00",
+          protected_forms: ["national_park"],
+          protected_areas: [{ form: "national_park", name: "Kampinoski Park Narodowy", overlap_pct: "50.00" }],
+        },
+      ],
+      truncated: false,
+    }));
+
+    const result = await client.callTool({ name: "get_transaction_nature", arguments: { transaction_id: VALID_UUID } });
+    const text = getTextContent(result);
+
+    expect(mockGetTransactionNature).toHaveBeenCalledWith(VALID_UUID, "test-api-key");
+    expect(text).toContain("Per-parcel nature breakdown (1 parcel with a forest");
+    expect(text).toContain("protection: national park");
+    expect(text).toContain("build restriction: statutory_ban");
+    expect(text).toContain("areas: Kampinoski Park Narodowy");
+    expect(text).toMatch(/API tokens.*48/);
+  });
+
+  it("empty + covered_no_data → the checked negative, never 'building is allowed'", async () => {
+    mockGetTransactionNature.mockResolvedValueOnce(withCredits({ data: [], truncated: false, coverage: "covered_no_data" }));
+
+    const result = await client.callTool({ name: "get_transaction_nature", arguments: { transaction_id: VALID_UUID } });
+    const text = getTextContent(result);
+
+    expect(text).toContain("No forest within 2 km and no protected natural area overlaps");
+    expect(text).toContain("never a statement that building is allowed");
+  });
+
+  // End-to-end version of the honesty fix: the envelope reaches the formatter, so an unchecked layer
+  // cannot be narrated to a model as a verified absence of forest and protection.
+  it("empty + not_covered → says nothing was checked, not that there is nothing there", async () => {
+    mockGetTransactionNature.mockResolvedValueOnce(withCredits({ data: [], truncated: false, coverage: "not_covered" }));
+
+    const result = await client.callTool({ name: "get_transaction_nature", arguments: { transaction_id: VALID_UUID } });
+    const text = getTextContent(result);
+
+    expect(text).toContain("nothing was checked");
+    expect(text).not.toContain("No forest within 2 km and no protected natural area overlaps");
+  });
+
+  it("rejects a malformed transaction_id via zod, no API call (protects credit)", async () => {
+    const result = await client.callTool({ name: "get_transaction_nature", arguments: { transaction_id: "not-a-uuid" } });
+
+    expect(result.isError).toBe(true);
+    expect(getTextContent(result)).toContain("UUID");
+    expect(mockGetTransactionNature).not.toHaveBeenCalled();
+  });
+});
+
 // ── Tests: get_transaction_surroundings ────────────────────────────
 
 describe("get_transaction_surroundings", () => {
@@ -2070,6 +2342,62 @@ describe("get_transaction_surroundings", () => {
     expect(result.isError).toBe(true);
     expect(getTextContent(result)).toContain("UUID");
     expect(mockGetTransactionSurroundings).not.toHaveBeenCalled();
+  });
+});
+
+// ── Tests: get_transaction_roads ────────────────────────────────────
+
+describe("get_transaction_roads", () => {
+  const VALID_UUID = "11111111-2222-3333-4444-555555555555";
+
+  it("renders a per-plot road-access breakdown with the framing note and the credit footer", async () => {
+    mockGetTransactionRoads.mockResolvedValueOnce(withCredits({
+      data: [
+        {
+          assessed: true,
+          access_indicator: "likely",
+          access_rule_version: 1,
+          public_road_distance_m: "8.20",
+          public_road_edge_distance_m: "4.70",
+          public_road_category: "municipal",
+          public_road_class: "local",
+          public_road_at_grade: true,
+          any_road_distance_m: "8.20",
+          major_road_distance_m: null,
+          source_as_of: "2025-04-01",
+        },
+      ],
+      truncated: false,
+    }));
+
+    const result = await client.callTool({ name: "get_transaction_roads", arguments: { transaction_id: VALID_UUID } });
+    const text = getTextContent(result);
+
+    expect(mockGetTransactionRoads).toHaveBeenCalledWith(VALID_UUID, "test-api-key");
+    expect(text).toContain("Per-parcel road access (1 plot;");
+    expect(text).toContain("access likely");
+    expect(text).toContain("public road: ~8 m (municipal, local), ~5 m to the carriageway edge");
+    expect(text).toContain("major road: none within 3 km");
+    // The framing is the product: an indicator sold as a determination of legal access is the failure
+    // mode of this layer, so the disclaimer has to survive every rendering path.
+    expect(text).toContain("does NOT determine legal access");
+    expect(text).toMatch(/API tokens.*48/);
+  });
+
+  it("two-state empty data → neutral message (no linked plots or unknown id)", async () => {
+    mockGetTransactionRoads.mockResolvedValueOnce(withCredits({ data: [], truncated: false }));
+
+    const result = await client.callTool({ name: "get_transaction_roads", arguments: { transaction_id: VALID_UUID } });
+
+    expect(getTextContent(result)).toContain("No road-access data is available");
+  });
+
+  it("rejects a malformed transaction_id via zod, no API call (protects credit)", async () => {
+    const result = await client.callTool({ name: "get_transaction_roads", arguments: { transaction_id: "not-a-uuid" } });
+
+    expect(result.isError).toBe(true);
+    expect(getTextContent(result)).toContain("UUID");
+    expect(mockGetTransactionRoads).not.toHaveBeenCalled();
   });
 });
 
@@ -2244,13 +2572,13 @@ describe("search_by_polygon validation", () => {
 
 describe("list_locations with TERYT hierarchy", () => {
   const sampleVoivodeships: LocationItem[] = [
-    { code: "02", name: "dolnośląskie", typeName: null, level: "voivodeship" },
-    { code: "14", name: "mazowieckie", typeName: null, level: "voivodeship" },
+    { code: "02", name: "dolnośląskie", typeName: null, level: "voivodeship", parent_name: null },
+    { code: "14", name: "mazowieckie", typeName: null, level: "voivodeship", parent_name: null },
   ];
 
   const sampleCounties: LocationItem[] = [
-    { code: "1401", name: "Warszawa", typeName: null, level: "county" },
-    { code: "1402", name: "ciechanowski", typeName: null, level: "county" },
+    { code: "1401", name: "Warszawa", typeName: null, level: "county", parent_name: null },
+    { code: "1402", name: "ciechanowski", typeName: null, level: "county", parent_name: null },
   ];
 
   it("no params → returns voivodeships via getLocations", async () => {
@@ -2297,7 +2625,7 @@ describe("list_locations with TERYT hierarchy", () => {
 
   it("trims whitespace from parent before validation", async () => {
     const counties: LocationItem[] = [
-      { code: "1401", name: "Warszawa", typeName: null, level: "county" },
+      { code: "1401", name: "Warszawa", typeName: null, level: "county", parent_name: null },
     ];
     mockGetLocations.mockResolvedValueOnce(withCredits(counties));
 
@@ -2335,8 +2663,8 @@ describe("list_locations with TERYT hierarchy", () => {
 
   it("6-digit parent returns precincts", async () => {
     const precinctItems = [
-      { code: "321705_2.0054", name: "Strączno", typeName: null, level: "precinct" as const },
-      { code: "321705_2.0055", name: "Szwecja", typeName: null, level: "precinct" as const },
+      { code: "321705_2.0054", name: "Strączno", typeName: null, level: "precinct" as const, parent_name: null },
+      { code: "321705_2.0055", name: "Szwecja", typeName: null, level: "precinct" as const, parent_name: null },
     ];
     mockGetLocations.mockResolvedValueOnce(withCredits(precinctItems));
 
@@ -2356,18 +2684,148 @@ describe("list_locations with TERYT hierarchy", () => {
 
     expect(mockGetLocations).toHaveBeenCalledWith("14", "test-api-key");
     expect(mockGetDistricts).not.toHaveBeenCalled();
+    expect(mockSearchLocations).not.toHaveBeenCalled();
   });
 
-  it("search without parent → legacy flow via getDistricts", async () => {
+  it("search merges the RCN district source with the TERYT source", async () => {
     mockGetDistricts.mockResolvedValueOnce(withCredits(["Mokotów", "Kraków-Podgórze"]));
 
     const result = await client.callTool({ name: "list_locations", arguments: { search: "Krak" } });
     const text = getTextContent(result);
 
     expect(mockGetDistricts).toHaveBeenCalled();
-    expect(mockGetLocations).not.toHaveBeenCalled();
+    expect(mockSearchLocations).toHaveBeenCalledWith("Krak", "test-api-key");
+    // RCN name that survived the filter is listed; the non-matching one is not.
     expect(text).toContain("Kraków-Podgórze");
     expect(text).not.toContain("Mokotów");
+    // No TERYT hits here → the RCN-only section carries the name-based call.
+    expect(text).toContain('search_transactions(location="Kraków-Podgórze")');
+  });
+
+  it("search returns TERYT units with codes and per-level follow-up calls", async () => {
+    mockGetDistricts.mockResolvedValueOnce(withCredits([]));
+    mockSearchLocations.mockReset();
+    mockSearchLocations.mockResolvedValueOnce(withCredits([
+      { code: "2217", name: "wejherowski", typeName: "powiat", level: "county", parent_name: "pomorskie", rcn_district: false },
+      { code: "221701", name: "Wejherowo", typeName: "gmina miejska", level: "municipality", parent_name: "wejherowski", rcn_district: true },
+    ]));
+
+    const result = await client.callTool({ name: "list_locations", arguments: { search: "Wejherowo" } });
+    const text = getTextContent(result);
+
+    expect(text).toContain("2217 - wejherowski");
+    expect(text).toContain("221701 - Wejherowo");
+    // teryt + parcels always; browse for county/municipality; demographics/infra where supported.
+    expect(text).toContain('search_transactions(teryt="221701")');
+    expect(text).toContain('list_locations(parent="2217")');
+    expect(text).toContain('get_infrastructure_signals(teryt="221701")');
+    // rcn_district=true row gets the name-based calls; the county row does not.
+    expect(text).toContain('search_transactions(location="Wejherowo")');
+    expect(text).not.toContain('search_transactions(location="wejherowski")');
+  });
+
+  it("search of a city key lifts its districts into the coded section", async () => {
+    // 'Warszawa' resolves via the static city map → no getDistricts call; TERYT adds the county,
+    // whose children are pulled once so districts land WITH a code, not in the RCN-only section.
+    mockSearchLocations.mockReset();
+    mockSearchLocations.mockResolvedValueOnce(withCredits([
+      { code: "1465", name: "Warszawa", typeName: "powiat", level: "county", parent_name: "mazowieckie", rcn_district: true },
+    ]));
+    mockGetLocations.mockResolvedValueOnce(withCredits([
+      { code: "146505", name: "Mokotów", typeName: "dzielnica", level: "municipality", parent_name: "Warszawa" },
+    ] as LocationItem[]));
+
+    const result = await client.callTool({ name: "list_locations", arguments: { search: "Warszawa" } });
+    const text = getTextContent(result);
+
+    expect(mockGetDistricts).not.toHaveBeenCalled();
+    expect(mockGetLocations).toHaveBeenCalledWith("1465", "test-api-key");
+    expect(text).toContain("1465 - Warszawa");
+    // Mokotów is now printed with its TERYT code and a name-based follow-up, not in "no code".
+    expect(text).toContain("146505 - Mokotów");
+    expect(text).toContain('search_transactions(location="Mokotów")');
+    expect(text).toContain('search_transactions(location="Warszawa")');
+  });
+
+  it("city-key district lift degrades to today's shape when the child fetch throws", async () => {
+    mockSearchLocations.mockReset();
+    mockSearchLocations.mockResolvedValueOnce(withCredits([
+      { code: "1465", name: "Warszawa", typeName: "powiat", level: "county", parent_name: "mazowieckie", rcn_district: true },
+    ]));
+    mockGetLocations.mockRejectedValueOnce(new Error("API error: HTTP 500"));
+
+    const result = await client.callTool({ name: "list_locations", arguments: { search: "Warszawa" } });
+    const text = getTextContent(result);
+
+    expect(result.isError).toBeFalsy();
+    expect(text).not.toContain("Error:");
+    // Fetch failed → the district stays in the RCN-only section rather than sinking the result.
+    expect(text).toContain("Mokotów");
+    expect(text).not.toContain("146505 - Mokotów");
+  });
+
+  it("a city-key district with no TERYT match stays in the no-code section", async () => {
+    mockSearchLocations.mockReset();
+    mockSearchLocations.mockResolvedValueOnce(withCredits([
+      { code: "1465", name: "Warszawa", typeName: "powiat", level: "county", parent_name: "mazowieckie", rcn_district: true },
+    ]));
+    // Children come back without the RCN name → nothing joins, RCN-only section keeps it.
+    mockGetLocations.mockResolvedValueOnce(withCredits([
+      { code: "146502", name: "Bielany", typeName: "dzielnica", level: "municipality", parent_name: "Warszawa" },
+    ] as LocationItem[]));
+
+    const result = await client.callTool({ name: "list_locations", arguments: { search: "Warszawa" } });
+    const text = getTextContent(result);
+
+    expect(text).toContain("Mokotów");
+    expect(text).not.toContain("146505 - Mokotów");
+  });
+
+  it("search shorter than 2 chars skips the TERYT branch (RCN only, no new 400)", async () => {
+    mockGetDistricts.mockResolvedValueOnce(withCredits(["Łódź-Bałuty"]));
+
+    await client.callTool({ name: "list_locations", arguments: { search: "ł" } });
+
+    expect(mockGetDistricts).toHaveBeenCalled();
+    expect(mockSearchLocations).not.toHaveBeenCalled();
+  });
+
+  it("search of punctuation with <2 word chars ('!a') stays RCN-only, no TERYT call, no error", async () => {
+    mockGetDistricts.mockResolvedValueOnce(withCredits(["Śródmieście"]));
+    mockSearchLocations.mockReset();
+
+    const result = await client.callTool({ name: "list_locations", arguments: { search: "!a" } });
+    const text = getTextContent(result);
+
+    // Word-char count is 1 here, so the guard skips TERYT and the server's 400 never surfaces.
+    expect(mockSearchLocations).not.toHaveBeenCalled();
+    expect(result.isError).toBeFalsy();
+    expect(text).not.toContain("Error:");
+  });
+
+  it("search '%_' (zero word chars) stays RCN-only without a TERYT call", async () => {
+    mockGetDistricts.mockResolvedValueOnce(withCredits(["Wola"]));
+    mockSearchLocations.mockReset();
+
+    const result = await client.callTool({ name: "list_locations", arguments: { search: "%_" } });
+
+    expect(mockSearchLocations).not.toHaveBeenCalled();
+    expect(result.isError).toBeFalsy();
+    expect(getTextContent(result)).not.toContain("Error:");
+  });
+
+  it("a thrown TERYT branch falls through to RCN-only instead of sinking the result", async () => {
+    mockGetDistricts.mockResolvedValueOnce(withCredits(["Mokotów"]));
+    mockSearchLocations.mockReset();
+    mockSearchLocations.mockRejectedValueOnce(new Error("API error: HTTP 400"));
+
+    const result = await client.callTool({ name: "list_locations", arguments: { search: "Mokotów" } });
+    const text = getTextContent(result);
+
+    expect(mockSearchLocations).toHaveBeenCalled();
+    expect(result.isError).toBeFalsy();
+    expect(text).not.toContain("Error:");
+    expect(text).toContain("Mokotów");
   });
 });
 
@@ -2606,12 +3064,16 @@ describe("tool.call identity: user_id in stderr log + Sentry setUser", () => {
   const OAUTH_UUID = "3f9a1c22-1b7e-4d0a-9c11-2b3c4d5e6f70";
 
   // Build a fresh server bound to `apiKey`, run one tool call, return the parsed `tool.call` log line.
-  async function runOneCall(apiKey: string, toolName: string): Promise<Record<string, unknown>> {
+  async function runOneCallWithResult(
+    apiKey: string,
+    toolName: string,
+  ): Promise<{ log: Record<string, unknown>; result: unknown }> {
     const writes: string[] = [];
     const spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown) => {
       writes.push(String(chunk));
       return true;
     });
+    let result: unknown;
     try {
       const { createMcpServer } = await import("../index.js");
       const server = createMcpServer(apiKey);
@@ -2619,14 +3081,18 @@ describe("tool.call identity: user_id in stderr log + Sentry setUser", () => {
       await server.connect(serverTransport);
       const c = new Client({ name: "id-test", version: "1.0.0" });
       await c.connect(clientTransport);
-      await c.callTool({ name: toolName, arguments: {} });
+      result = await c.callTool({ name: toolName, arguments: {} });
       await c.close();
     } finally {
       spy.mockRestore();
     }
     const line = writes.reverse().find((w) => w.includes('"tool.call"'));
     if (!line) throw new Error("no tool.call log line captured");
-    return JSON.parse(line) as Record<string, unknown>;
+    return { log: JSON.parse(line) as Record<string, unknown>, result };
+  }
+
+  async function runOneCall(apiKey: string, toolName: string): Promise<Record<string, unknown>> {
+    return (await runOneCallWithResult(apiKey, toolName)).log;
   }
 
   it("OAuth call: user_id = decoded UUID, key_prefix = 'oauth', Sentry user = UUID", async () => {
@@ -2648,6 +3114,63 @@ describe("tool.call identity: user_id in stderr log + Sentry setUser", () => {
     expect(log.success).toBe(false);
     expect(mockSentrySetUser).toHaveBeenCalledWith({ id: OAUTH_UUID });
     expect(mockSentryCaptureException).toHaveBeenCalledTimes(1);
+  });
+
+  // The states below are answers, not incidents: an unknown location, a spent allowance, a rate
+  // limit, a key the user has to fix. Reporting them buried the failures that mattered - but the
+  // per-call log must still record them, and the caller must still read the same message.
+  describe("expected API states are not reported", () => {
+    const cases: Array<{ label: string; status: number; mode: "oauth" | "api_key"; code?: string }> = [
+      { label: "unknown location (404)", status: 404, mode: "oauth" },
+      { label: "trial expired / no credits (402)", status: 402, mode: "oauth", code: "trial_expired" },
+      { label: "rate limit (429)", status: 429, mode: "oauth" },
+      { label: "bad request (400)", status: 400, mode: "oauth" },
+      { label: "rejected API key (401 on a key)", status: 401, mode: "api_key" },
+      { label: "email not verified (403)", status: 403, mode: "oauth", code: "email_not_verified" },
+    ];
+
+    for (const c of cases) {
+      it(`${c.label} -> no capture, message still relayed`, async () => {
+        mockGetStats.mockRejectedValueOnce(
+          new ApiHttpError("Unknown location: Babiak", { status: c.status, authMode: c.mode, code: c.code }),
+        );
+        const { log, result } = await runOneCallWithResult(
+          encodeOAuthCtx(OAUTH_UUID, "grant-x"),
+          "get_market_overview",
+        );
+
+        expect(log.success).toBe(false); // the business signal survives in the log line
+        expect(mockSentryCaptureException).not.toHaveBeenCalled();
+        // Not reporting must not mean not answering: the caller reads the same sentence as before.
+        expect(JSON.stringify(result)).toContain("Unknown location: Babiak");
+      });
+    }
+
+    it("5xx -> reported", async () => {
+      mockGetStats.mockRejectedValueOnce(
+        new ApiHttpError("Cenogram temporarily unavailable.", { status: 503, authMode: "oauth" }),
+      );
+      await runOneCall(encodeOAuthCtx(OAUTH_UUID, "grant-x"), "get_market_overview");
+      expect(mockSentryCaptureException).toHaveBeenCalledTimes(1);
+    });
+
+    // The OAuth token was validated before the call, so a rejection here points at drift on our
+    // side, not at the user's setup.
+    it("401 on the OAuth path -> reported", async () => {
+      mockGetStats.mockRejectedValueOnce(
+        new ApiHttpError("Connection expired or revoked.", { status: 401, authMode: "oauth" }),
+      );
+      await runOneCall(encodeOAuthCtx(OAUTH_UUID, "grant-x"), "get_market_overview");
+      expect(mockSentryCaptureException).toHaveBeenCalledTimes(1);
+    });
+
+    it("aborted request (not an HTTP answer) -> reported", async () => {
+      const abort = new Error("This operation was aborted");
+      abort.name = "AbortError";
+      mockGetStats.mockRejectedValueOnce(abort);
+      await runOneCall(encodeOAuthCtx(OAUTH_UUID, "grant-x"), "get_market_overview");
+      expect(mockSentryCaptureException).toHaveBeenCalledTimes(1);
+    });
   });
 
   it("api-key call: user_id = key_prefix (cngrm_xxxx), Sentry user = same prefix", async () => {
@@ -2728,5 +3251,686 @@ describe("missing auth context", () => {
     expect(text).toMatch(/bug on our side/i);
     expect(text).toContain("github.com/cenogram/mcp-server/issues");
     expect(text).not.toContain("CENOGRAM_API_KEY");
+  });
+});
+
+// ── Tests: list_parcels_in_area ────────────────────────────────────
+//
+// One tool sits over three routes, and which route a call takes is decided entirely by the shape of
+// the arguments. Nothing about that decision is visible in the answer text, so without these tests a
+// mis-wired branch would look like a normal reply — the light list where outlines were asked for, or
+// a 5-token call where a 2-token one was meant. The pre-flight guards are pinned for the same reason:
+// they are the difference between "you cannot ask that" and a paid-for 400.
+
+describe("list_parcels_in_area", () => {
+  const parcelList: ParcelListResponse = {
+    data: [
+      { id: "u-1", parcel_id: "146518_8.0108.27", parcel_key: "146518_8.0108", district: "Wawer", lat: 52.1234, lng: 21.0567 },
+      // Second row is deliberately the hard one: identity withheld AND no outline held.
+      { id: "u-2", parcel_id: null, parcel_key: null, district: null, lat: null, lng: null },
+    ],
+    pagination: { limit: 250, has_more: true, next_cursor: "Y3Vyc29yLTI" },
+  };
+
+  const parcelFeatures: ParcelFeatureCollection = {
+    type: "FeatureCollection",
+    truncated: true,
+    features: [
+      {
+        type: "Feature",
+        geometry: {
+          type: "Polygon",
+          coordinates: [[[21.0, 52.0], [21.2, 52.0], [21.2, 52.4], [21.0, 52.4], [21.0, 52.0]]],
+        },
+        properties: { id: "u-1", parcel_id: "146518_8.0108.27", parcel_key: "146518_8.0108", district: "Wawer" },
+      },
+    ],
+  };
+
+  const samplePolygon = {
+    type: "Polygon" as const,
+    coordinates: [[[21.0, 52.0], [21.2, 52.0], [21.2, 52.4], [21.0, 52.4], [21.0, 52.0]]],
+  };
+
+  // A guard that fires must cost nothing: no route may be called, not just "not the wrong one".
+  function expectNoApiCall() {
+    expect(mockListParcels).not.toHaveBeenCalled();
+    expect(mockGetParcelsMap).not.toHaveBeenCalled();
+    expect(mockSearchParcelsByPolygon).not.toHaveBeenCalled();
+  }
+
+  async function call(args: Record<string, unknown>): Promise<string> {
+    return getTextContent(await client.callTool({ name: "list_parcels_in_area", arguments: args }));
+  }
+
+  describe("routing", () => {
+    it("sends a teryt filter to the light list and names it in the scope", async () => {
+      mockListParcels.mockResolvedValueOnce(withCredits(parcelList));
+
+      const text = await call({ teryt: "1465" });
+
+      expect(mockListParcels).toHaveBeenCalledWith(expect.objectContaining({ teryt: "1465" }), "test-api-key");
+      expect(mockGetParcelsMap).not.toHaveBeenCalled();
+      expect(mockSearchParcelsByPolygon).not.toHaveBeenCalled();
+      expect(text).toContain("teryt 1465");
+    });
+
+    it("keeps a bbox on the light list when includeGeometry is not asked for", async () => {
+      // The expensive route must never be reached by naming an area alone — the price follows the
+      // shape of the answer, and a bbox on its own asks for the cheap shape.
+      mockListParcels.mockResolvedValueOnce(withCredits(parcelList));
+
+      const text = await call({ bbox: "21.0,52.0,21.2,52.4" });
+
+      expect(mockListParcels).toHaveBeenCalledWith(
+        expect.objectContaining({ bbox: "21.0,52.0,21.2,52.4" }),
+        "test-api-key",
+      );
+      expect(mockGetParcelsMap).not.toHaveBeenCalled();
+      expect(text).toContain("the bounding box");
+    });
+
+    it("routes includeGeometry=true with a bbox to the outline call", async () => {
+      mockGetParcelsMap.mockResolvedValueOnce(withCredits(parcelFeatures));
+
+      const text = await call({ bbox: "21.0,52.0,21.2,52.4", includeGeometry: true, limit: 25 });
+
+      expect(mockGetParcelsMap).toHaveBeenCalledWith("21.0,52.0,21.2,52.4", 25, "test-api-key");
+      expect(mockListParcels).not.toHaveBeenCalled();
+      expect(text).toContain("Outline (GeoJSON, WGS84)");
+    });
+
+    it("routes a polygon to the polygon call without needing includeGeometry", async () => {
+      mockSearchParcelsByPolygon.mockResolvedValueOnce(withCredits(parcelFeatures));
+
+      const text = await call({ polygon: samplePolygon });
+
+      expect(mockSearchParcelsByPolygon).toHaveBeenCalledWith(samplePolygon, undefined, "test-api-key");
+      expect(mockListParcels).not.toHaveBeenCalled();
+      expect(mockGetParcelsMap).not.toHaveBeenCalled();
+      expect(text).toContain("the polygon");
+    });
+
+    it("sends a full circle to the light list and names the radius", async () => {
+      mockListParcels.mockResolvedValueOnce(withCredits(parcelList));
+
+      const text = await call({ lat: 52.1, lng: 21.0, radiusKm: 2 });
+
+      expect(mockListParcels).toHaveBeenCalledWith(
+        expect.objectContaining({ lat: 52.1, lng: 21.0, radiusKm: 2 }),
+        "test-api-key",
+      );
+      expect(text).toContain("a 2 km circle");
+    });
+
+    it("labels the scope by teryt when both teryt and location are given", async () => {
+      // teryt wins on the server, so a label naming the location would misreport what was searched.
+      mockListParcels.mockResolvedValueOnce(withCredits(parcelList));
+
+      const text = await call({ teryt: "1465", location: "Wawer" });
+
+      expect(text).toContain("teryt 1465");
+      expect(text).not.toContain('"Wawer"');
+    });
+
+    it("passes the cursor and the surface filters through to the light list", async () => {
+      mockListParcels.mockResolvedValueOnce(withCredits(parcelList));
+
+      await call({ teryt: "1465", minArea: 500, maxArea: 2000, cursor: "Y3Vyc29yLTI", limit: 100 });
+
+      expect(mockListParcels).toHaveBeenCalledWith(
+        expect.objectContaining({ minArea: 500, maxArea: 2000, cursor: "Y3Vyc29yLTI", limit: 100 }),
+        "test-api-key",
+      );
+    });
+  });
+
+  describe("pre-flight guards", () => {
+    it("refuses a call that names no area at all", async () => {
+      const text = await call({});
+      expect(text).toContain("Name the area first");
+      expectNoApiCall();
+    });
+
+    it("refuses a polygon combined with another area", async () => {
+      const text = await call({ polygon: samplePolygon, teryt: "1465" });
+      expect(text).toContain("A polygon already describes the area");
+      expectNoApiCall();
+    });
+
+    it("refuses a bbox combined with a circle", async () => {
+      const text = await call({ bbox: "21.0,52.0,21.2,52.4", lat: 52.1, lng: 21.0, radiusKm: 2 });
+      expect(text).toContain("Pick one shape for the area");
+      expectNoApiCall();
+    });
+
+    it("refuses an incomplete circle", async () => {
+      const text = await call({ lat: 52.1, lng: 21.0 });
+      expect(text).toContain("must be given together");
+      expectNoApiCall();
+    });
+
+    it("refuses includeGeometry=false alongside a polygon instead of ignoring it", async () => {
+      // The parameter is optional rather than defaulted precisely so "omitted" and "explicitly
+      // false" stay distinguishable here; a default would turn this into silent ignoring.
+      const text = await call({ polygon: samplePolygon, includeGeometry: false });
+      expect(text).toContain("always returns outlines");
+      expectNoApiCall();
+    });
+
+    it("refuses includeGeometry=true without a bbox or a polygon", async () => {
+      const text = await call({ teryt: "1465", includeGeometry: true });
+      expect(text).toContain("Outlines are returned for a bbox or a polygon");
+      expectNoApiCall();
+    });
+
+    it("refuses a surface filter on a bbox outline call", async () => {
+      const text = await call({ bbox: "21.0,52.0,21.2,52.4", includeGeometry: true, minArea: 500 });
+      expect(text).toContain("not available on an outline call");
+      expectNoApiCall();
+    });
+
+    it("refuses a surface filter on a polygon call too", async () => {
+      const text = await call({ polygon: samplePolygon, maxArea: 2000 });
+      expect(text).toContain("not available on an outline call");
+      expectNoApiCall();
+    });
+
+    it("refuses a cursor on an outline call", async () => {
+      const text = await call({ bbox: "21.0,52.0,21.2,52.4", includeGeometry: true, cursor: "Y3Vyc29yLTI" });
+      expect(text).toContain("no paging");
+      expectNoApiCall();
+    });
+
+    it("refuses a cursor on a polygon call too", async () => {
+      const text = await call({ polygon: samplePolygon, cursor: "Y3Vyc29yLTI" });
+      expect(text).toContain("no paging");
+      expectNoApiCall();
+    });
+
+    it("refuses buildingNumber without a street", async () => {
+      const text = await call({ teryt: "1465", buildingNumber: "10" });
+      expect(text).toContain("buildingNumber needs street");
+      expectNoApiCall();
+    });
+
+    it("refuses a street when the area is only named down to a voivodeship", async () => {
+      const text = await call({ teryt: "14", street: "Karmelicka" });
+      expect(text).toContain("needs a narrower area");
+      expectNoApiCall();
+    });
+
+    it("judges the scope by teryt when both teryt and location are given", async () => {
+      // teryt wins on the server, so a wide teryt is the scope even next to a city name. Reading the
+      // location here would wave through a request the server then refuses — at the caller's cost.
+      const text = await call({ teryt: "14", location: "Kraków", street: "Karmelicka" });
+      expect(text).toContain("needs a narrower area");
+      expectNoApiCall();
+    });
+
+    it("takes the widest member of a teryt list as the scope", async () => {
+      // "asking for 02,146501 is as broad as asking for 02" — the same reading the server takes.
+      const text = await call({ teryt: "02,146501", street: "Karmelicka" });
+      expect(text).toContain("needs a narrower area");
+      expectNoApiCall();
+    });
+
+    it("accepts a street on a location name, which resolves to a county", async () => {
+      mockListParcels.mockResolvedValueOnce(withCredits(parcelList));
+
+      await call({ location: "Kraków", street: "Karmelicka" });
+
+      expect(mockListParcels).toHaveBeenCalledWith(
+        expect.objectContaining({ location: "Kraków", street: "Karmelicka" }),
+        "test-api-key",
+      );
+    });
+
+    it("refuses a street fragment with fewer than three letters or digits", async () => {
+      // Three CHARACTERS is not the test: punctuation yields nothing an index over names can be
+      // searched by, so "!!!" would be answered by reading every street name we hold.
+      const text = await call({ teryt: "1465", street: "!!!" });
+      expect(text).toContain("letters or digits");
+      expectNoApiCall();
+    });
+
+    it("counts Polish letters toward the minimum", async () => {
+      mockListParcels.mockResolvedValueOnce(withCredits(parcelList));
+
+      await call({ teryt: "1465", street: "Łąk" });
+
+      expect(mockListParcels).toHaveBeenCalledWith(expect.objectContaining({ street: "Łąk" }), "test-api-key");
+    });
+
+    it("refuses an address filter on a bbox outline call rather than dropping it", async () => {
+      // Silently dropping it would answer with every parcel in the shape and read as a street with
+      // a great many parcels on it — a wrong answer the caller cannot detect.
+      const text = await call({ bbox: "21.0,52.0,21.2,52.4", includeGeometry: true, street: "Karmelicka" });
+      expect(text).toContain("not available on an outline call");
+      expectNoApiCall();
+    });
+
+    it("refuses an address filter on a polygon call too", async () => {
+      const text = await call({ polygon: samplePolygon, street: "Karmelicka" });
+      expect(text).toContain("not available on an outline call");
+      expectNoApiCall();
+    });
+
+    it("refuses a polygon over the vertex ceiling before any call is made", async () => {
+      // Schema-level, not handler-level: the ring never reaches the handler. Asserted through the
+      // absence of a call rather than the message, because the rejection shape belongs to the SDK.
+      const ring = Array.from({ length: 501 }, (_, i) => [21 + i / 10000, 52]);
+      await call({ polygon: { type: "Polygon", coordinates: [ring] } });
+      expectNoApiCall();
+    });
+  });
+
+  describe("rendering", () => {
+    it("prints the truncation warning before the parcels, not after them", async () => {
+      // A reader who meets the list first reads it as the complete answer for the area.
+      mockGetParcelsMap.mockResolvedValueOnce(withCredits(parcelFeatures));
+
+      const text = await call({ bbox: "21.0,52.0,21.2,52.4", includeGeometry: true });
+
+      expect(text).toContain("TRUNCATED");
+      expect(text.indexOf("TRUNCATED")).toBeLessThan(text.indexOf("1. 146518_8.0108.27"));
+    });
+
+    it("renders withheld identity as a plan message, never as a literal null", async () => {
+      mockListParcels.mockResolvedValueOnce(withCredits(parcelList));
+
+      const text = await call({ teryt: "1465" });
+
+      expect(text).toContain("(parcel number requires a paid plan)");
+      expect(text).not.toContain("null");
+      expect(text).toContain("no outline held");
+    });
+
+    it("hands the cursor back so the caller can page", async () => {
+      mockListParcels.mockResolvedValueOnce(withCredits(parcelList));
+
+      const text = await call({ teryt: "1465" });
+
+      expect(text).toContain('cursor="Y3Vyc29yLTI"');
+      expect(text).toContain("pass it back unchanged");
+    });
+
+    it("says so when more rows match but no cursor came back", async () => {
+      mockListParcels.mockResolvedValueOnce(withCredits({
+        data: parcelList.data,
+        pagination: { limit: 250, has_more: true },
+      } satisfies ParcelListResponse));
+
+      const text = await call({ teryt: "1465" });
+
+      expect(text).toContain("narrow the filter instead of paging");
+    });
+
+    it("places a MultiPolygon outline by walking the whole nesting", async () => {
+      // Same route answers with Polygon or MultiPolygon; a renderer that only understands one of
+      // them reports "unknown" for real geometry it was handed.
+      mockSearchParcelsByPolygon.mockResolvedValueOnce(withCredits({
+        type: "FeatureCollection",
+        truncated: false,
+        features: [{
+          type: "Feature",
+          geometry: {
+            type: "MultiPolygon",
+            coordinates: [
+              [[[20.0, 50.0], [20.4, 50.0], [20.4, 50.2], [20.0, 50.2], [20.0, 50.0]]],
+              [[[21.0, 51.0], [21.2, 51.0], [21.2, 51.4], [21.0, 51.4], [21.0, 51.0]]],
+            ],
+          },
+          properties: { id: "u-1", parcel_id: "146518_8.0108.27", parcel_key: "146518_8.0108", district: "Wawer" },
+        }],
+      } satisfies ParcelFeatureCollection));
+
+      const text = await call({ polygon: samplePolygon });
+
+      expect(text).toContain("Outline centre: 50.7000°N, 20.6000°E");
+      expect(text).not.toContain("Outline centre: unknown");
+    });
+
+    it("reads an empty area as an answer, and names the reason it is usually empty", async () => {
+      mockListParcels.mockResolvedValueOnce(withCredits({
+        data: [],
+        pagination: { limit: 250, has_more: false },
+      } satisfies ParcelListResponse));
+
+      const text = await call({ teryt: "1465" });
+
+      expect(text).toContain("No parcels found for teryt 1465");
+      // Still an answer rather than a failure — but "the filter matched nothing" was the wrong half
+      // of the truth: coverage is near-complete but not the whole register, so a model must not read this as "no parcels here".
+      expect(text).toContain("The filter is valid");
+      expect(text).toContain("near-complete coverage of the cadastral register rather than the whole of it");
+      expect(text).not.toContain("This is an answer, not a failure");
+    });
+
+    it("prints the measured coverage when the answer carries it", async () => {
+      mockListParcels.mockResolvedValueOnce(withCredits({
+        data: [],
+        pagination: { limit: 250, has_more: false },
+        corpus_coverage: {
+          basis: "cadastral_partial",
+          held_parcels: 163,
+          source_parcels: 1000,
+          held_pct: 16.3,
+          counties: 1,
+          as_of: "2026-09-09T08:00:00.000Z",
+          note: "note",
+        },
+      } satisfies ParcelListResponse));
+
+      const text = await call({ teryt: "1465" });
+
+      expect(text).toContain("we hold 163 of the 1,000 parcels");
+      expect(text).toContain("16.3%");
+      // The share is useless without the day it was taken: a measurement from yesterday and one from
+      // half a year ago read identically otherwise.
+      expect(text).toContain("measured 2026-09-09");
+    });
+
+    it("renders an area query's null figures as words, never as a zero percentage", async () => {
+      mockListParcels.mockResolvedValueOnce(withCredits({
+        data: [],
+        pagination: { limit: 250, has_more: false },
+        corpus_coverage: {
+          basis: "cadastral_partial",
+          held_parcels: null,
+          source_parcels: null,
+          held_pct: null,
+          counties: null,
+          as_of: null,
+          note: "We hold near-complete coverage of the cadastral register, though not the whole of it and not live. For an area query we cannot say how much of it this shape covers: sizing it needs county boundaries we do not hold.",
+        },
+      } satisfies ParcelListResponse));
+
+      const text = await call({ teryt: "1465" });
+
+      expect(text).toContain("we cannot say how much of it this shape covers");
+      expect(text).not.toMatch(/0\.0%/);
+      // A count we do not have is described, not printed.
+      expect(text).not.toContain("null counties");
+    });
+
+    it("says a scope was never measured instead of telling the caller to ask by scope", async () => {
+      mockListParcels.mockResolvedValueOnce(withCredits({
+        data: [],
+        pagination: { limit: 250, has_more: false },
+        corpus_coverage: {
+          basis: "cadastral_partial",
+          held_parcels: null,
+          source_parcels: null,
+          held_pct: null,
+          counties: 0,
+          as_of: null,
+          note: "We hold near-complete coverage of the cadastral register, though not the whole of it and not live. We have no coverage measurement for the counties this query addresses, so how much we hold here is unknown.",
+        },
+      } satisfies ParcelListResponse));
+
+      const text = await call({ teryt: "9999" });
+
+      expect(text).toContain("no coverage measurement for the counties this query addresses");
+      // The caller asked by teryt. Calling that "an area query" and answering with "ask by teryt" is
+      // the loop this branch exists to break.
+      expect(text).not.toContain("For an area query");
+      expect(text).not.toContain("Ask by teryt or location");
+      expect(text).not.toContain("read the list above");
+    });
+
+    it("prints the address and marks a street we worked out, never the other way round", async () => {
+      // The marker is the whole point of carrying the provenance through: a derived street quoted
+      // as a recorded one is a claim about the record that the record does not make.
+      mockListParcels.mockResolvedValueOnce(withCredits({
+        data: [
+          { id: "u-1", parcel_id: "126101_1.0001.1", parcel_key: "126101_1.0001", district: "Stare Miasto", lat: 50.06, lng: 19.93, street: "Karmelicka", building_number: "10", address_source: "rcn" },
+          { id: "u-2", parcel_id: "126101_1.0001.2", parcel_key: "126101_1.0001", district: "Stare Miasto", lat: 50.07, lng: 19.94, street: "Krupnicza", building_number: null, address_source: "approx_high" },
+        ],
+        pagination: { limit: 250, has_more: false },
+      } satisfies ParcelListResponse));
+
+      const text = await call({ teryt: "1261" });
+
+      expect(text).toContain("Address: Karmelicka 10");
+      expect(text).toContain("Address: Krupnicza [street approximate");
+      // The recorded one carries no marker: tagging both would say "ordinary" on most rows.
+      expect(text).not.toContain("Karmelicka 10 [street approximate");
+    });
+
+    it("prints no address line at all for a parcel we hold no street for", async () => {
+      // 'none' is the contract's way of saying we looked and there is nothing. Printing that on
+      // every rural row would bury the rows that do carry an address.
+      mockListParcels.mockResolvedValueOnce(withCredits({
+        data: [
+          { id: "u-1", parcel_id: "126101_1.0001.1", parcel_key: "126101_1.0001", district: "Stare Miasto", lat: 50.06, lng: 19.93, street: null, building_number: null, address_source: "none" },
+        ],
+        pagination: { limit: 250, has_more: false },
+      } satisfies ParcelListResponse));
+
+      const text = await call({ teryt: "1261" });
+
+      expect(text).not.toContain("Address:");
+      expect(text).not.toContain("none");
+      expect(text).toContain("126101_1.0001.1");
+    });
+
+    it("names the street in the scope label, so an empty answer is not read as a statement about the county", async () => {
+      mockListParcels.mockResolvedValueOnce(withCredits({
+        data: [],
+        pagination: { limit: 250, has_more: false },
+      } satisfies ParcelListResponse));
+
+      const text = await call({ teryt: "1261", street: "Karmelicka", buildingNumber: "10" });
+
+      expect(text).toContain('teryt 1261, street "Karmelicka" no. 10');
+    });
+
+    it("renders street suggestions as ready calls and says the tokens came back on an empty street page", async () => {
+      // An inflected street answers empty; the server refunds it (X-Credits-Refunded → creditInfo.refunded)
+      // and hands back close catalogue names. Both must reach the caller: the refund and the retries.
+      mockListParcels.mockResolvedValueOnce({
+        data: {
+          data: [],
+          pagination: { limit: 250, has_more: false },
+          suggestions: { streets: ["Karmelicka", "Karmelitów"] },
+        } satisfies ParcelListResponse,
+        creditInfo: { balance: 48, cost: 2, refunded: 2 },
+      });
+
+      const text = await call({ teryt: "1261", street: "Karmelickiej" });
+
+      expect(text).toContain("refunded");
+      expect(text).toContain('street="Karmelicka"');
+      expect(text).toContain('street="Karmelitów"');
+    });
+
+    it("renders building-number suggestions when the street exists but the number missed", async () => {
+      mockListParcels.mockResolvedValueOnce({
+        data: {
+          data: [],
+          pagination: { limit: 250, has_more: false },
+          suggestions: { building_numbers: ["84/92", "86"] },
+        } satisfies ParcelListResponse,
+        creditInfo: { balance: 48, cost: 2, refunded: 2 },
+      });
+
+      const text = await call({ teryt: "1261", street: "Marszałkowska", buildingNumber: "84" });
+
+      expect(text).toContain("refunded");
+      expect(text).toContain('buildingNumber="84/92"');
+    });
+  });
+});
+
+// ── Tests: the street catalogue formatter, with no tool in front of it ─────
+//
+// The catalogue is not registered as a tool, so there is no handler to drive. The formatter stays,
+// and so does this test, because what it asserts is the part that is easiest to get wrong: what an
+// empty answer says about itself.
+
+describe("formatStreetList", () => {
+  const streetList: StreetListResponse = {
+    data: [
+      { street: "Karmelicka", address_source: "rcn" },
+      { street: "Karmazynowa", address_source: "approx" },
+    ],
+    scope: { teryt: "1261", resolved_from: "teryt" },
+    pagination: { limit: 50, has_more: false },
+  };
+
+  it("tags only the derived names and explains the untagged case once", () => {
+    const text = formatStreetList(streetList, "Karm", "teryt 1261");
+
+    expect(text).toContain("Karmelicka");
+    expect(text).toContain("Karmazynowa [approximate");
+    expect(text).not.toContain("Karmelicka [approximate");
+    expect(text).toContain("Untagged names are on record");
+  });
+
+  it("answers a cap with 'type more', because there is no second page", () => {
+    const text = formatStreetList(
+      { ...streetList, pagination: { limit: 50, has_more: true } },
+      "Karm",
+      "teryt 1261",
+    );
+
+    expect(text).toContain("no second page");
+    expect(text).not.toContain("cursor");
+  });
+
+  it("gives BOTH reasons an answer can be empty, and leads with neither", () => {
+    // The wording this replaces led with "a rural area can come back empty". For a city that premise
+    // is false, and a caller who believes it goes looking for a precinct number instead of a shorter
+    // fragment. An answer may not assert something about a set it has not checked — so it names both
+    // possibilities and says it cannot tell them apart.
+    //
+    // A third reason was here until matching moved to anywhere-inside-the-name: a name stored with
+    // its generic member in front of it now answers to the bare name, so it can no longer produce an
+    // empty list. The assertion that it is GONE is the point of the last line.
+    const text = formatStreetList(
+      { ...streetList, data: [] },
+      "Mars",
+      "teryt 1465",
+    );
+
+    expect(text, "does not name the thin-coverage case").toMatch(/thin outside towns/i);
+    expect(text, "does not name the genuinely-absent case").toMatch(/genuinely no such street/i);
+    expect(text, "does not ask for the nominative").toMatch(/nominative/i);
+    expect(text, "does not say matching folds case and accents").toMatch(/accent-insensitive/i);
+    expect(text, "still points at the precinct lookup").toContain("resolve_parcel");
+    // Both old wordings, verbatim: neither may come back. The second is the prefix phrasing, and it
+    // is the one that matters — it asserted something about the set that stopped being true when
+    // matching moved inside the name.
+    expect(text).not.toContain("This is an answer, not a failure");
+    expect(text).not.toContain("begins that way");
+    expect(text).not.toContain("This is an answer, not a failure");
+  });
+});
+
+
+// ── Tests: get_parcel_land_class ───────────────────────────────────
+//
+// The call path, end to end through the registered tool: what the client sends, what reaches the API
+// function, and what the caller reads back. The four states are told apart HERE too — not only in the
+// formatter — because the state is what decides whether the call cost anything, and a state collapsed
+// on the way through the handler would be invisible to a formatter test.
+
+describe("get_parcel_land_class", () => {
+  const RAW_ID = "142907_2.0014.342/5";
+
+  function landClassResponse(overrides: Partial<ParcelLandClassResponse> = {}): ParcelLandClassResponse {
+    return {
+      parcel: { id: "uuid-1", parcel_id: RAW_ID, parcel_key: "142907_2.0014.342-5" },
+      coverage: "covered",
+      as_of: "2026-08-01",
+      use_codes: ["R", "Ls"],
+      use_names: ["grunty orne", "lasy"],
+      soil_classes: ["IIIa", "IVb"],
+      protected_class_present: true,
+      in_city: false,
+      legal_note: "Działka zawiera grunt rolny klasy chronionej (I-III).",
+      legal_state_as_of: "2026-08-12",
+      note: null,
+      ...overrides,
+    };
+  }
+
+  it("renders a covered classification with the credit footer", async () => {
+    mockGetParcelLandClass.mockResolvedValueOnce(withCredits(landClassResponse()));
+
+    const result = await client.callTool({ name: "get_parcel_land_class", arguments: { parcelId: RAW_ID } });
+    const text = getTextContent(result);
+
+    // The raw id travels to the API function untouched: normalising to the dash form is the client's
+    // job, and doing it twice would corrupt an id whose number segment legitimately contains a dash.
+    expect(mockGetParcelLandClass).toHaveBeenCalledWith(RAW_ID, "test-api-key");
+    expect(text).toContain(`Land-use and soil-quality classification: ${RAW_ID}`);
+    expect(text).toContain("grunty orne, lasy; soil class IIIa, IVb");
+    expect(text).toContain("Use codes: R, Ls");
+    expect(text).toContain("Protected soil grade (I-III) present: yes");
+    expect(text).toContain("Inside a city's administrative boundary: no");
+    expect(text).toContain("Re-designation: Działka zawiera grunt rolny klasy chronionej (I-III).");
+    expect(text).toContain("Legal state verified as of 2026-08-12.");
+    expect(text).toMatch(/API tokens.*48/);
+  });
+
+  it("tells a checked negative apart from an uncovered county", async () => {
+    mockGetParcelLandClass.mockResolvedValueOnce(withCredits(landClassResponse({
+      coverage: "covered_no_data",
+      use_codes: [], use_names: [], soil_classes: [],
+      protected_class_present: false, legal_note: null,
+    })));
+
+    const text = getTextContent(await client.callTool({
+      name: "get_parcel_land_class", arguments: { parcelId: RAW_ID },
+    }));
+
+    expect(text).toContain("The county publishes the classification, but parcel");
+    expect(text).toContain("billed as an answer");
+    expect(text).not.toContain("the tokens are refunded");
+  });
+
+  it("says the county publishes nothing, passes the server's reason through, and calls the tokens refunded", async () => {
+    mockGetParcelLandClass.mockResolvedValueOnce(withCredits(landClassResponse({
+      coverage: "not_covered",
+      as_of: null,
+      use_codes: [], use_names: [], soil_classes: [],
+      protected_class_present: false, in_city: null, legal_note: null, legal_state_as_of: null,
+      note: "The parcel has no cadastral key, so this layer cannot be computed for it.",
+    })));
+
+    const text = getTextContent(await client.callTool({
+      name: "get_parcel_land_class", arguments: { parcelId: RAW_ID },
+    }));
+
+    expect(text).toContain("No land-use or soil-quality classification is available");
+    expect(text).toContain("the tokens are refunded");
+    expect(text).toContain("The parcel has no cadastral key");
+  });
+
+  it("keeps a timed-out lookup separate from an answered one", async () => {
+    mockGetParcelLandClass.mockResolvedValueOnce(withCredits(landClassResponse({
+      coverage: "not_computed",
+      as_of: null,
+      use_codes: [], use_names: [], soil_classes: [],
+      protected_class_present: false, legal_note: null, legal_state_as_of: null,
+    })));
+
+    const text = getTextContent(await client.callTool({
+      name: "get_parcel_land_class", arguments: { parcelId: RAW_ID },
+    }));
+
+    expect(text).toContain("could not be completed");
+    expect(text).toContain("Retry shortly");
+    // A retryable failure must not read as a finding about the parcel.
+    expect(text).not.toContain("Protected soil grade");
+  });
+
+  it("rejects an id too short to be one via zod, no API call (protects credit)", async () => {
+    const result = await client.callTool({ name: "get_parcel_land_class", arguments: { parcelId: "ab" } });
+
+    expect(result.isError).toBe(true);
+    expect(mockGetParcelLandClass).not.toHaveBeenCalled();
   });
 });

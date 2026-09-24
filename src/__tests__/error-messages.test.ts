@@ -81,14 +81,16 @@ describe("authErrorMessage", () => {
       expect(msg).toContain("query cost: ?");
     });
 
-    // An expired trial freezes the balance instead of spending it, so the credits template
-    // describes the wrong problem: it would report "balance: 300, query cost: 1" and leave the
-    // caller looking for a maths error. The API states the real reason; relay it untouched.
+    // An expired trial blocks on time, not on an empty wallet, so the credits template describes
+    // the wrong problem: it would report "balance: 300, query cost: 1" and leave the caller looking
+    // for a maths error. The API states the real reason; relay it untouched. The fixture below is a
+    // verbatim copy of what the API sends today - when that wording changes, copy it again rather
+    // than paraphrasing, because the point of the test is that nothing here rewrites it.
     describe("trial_expired", () => {
       const trialBody = {
         error: "trial_expired",
         message:
-          "Your 14-day free API trial has expired, so this request was not charged. Your remaining 300 token(s) are frozen, not lost - they become spendable again once you subscribe to Starter at https://cenogram.pl/api#cennik",
+          "Your free API trial has expired, so this request was not charged. Subscribe to Standard at https://cenogram.pl/api#cennik to get 2000 tokens per month",
         currentBalance: 300,
         creditsRequired: 1,
         upgrade: "https://cenogram.pl/api#cennik",
@@ -189,12 +191,12 @@ describe("authErrorMessage", () => {
 
   describe("404", () => {
     // The API frames unknown location/county as a client-correctable 404 and now returns a
-    // self-correcting body.error (e.g. "Unknown location: X. ... List covered locations first ...").
+    // self-correcting body.error (e.g. "Unknown location: X. Look up the code with ...").
     // The MCP layer must surface that specific message verbatim so the model can self-correct,
     // not swallow it behind a generic string.
     it("passes the API's specific error message through verbatim", () => {
       const specific =
-        'Unknown location: Sandomierz. Not a covered county for this tool. List covered locations first (the /locations coverage catalog) or pass a 4-digit county TERYT code; districts are supported only for Warszawa (6-digit TERYT).';
+        'Unknown location: Sandomierz. Look up the code with /api/locations?search=<fragment> (free, returns a TERYT code to pass as teryt=), or pass a 4-digit county TERYT directly.';
       expect(authErrorMessage(404, "oauth", { error: specific })).toBe(specific);
     });
     it("prefers body.message over body.error when both present", () => {

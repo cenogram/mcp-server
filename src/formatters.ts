@@ -1,4 +1,4 @@
-import type { Transaction, TransactionsResponse, TransactionsSummary, StatsResponse, PricePerM2Row, HistogramBin, ParcelSearchResponse, ParcelResolveResponse, SpatialSearchResponse, SpatialFeature, CompareResponse, LocationItem, RentalYieldResponse, RentalYieldLocationsResponse, PriceSpreadResponse, PriceSpreadLocationsResponse, ValuationResponse, ValuationComparable, Percentiles, TxWindow, BuildingBreakdownResponse, FloodBreakdownResponse, HeritageBreakdownResponse, LandslideBreakdownResponse, SurroundingsResponse, SurroundingsRow, TransitBreakdownResponse, PermitsResponse, PlanningResponse, PlanningRow, FarmlandResponse, DemographicsResponse, DemographicsIndicator, InfrastructureSignalsResponse, ParcelReportResponse, ReportSection, ReportMarketContext, ReportMarketLevel, ReportLocationContext } from "./api-client.js";
+import type { Transaction, TransactionsResponse, TransactionsSummary, StatsResponse, PricePerM2Row, HistogramBin, ParcelSearchResponse, ParcelResolveResponse, ParcelListRow, ParcelListResponse, StreetListResponse, ParcelFeature, ParcelFeatureCollection, CorpusCoverage, SpatialSearchResponse, SpatialFeature, CompareResponse, LocationItem, LocationSearchItem, RentalYieldResponse, RentalYieldLocationsResponse, PriceSpreadResponse, PriceSpreadLocationsResponse, FloodRiskResponse, FloodRiskLocationsResponse, ValuationResponse, ValuationComparable, Percentiles, TxWindow, BuildingBreakdownResponse, BuildingAgeEstimate, FloodBreakdownResponse, HeritageBreakdownResponse, LandslideBreakdownResponse, NatureBreakdownResponse, SubsurfaceBreakdownResponse, SurroundingsResponse, SurroundingsRow, RoadsBreakdownResponse, RoadsBreakdownRow, TransitBreakdownResponse, PermitsResponse, PlanningResponse, PlanningRow, FarmlandResponse, DemographicsResponse, DemographicsIndicator, InfrastructureSignalsResponse, ParcelReportResponse, ParcelLandClassResponse, ReportSection, ReportMarketContext, ReportMarketLevel, ReportLocationContext } from "./api-client.js";
 import { PROPERTY_TYPES, MARKET_TYPES, BUILDING_TYPES, OWNERSHIP_TYPES, PARTY_TYPES, LAND_USES } from "./mappings.js";
 
 // Cross-link shown once on a transaction list when ≥1 row carries building data — tells the LLM the
@@ -418,7 +418,7 @@ export function formatPriceStats(
 ): string {
   if (rows.length === 0) {
     return location
-      ? `No price statistics found for "${location}". Note: this endpoint only covers residential units (apartments). Use list_locations to find valid location names.`
+      ? `No price statistics found for "${location}". Note: this endpoint only covers residential units (apartments), and matches on name only. Call list_locations(search=...) to confirm the name is a valid RCN district (rcn_district).`
       : "No price statistics available.";
   }
 
@@ -476,7 +476,11 @@ export function formatHistogram(bins: HistogramBin[]): string {
 
 export function formatParcelResults(res: ParcelSearchResponse, query: string): string {
   if (res.results.length === 0) {
-    return `No parcels found matching "${query}".`;
+    // A miss here is not proof the parcel does not exist: coverage is near-complete but not the whole
+    // register and not live, so "no match" points to a recent change, an odd spelling, or a parcel we
+    // do not hold — saying so is the difference between a useful next step and a model reporting that
+    // the land does not exist.
+    return `No parcels found matching "${query}". This searches the parcels we hold, which are near-complete coverage of the cadastral register rather than the whole of it, so a miss is more likely a recent change or a mistyped prefix than evidence that no such parcel exists — ${CORPUS_COVERAGE_HINT}${formatCorpusCoverage(res.corpus_coverage)}`;
   }
 
   const lines: string[] = [`Found ${res.results.length} parcels matching "${query}":\n`];
@@ -489,14 +493,263 @@ export function formatParcelResults(res: ParcelSearchResponse, query: string): s
     lines.push(`${i + 1}. ${p.parcel_id ?? "(parcel number requires a paid plan)"}`);
     lines.push(`   District: ${district} | Area: ${area} | Location: ${location}`);
   }
+  return lines.join("\n") + formatCorpusCoverage(res.corpus_coverage);
+}
+
+// ── Parcel collection formatting ───────────────────────────────────
+
+// Gated identity renders as a sentence, never as "null" or "undefined": a reader who meets an empty
+// slot concludes the parcel has no number, which is a different (and false) statement.
+const PARCEL_IDENTITY_WITHHELD = "(parcel number requires a paid plan)";
+
+// ── Corpus coverage: printed with every parcel collection ──────────────────────────────────────
+//
+// The parcel endpoints answer from the cadastral register we hold, which is near-complete but not the
+// whole of it and not live. Every empty or short list therefore has two possible readings — "the land
+// is not there" and "we do not have it (yet)" — and the second is the safer default. These renderers
+// exist so a model on the other side is never left to pick between them on its own.
+const CORPUS_COVERAGE_HINT =
+  "looking the parcel up by its FULL cadastral id (resolve_parcel) goes down a different path that can confirm and add a parcel we do not yet hold.";
+
+// Said only when there is a measurement to report; without one the server's own note is passed
+// through instead of a guess. The two unmeasured states are NOT the same statement — an area query
+// cannot be sized at all, while a named scope may simply never have been measured — and the note is
+// what tells them apart, so inventing one sentence for both is how a caller who asked by scope ends
+// up being told to ask by scope.
+const COVERAGE_UNMEASURED_FALLBACK =
+  "we hold near-complete coverage of the cadastral register, though not the whole of it and not live, " +
+  "and how much of it this query covers is not measured. Read the answer above as what we hold, not " +
+  "as what is there.";
+
+/** A finite number or nothing: a field arriving as a string must not reach `.toFixed` or `.toLocaleString`. */
+function finiteOrNull(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+// The scope in words. A count we do not have is described, never printed — "these null counties" is
+// worse than saying nothing about how many.
+function coverageScopeLabel(counties: number | null): string {
+  if (counties === 1) return "this county";
+  if (counties != null && counties > 1) return `these ${counties.toLocaleString("en-US")} counties`;
+  return "the counties this query addresses";
+}
+
+// Rounding must not turn a real gap into "we have everything", nor a real holding into "we have
+// nothing": both ends get a bounded form instead of a misleading 100.0% / 0.0%.
+// The two counts we are about to print decide the boundary, not the rounded share the server sent —
+// the server's own value is already rounded and reads "0" for a real, tiny holding.
+function coveragePctLabel(held: number, source: number, reported: number | null): string {
+  const exact = (held / source) * 100;
+  if (held > 0 && exact < 0.05) return "<0.1%";
+  if (held < source && exact >= 99.95) return ">99.9%";
+  return `${(reported ?? exact).toFixed(1)}%`;
+}
+
+// Printed only when it says something: a fully covered scope needs no caveat. Nulls are NOT rendered
+// as zeroes — "we did not size this" and "there is nothing here" must never look alike.
+export function formatCorpusCoverage(cov: CorpusCoverage | null | undefined): string {
+  if (!cov) return "";
+  // The date of the measurement travels with it. A share of the register without one cannot be told
+  // apart from a share measured half a year ago, and the two lead to different decisions.
+  const asOf = typeof cov.as_of === "string" ? cov.as_of.split("T")[0] : null;
+  const held = finiteOrNull(cov.held_parcels);
+  const source = finiteOrNull(cov.source_parcels);
+
+  if (held != null && source != null && source > 0) {
+    if (held >= source) return "";
+    const scope = coverageScopeLabel(finiteOrNull(cov.counties));
+    const pct = coveragePctLabel(held, source, finiteOrNull(cov.held_pct));
+    const stamp = asOf ? `, measured ${asOf}` : "";
+    return `\n\nCOVERAGE: we hold ${held.toLocaleString("en-US")} of the ${source.toLocaleString("en-US")} parcels the cadastral register lists for ${scope} (${pct}${stamp}). A short or empty list above reflects that, not the land.`;
+  }
+
+  const note = typeof cov.note === "string" && cov.note.trim().length > 0
+    ? cov.note.trim()
+    : COVERAGE_UNMEASURED_FALLBACK;
+  const stamp = asOf ? ` Our latest coverage measurement is dated ${asOf}.` : "";
+  return `\n\nCOVERAGE: ${note}${stamp}`;
+}
+
+// Collect every [lng, lat] pair out of a GeoJSON coordinates tree. The same route answers with a
+// Polygon or a MultiPolygon depending on the parcel, so walking the nesting is what keeps one
+// renderer correct for both; an unexpected shape yields no pairs instead of throwing.
+function collectPositions(node: unknown, out: Array<[number, number]>): void {
+  if (!Array.isArray(node)) return;
+  if (node.length >= 2 && typeof node[0] === "number" && typeof node[1] === "number") {
+    out.push([node[0], node[1]]);
+    return;
+  }
+  for (const child of node) collectPositions(child, out);
+}
+
+// Mid-point of the outline's bounding box, deliberately NOT called a centroid — it is here so a
+// reader can tell where a parcel is without parsing the ring, and a true centroid would be more
+// arithmetic for a number nobody asked for. Labelled "outline centre" wherever it is rendered.
+function outlineCentre(geometry: ParcelFeature["geometry"]): { lat: number; lng: number } | null {
+  if (!geometry) return null;
+  const positions: Array<[number, number]> = [];
+  collectPositions(geometry.coordinates, positions);
+  if (positions.length === 0) return null;
+  let minLng = Infinity, maxLng = -Infinity, minLat = Infinity, maxLat = -Infinity;
+  for (const [lng, lat] of positions) {
+    if (lng < minLng) minLng = lng;
+    if (lng > maxLng) maxLng = lng;
+    if (lat < minLat) minLat = lat;
+    if (lat > maxLat) maxLat = lat;
+  }
+  return { lat: (minLat + maxLat) / 2, lng: (minLng + maxLng) / 2 };
+}
+
+/**
+ * The address line of one parcel row, or null when there is nothing to print.
+ *
+ * A street we worked out ourselves is tagged, in the same words the transaction rows use, so an
+ * approximated street is never read back as one on record. A row with no street prints no address
+ * line at all rather than "none": the answer to "which street is this parcel on" is that we hold
+ * none, and most rural parcels are in that position — a line saying so on every one of them would
+ * bury the rows that do carry an address. The absence is described once, in the tool description.
+ */
+function formatParcelAddress(p: ParcelListRow): string | null {
+  if (p.street == null || p.street === "") return null;
+  const approx = p.address_source === "approx_high" || p.address_source === "approx_low";
+  const tag = approx ? " [street approximate — derived, not from the record]" : "";
+  return [p.street, p.building_number].filter(Boolean).join(" ") + tag;
+}
+
+// The light collection: identifiers, district, centroid, and the street address where we hold one.
+// No outline and no surface — see the tool description for why, and for which call returns each.
+export function formatParcelList(res: ParcelListResponse, scope: string, creditsRefunded = false): string {
+  if (res.data.length === 0) {
+    const lines = [
+      `No parcels found for ${scope}. The filter is valid; nothing matched it AMONG THE PARCELS WE HOLD, which are near-complete coverage of the cadastral register rather than the whole of it. So this is not evidence that the area has no parcels.`,
+    ];
+    // Say the tokens came back only when the header confirmed it — never infer a refund from the shape.
+    if (creditsRefunded) lines.push("The tokens for this call were refunded — an unmatched street page costs nothing.");
+    const streets = res.suggestions?.streets ?? [];
+    const numbers = res.suggestions?.building_numbers ?? [];
+    if (streets.length > 0) {
+      lines.push("Close street names on record here — matching is case- and accent-insensitive but does not inflect, so retry with one of these, each a ready next call:");
+      for (const s of streets) lines.push(`  - street="${s}"`);
+    }
+    if (numbers.length > 0) {
+      lines.push("The street is on record but that number is not; these are the numbers held on it, in the compound form the register uses — retry with one of them:");
+      for (const n of numbers) lines.push(`  - buildingNumber="${n}"`);
+    }
+    if (streets.length === 0 && numbers.length === 0) {
+      lines.push("Widening the area or dropping a surface filter is the next step.");
+    }
+    lines.push(CORPUS_COVERAGE_HINT);
+    return lines.join("\n") + formatCorpusCoverage(res.corpus_coverage);
+  }
+
+  const lines: string[] = [`Found ${res.data.length} parcel${res.data.length === 1 ? "" : "s"} for ${scope}:\n`];
+  for (const [i, p] of res.data.entries()) {
+    const district = p.district ?? "Unknown";
+    const location = p.lat != null && p.lng != null
+      ? `${p.lat.toFixed(4)}°N, ${p.lng.toFixed(4)}°E`
+      : "no outline held";
+    lines.push(`${i + 1}. ${p.parcel_id ?? PARCEL_IDENTITY_WITHHELD}`);
+    lines.push(`   District: ${district} | Location: ${location}`);
+    const address = formatParcelAddress(p);
+    if (address) lines.push(`   Address: ${address}`);
+  }
+
+  // has_more is a fact about paging, not about coverage — and it is the difference between "these
+  // are the parcels here" and "these are the first ones". Saying so is the whole point of printing it.
+  if (res.pagination.has_more && res.pagination.next_cursor) {
+    lines.push(`\nMore parcels match than are shown. Pass cursor="${res.pagination.next_cursor}" to get the next page (the value is opaque — pass it back unchanged).`);
+  } else if (res.pagination.has_more) {
+    lines.push(`\nMore parcels match than are shown, but no cursor came back — narrow the filter instead of paging.`);
+  }
+  lines.push(`\nNo outline and no surface on these rows: call list_parcels_in_area with includeGeometry=true (or a polygon) for outlines, or get_parcel_report for one parcel in full.`);
+  return lines.join("\n") + formatCorpusCoverage(res.corpus_coverage);
+}
+
+/**
+ * The street catalogue for one scope.
+ *
+ * An empty list is said in words, because an empty list and an unavailable catalogue are different
+ * answers and the caller cannot tell them apart from the shape alone. The unavailable case never
+ * reaches this function — it is answered as an error, on purpose.
+ *
+ * ⚠ No tool calls this — the catalogue answers over REST only, for the reasons written where its
+ * registration would have gone. It is kept here because the route is live.
+ */
+export function formatStreetList(res: StreetListResponse, q: string, scope: string): string {
+  if (res.data.length === 0) {
+    // TWO things produce an empty list here and the answer names both, because it cannot tell which
+    // one happened. Naming only one is what the earlier wording did — it led with "a rural area can
+    // come back empty", which is false in its premise for a city and sends the caller off after a
+    // precinct number instead of a shorter fragment. An answer may not assert something about a set
+    // it has not checked.
+    //
+    // A third reason used to belong here and no longer does: matching now reads ANYWHERE inside the
+    // name, so a name stored with its generic member in front of it ("ulica X", "aleja X") answers
+    // to "X". That was the single largest source of empty answers and it is gone.
+    return `No street name in ${scope} matches "${q}". The scope is valid and nothing we hold there contains that fragment — two different things can put you here, and this answer cannot tell them apart:\n`
+      + `  1. We hold no street addresses in this area at all. Coverage follows the addresses themselves and is thin outside towns, so rural parcels are often there while their streets are not — for one of those, resolve_parcel with the precinct name and the parcel number is the way in, not a street.\n`
+      + `  2. There is genuinely no such street here.\n`
+      + `Matching is case- and accent-insensitive but does not inflect, so pass the name in the nominative ('karmelicka' or 'Karmelicką' both find 'Karmelicka', but 'Karmelickiej' does not).`;
+  }
+
+  const lines: string[] = [
+    `${res.data.length} street name${res.data.length === 1 ? "" : "s"} in ${scope} matching "${q}":\n`,
+  ];
+  for (const row of res.data) {
+    // Only the derived names are tagged. Marking both would double the length of every line to say
+    // "ordinary" on most of them; the untagged case is explained once, below the list.
+    const tag = row.address_source === "approx" ? " [approximate — derived, not from the record]" : "";
+    lines.push(`  - ${row.street}${tag}`);
+  }
+  lines.push(
+    "\nUntagged names are on record; tagged ones we worked out for parcels the record left without a street. " +
+    "Any of these can be passed to list_parcels_in_area as street= inside the same scope.",
+  );
+  if (res.pagination.has_more) {
+    // No cursor by design, so the honest next step is a longer fragment, not a second page. Saying
+    // so stops the caller looking for a paging parameter that does not exist.
+    lines.push(`More names match than are shown (the answer is capped at ${res.pagination.limit}). Type more of the name — there is no second page.`);
+  }
   return lines.join("\n");
+}
+
+// A geometric collection: each feature carries the full outline. The GeoJSON goes out verbatim —
+// it is what the caller asked for — with the outline centre alongside it so the answer is readable
+// without parsing every ring.
+export function formatParcelFeatures(res: ParcelFeatureCollection, scope: string): string {
+  if (res.features.length === 0) {
+    return `No parcels found in ${scope}. The area is valid and holds no parcel WE CAN PLACE THERE — coverage is near-complete but not the whole cadastral register and not live, so read this as "we have nothing mapped here", not as "there is nothing here". ${CORPUS_COVERAGE_HINT}${formatCorpusCoverage(res.corpus_coverage)}`;
+  }
+
+  const lines: string[] = [`Found ${res.features.length} parcel${res.features.length === 1 ? "" : "s"} in ${scope}:`];
+  if (res.truncated) {
+    // Stated before the data, not after it: a reader who meets the list first reads it as complete.
+    lines.push(`TRUNCATED — more of the parcels we hold match than the limit returns, and the ones below are an arbitrary subset, not the first, nearest or largest. Read this as a sample of the area, never as its parcel list. A smaller area returns everything WE HOLD there, which is not the same as every parcel there: coverage is near-complete but not the whole cadastral register and not live.`);
+  }
+  lines.push("");
+
+  for (const [i, f] of res.features.entries()) {
+    const district = f.properties.district ?? "Unknown";
+    const centre = outlineCentre(f.geometry);
+    const where = centre ? `${centre.lat.toFixed(4)}°N, ${centre.lng.toFixed(4)}°E` : "unknown";
+    lines.push(`${i + 1}. ${f.properties.parcel_id ?? PARCEL_IDENTITY_WITHHELD}`);
+    lines.push(`   District: ${district} | Outline centre: ${where}`);
+    lines.push(`   Outline (GeoJSON, WGS84): ${f.geometry ? JSON.stringify(f.geometry) : "not returned"}`);
+  }
+  return lines.join("\n") + formatCorpusCoverage(res.corpus_coverage);
 }
 
 // ── Parcel resolve formatting ──────────────────────────────────────
 
 export function formatParcelResolve(res: ParcelResolveResponse): string {
+  // not_computed FIRST: it is not a miss. The lookup did not finish (a live confirmation failed, or the
+  // name sits on more precincts than one search covers), so telling the caller to check the spelling would
+  // be advice about a question we never answered.
+  if (res.coverage === "not_computed") {
+    return "The lookup could not be completed, so this says nothing about whether the parcel exists (the credit is refunded). Best next step: pass the full cadastral id in parcelId — that path does not go through the name at all. A retry helps only if a live confirmation timed out; it will not change the answer for a name carried by very many precincts.";
+  }
   if (res.coverage === "not_covered" || res.matches.length === 0) {
-    return "No parcel matched. The identifier or 'name + number' is not in our cadastral copy (the credit is refunded). Check the spelling of the locality name, or use search_parcels to look up a parcel id by prefix.";
+    return "No parcel matched (the credit is refunded). Two different causes, and with near-complete coverage the first is now the common one: the name may be spelled differently than the register spells it (for 'name + number' it is matched against the gmina name and the cadastral precinct (obręb) name, exactly), OR we do not hold the parcel — coverage is near-complete but not the whole cadastral register and not live, so a discovery lookup can still miss a parcel that exists. This is not a confirmation that the parcel does not exist. Passing the FULL cadastral id in parcelId goes down a different path that can confirm and add a parcel we do not yet hold." + formatCorpusCoverage(res.corpus_coverage);
   }
 
   const lines: string[] = [`Found ${res.matches.length} parcel${res.matches.length === 1 ? "" : "s"}:\n`];
@@ -515,7 +768,11 @@ export function formatParcelResolve(res: ParcelResolveResponse): string {
   if (res.as_of) {
     lines.push(`\nCadastral copy as of ${res.as_of.split("T")[0]}.`);
   }
-  return lines.join("\n");
+  // State the cost on the success path too, not only via the "refunded" wording on a miss — so a
+  // caller sees the price whatever the outcome. Resolving is free, and the server sends no credit
+  // header on a free call (the footer helper stays empty), so the line is stated here explicitly.
+  lines.push(`\nQuery cost: 0 API tokens — resolving a parcel is free.`);
+  return lines.join("\n") + formatCorpusCoverage(res.corpus_coverage);
 }
 
 // ── Spatial search formatting ──────────────────────────────────────
@@ -558,6 +815,66 @@ export function formatSpatialResults(res: SpatialSearchResponse): string {
   return lines.join("\n");
 }
 
+// ── Building age ────────────────────────────────────────────────────
+
+// One clause describing a building's construction age, or "" when there is nothing to say at all.
+//
+// Two things this deliberately does NOT do. It does not drop a refusal: every status other than an
+// absent field produces a sentence, because a reader who sees no age line concludes the age was never
+// discussed rather than that it could not be established. And it does not print a bare year: the value
+// is an interval derived from permit records, and collapsing it to one number would present an
+// estimate as a registry fact — which is exactly what a valuer must not paste into an appraisal.
+export function formatBuildingAge(age: BuildingAgeEstimate | undefined): string {
+  // Field absent = the API on the other side does not send it yet (or was rolled back). Say nothing.
+  if (age == null) return "";
+  // Appended to EVERY branch, not just to the dated one: a rebuild or an extension is the most
+  // decision-relevant thing we know about a building we could not date, and dropping it on the
+  // ambiguous branches would hide it exactly where the reader has least else to go on.
+  const works = age.last_works_year != null ? `; later works ${age.last_works_year}` : "";
+  const clause = (body: string): string => `construction year not established: ${body}${works}`;
+  switch (age.status) {
+    case "estimated": {
+      // "estimated" without both edges of the interval is a contradiction, not a silent case: say so
+      // rather than dropping the line, because a dropped line reads as "nobody looked at the age".
+      if (age.year_from == null || age.year_to == null) {
+        return clause("an estimate came back without the interval it has to carry, so there is no honest year to state");
+      }
+      const range = age.year_from === age.year_to ? `${age.year_from}` : `${age.year_from}-${age.year_to}`;
+      // The range comes first and the single year after it. That order is the message: the range is the
+      // part that was measured against real first sales, the single year is the least certain number
+      // here, and a reader who sees a year first will quote the year.
+      const point = age.year_point != null ? `, point estimate ~${age.year_point} (least certain)` : "";
+      // Spelled out, not shortened to "high confidence": this grades how well the building was tied to
+      // a construction record, and our own measurement found it does NOT order the error on the year —
+      // the top grade carries the worst hard error on one of the two routes. A reader (human or model)
+      // who meets a bare grade next to a pair of years reads it as certainty about the years and passes
+      // that on to an appraisal, so the clause has to name what is being graded and what is not.
+      const conf = age.confidence ? `, ${age.confidence} confidence in the permit match (not in the year)` : "";
+      return `built range ${range}${point} [estimate from permit records, not a registry date${conf}]${works}`;
+    }
+    case "older_than_register":
+      // Deliberately says what we could not establish, not that the building is old: the same empty
+      // result also appears when a split or merge renumbered the land after the works were registered.
+      return clause("no construction record for this land falls inside our coverage, which starts in 2016 — the works may predate it, or the land may have been renumbered since");
+    case "ambiguous_permits":
+    case "ambiguous_buildings":
+    case "ambiguous_both":
+      return clause("construction records for this land could not be tied to this specific building");
+    case "no_parcel_key":
+      return clause("this land has no cadastral identifier to match records against");
+    case "not_applicable":
+      return clause("this building has no outline we can place on the land");
+    case "not_computed":
+      return clause("the lookup could not be completed for this request — retrying later may return one");
+    default:
+      // Reachable in production despite the union: the status set is closed in the types, not at
+      // runtime, and this package ships separately from the service it reads. A status added on the
+      // other side would otherwise render as no line at all — "the age was never discussed" instead of
+      // "we cannot state it", which is the one misreading this whole function exists to prevent.
+      return clause("the answer came back in a form this client version does not recognise — a newer client may be able to state it");
+  }
+}
+
 // ── Building breakdown formatting (per-transaction, per-building) ───
 
 export function formatBuildingBreakdown(res: BuildingBreakdownResponse): string {
@@ -596,6 +913,12 @@ export function formatBuildingBreakdown(res: BuildingBreakdownResponse): string 
 
     // match_confidence is a readable enum (high/low) or null — render verbatim when present.
     if (b.match_confidence) cells.push(`match confidence: ${b.match_confidence}`);
+
+    // Age: a REFUSAL renders as a sentence, never as a missing line. A model reading this has to be
+    // able to tell "we cannot date this building" from "nobody mentioned the age", and an omitted line
+    // reads as the second. Absent field = an older API on the other side; then we say nothing at all.
+    const age = formatBuildingAge(b.age_estimate);
+    if (age) cells.push(age);
 
     lines.push(`${i + 1}. ${cells.join(" | ")}`);
   });
@@ -766,6 +1089,212 @@ export function formatLandslideBreakdown(res: LandslideBreakdownResponse): strin
   return lines.join("\n");
 }
 
+// ── Nature (forest amenity + protected-area restriction) formatting (per-transaction, per-parcel) ───
+
+// Sharpest overlapping protection form → readable label (protection_rank 1 = sharpest … 6 = loosest).
+const PROTECTION_RANK_LABEL: Record<number, string> = {
+  1: "national park",
+  2: "nature reserve",
+  3: "Natura 2000",
+  4: "landscape park",
+  5: "protected landscape",
+  6: "a minor protection form, or a buffer zone",
+};
+
+// building_restriction → what the classification means. It names the SOURCE of the restriction, never the
+// outcome of a specific case, and never renders as legal advice.
+const BUILDING_RESTRICTION_NOTE: Record<string, string> = {
+  statutory_ban: "a build ban that follows directly from the Nature Protection Act (national parks and reserves), with statutory exceptions — not a ruling on any specific project",
+  conditional: "no blanket statutory ban; restrictions depend on the act that established the area",
+};
+
+// What an EMPTY breakdown is allowed to say, by `coverage`. The distinction is the whole point: a settled
+// negative ("there is no forest and no protected area here") is a claim about the world, and we may only
+// make it when the plots were really checked. Before the reference data lands, an empty response means
+// nothing at all — rendering it as a negative would put a fact we never established into a model's mouth.
+const NATURE_EMPTY_MESSAGE: Record<"covered_no_data" | "not_covered" | "unknown", string> = {
+  // Earned: the plots were evaluated and neither signal is present. Still hedged on the id, because an
+  // unknown transaction id also yields an empty result and we cannot tell the two apart here.
+  covered_no_data:
+    "No forest within 2 km and no protected natural area overlaps this transaction's parcels (or the id was not found). An empty result is never a statement that building is allowed — this layer does not cover local zoning plans, planning-permission decisions or areas under designation.",
+  // Not earned: nothing was checked. Say that, and say plainly what it does NOT mean.
+  not_covered:
+    "This layer holds no nature reference data for these parcels yet, so nothing was checked. That is NOT a finding that there is no forest nearby and no protected natural area here — it means the check could not be made. The credit for this call is refunded; try again later.",
+  // A server that predates the coverage field: we cannot tell the two cases apart, so we assert neither.
+  unknown:
+    "No forest or protected-area signal was returned for this transaction's parcels. This response does not distinguish 'checked, nothing found' from 'not checked' (the id may also be unknown), so do not read it as a finding that there is no forest or protected area — and never as a statement that building is allowed.",
+};
+
+export function formatNatureBreakdown(res: NatureBreakdownResponse): string {
+  const { data, truncated } = res;
+  // A row exists ONLY on a signal (forest within 2 km OR an overlapping protected area). Empty is not one
+  // situation but three, and `coverage` is what tells them apart (see the table above).
+  if (data.length === 0) {
+    const key = res.coverage === "covered_no_data" || res.coverage === "not_covered" ? res.coverage : "unknown";
+    return NATURE_EMPTY_MESSAGE[key];
+  }
+
+  const lines: string[] = [
+    `Per-parcel nature breakdown (${data.length} parcel${data.length === 1 ? "" : "s"} with a forest or protected-area signal):`,
+    "",
+  ];
+
+  data.forEach((r, i) => {
+    const cells: string[] = [];
+
+    // Forest: distance in metres; 0 = the parcel overlaps forest (with an optional overlap share).
+    const dist = r.forest_distance_m != null ? Number(r.forest_distance_m) : null;
+    if (dist != null && Number.isFinite(dist)) {
+      if (dist === 0) {
+        const ov = r.forest_overlap_pct != null ? Number(r.forest_overlap_pct) : null;
+        cells.push(`forest: overlaps the parcel${ov != null && Number.isFinite(ov) ? ` (${Math.round(ov)}% of area)` : ""}`);
+      } else {
+        cells.push(`forest: ${dist} m away`);
+      }
+    }
+
+    // Protection: sharpest form, the build-restriction class + its meaning, overlap share, named areas.
+    if (r.protection_rank != null) {
+      const label = PROTECTION_RANK_LABEL[r.protection_rank] ?? `protection rank ${r.protection_rank}`;
+      cells.push(`protection: ${label}`);
+      if (r.building_restriction) {
+        const note = BUILDING_RESTRICTION_NOTE[r.building_restriction];
+        cells.push(`build restriction: ${r.building_restriction}${note ? ` (${note})` : ""}`);
+      }
+      if (r.protected_overlap_pct != null) {
+        const p = Number(r.protected_overlap_pct);
+        if (Number.isFinite(p)) cells.push(`${Math.round(p)}% of the parcel under protection`);
+      }
+      if (Array.isArray(r.protected_areas) && r.protected_areas.length > 0) {
+        const labels = r.protected_areas.map((a) => a.name ?? a.form).filter((x): x is string => !!x);
+        if (labels.length > 0) cells.push(`areas: ${labels.join("; ")}`);
+      }
+    }
+
+    lines.push(`${i + 1}. ${cells.join(" | ")}`);
+  });
+
+  if (truncated) {
+    lines.push("", "Showing the first 500 parcels (the transaction is linked to more).");
+  }
+
+  // Two legal guards: an empty result is not permission to build, and the restriction class
+  // names the source of the limit (statute vs the establishing act), not the outcome of any specific case.
+  lines.push(
+    "",
+    "Note: forest_distance_m is the nearest forest within 2 km (0 = the parcel overlaps forest). building_restriction names the SOURCE of the restriction (statute vs the act that established the area), not the outcome of any permitting case; an empty result is never a statement that building is allowed — this layer does not cover local zoning plans, planning-permission decisions or areas under designation. A buffer zone around a park or reserve IS reported, as form 'buffer_zone' at rank 6, and never as a statutory ban. Forest coverage is mainly publicly-managed land, so private forests may be incomplete.",
+  );
+
+  return lines.join("\n");
+}
+
+// ── Subsurface breakdown formatting (per-transaction, per-parcel) ───
+
+// Mineral class → what it means for the parcel (distinction 1, the one that makes a "mining terrain" line
+// meaningful: a gravel pit is not a coal mine). Neutral EN; the source register is never named.
+const MINERAL_CLASS_NOTE: Record<string, string> = {
+  subsidence: "extraction with surface deformation — the actual mining-damage risk",
+  surface: "open-pit working — mostly local impact (neighbourhood, noise)",
+  fluid: "borehole extraction — usually no surface deformation, but a concession and zones still apply",
+  other: "mineral not classified",
+};
+
+// Carries all three load-bearing distinctions in one closing note: (1) mining terrain = advisory signal,
+// approximate location, verify with the mining-supervision authority; (2) a reservoir's extent alone is
+// not a restriction; (3) absence is never 'safe'. No source register or institution is named.
+const SUBSURFACE_NOTE =
+  "Note: a mining terrain is a legally defined zone of anticipated mining influence; its mapped location is approximate — an intersection is an advisory signal to verify with the competent mining-supervision authority (named per terrain as the oversight authority), not a legal determination. Some terrains with status 'active' carry a valid_until already in the past, because the register entry can lag behind the expiry of a concession. A groundwater reservoir's extent alone imposes NO restriction; a restriction would come only from an established protection zone, which is not published here. Absence of a match is never asserted as 'safe': the mining register covers concession areas, so historic or shallow workings may not appear, and an absent reservoir does not mean there is no groundwater beneath the parcel.";
+
+// pct fields arrive as NUMERIC → string over the wire; round for display.
+function subsurfacePct(v: number | string | null): number | null {
+  if (v == null) return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? Math.round(n) : null;
+}
+
+export function formatSubsurfaceBreakdown(res: SubsurfaceBreakdownResponse): string {
+  const { data, truncated } = res;
+  // TWO-STATE (distinction 3): empty covers both "no linked parcel overlaps either layer" and
+  // "unknown/garbage id" (REST returns 200 + [] for both). One neutral message fits both, and it NEVER
+  // asserts safety — the mining register covers concession areas, so historic workings may be absent.
+  if (data.length === 0) {
+    return "No mapped mining terrain or major groundwater reservoir overlaps this transaction's parcels (or the id was not found). Absence of mapped data is never asserted as 'safe' — the mining register covers concession areas, so historic or shallow workings may not appear.";
+  }
+
+  const lines: string[] = [
+    `Per-parcel subsurface breakdown (${data.length} parcel${data.length === 1 ? "" : "s"} overlapping a mining terrain or a major groundwater reservoir):`,
+    "",
+  ];
+
+  let n = 0;
+  for (const r of data) {
+    const cells: string[] = [];
+
+    // Mining dimension. mineral_class (distinction 1) is spelled out — a "terrain" line without it is an
+    // alarm with no content.
+    if (r.mining_status) {
+      const cls = r.mineral_class ?? null;
+      const clsNote = cls ? MINERAL_CLASS_NOTE[cls] : undefined;
+      const pct = subsurfacePct(r.mining_overlap_pct);
+      cells.push(
+        `mining terrain: ${r.mining_status}${cls ? `, ${cls}${clsNote ? ` (${clsNote})` : ""}` : ""}${pct != null ? `, ${pct}% of the parcel in the terrain` : ""}`,
+      );
+      if (Array.isArray(r.mining_terrains) && r.mining_terrains.length > 0) {
+        const labels = r.mining_terrains
+          .map((t) => {
+            const parts: string[] = [];
+            if (t.name) parts.push(t.name);
+            if (t.oversight_authority) parts.push(`oversight: ${t.oversight_authority}`);
+            if (t.valid_until) parts.push(`valid until ${t.valid_until}`);
+            if (t.revoked_on) parts.push(`revoked ${t.revoked_on}`);
+            return parts.length > 0 ? parts.join(", ") : null;
+          })
+          .filter((s): s is string => !!s);
+        // Say only what the payload supports: the list reached its cap. Never "there are more" —
+        // neither derivation keeps the pre-cap total, so that claim would be invented here.
+        if (labels.length > 0) cells.push(`terrains: ${labels.join("; ")}${r.mining_terrains_capped ? " (list reached the 5-entry cap)" : ""}`);
+      }
+    }
+
+    // Groundwater dimension. The extent-only caveat (distinction 2) rides on the line itself so it can
+    // never be quoted as a restriction.
+    if (r.groundwater_status) {
+      const pct = subsurfacePct(r.groundwater_overlap_pct);
+      cells.push(
+        `groundwater reservoir: ${r.groundwater_status} (reservoir extent only — not a restriction)${pct != null ? `, ${pct}% of the parcel in the reservoir` : ""}`,
+      );
+      if (Array.isArray(r.groundwater_bodies) && r.groundwater_bodies.length > 0) {
+        const labels = r.groundwater_bodies
+          .map((b) => {
+            const parts: string[] = [];
+            if (b.number != null) parts.push(`no. ${b.number}`);
+            if (b.name) parts.push(b.name);
+            if (b.documented_year != null) parts.push(`documented ${b.documented_year}`);
+            if (b.depth_from_m != null) parts.push(`from ${b.depth_from_m} m`);
+            if (b.medium_type) parts.push(b.medium_type);
+            return parts.length > 0 ? parts.join(", ") : null;
+          })
+          .filter((s): s is string => !!s);
+        if (labels.length > 0) cells.push(`reservoirs: ${labels.join("; ")}${r.groundwater_bodies_capped ? " (list reached the 5-entry cap)" : ""}`);
+      }
+    }
+
+    // Defense-in-depth: the API CHECK guarantees each row carries ≥1 dimension, but never emit a bare
+    // "N." row if a future shape change ever produced a both-null row — skip it and keep numbering contiguous.
+    if (cells.length === 0) continue;
+    n += 1;
+    lines.push(`${n}. ${cells.join(" | ")}`);
+  }
+
+  if (truncated) {
+    lines.push("", "Showing the first 500 parcels (the transaction is linked to more).");
+  }
+
+  lines.push("", SUBSURFACE_NOTE);
+
+  return lines.join("\n");
+}
+
 // ── Surroundings formatting (per-transaction, per-parcel) ──────────
 
 // Nuisance categories with the fixed per-category search radius (meters) used by the assessment.
@@ -778,6 +1307,12 @@ const SURROUNDINGS_CATEGORIES: { key: keyof SurroundingsRow; label: string; radi
   { key: "industrial_area_distance_m", label: "industrial/storage area", radiusLabel: "1 km" },
   { key: "industrial_plant_distance_m", label: "large industrial plant", radiusLabel: "3 km" },
   { key: "livestock_farm_distance_m", label: "intensive livestock farm", radiusLabel: "3 km" },
+  // Overhead power lines, OPTIONAL on the row: the service may omit these two keys entirely instead of
+  // sending nulls, so they are rendered ONLY when the key is present — see the `in` check in the
+  // renderer. An absent key is no claim; rendering "none within 1 km" for it would manufacture the
+  // claim "nothing within the radius", which only a null carries.
+  { key: "power_line_hv_distance_m", label: "high-voltage overhead power line", radiusLabel: "1 km" },
+  { key: "power_line_ehv_distance_m", label: "extra-high-voltage overhead power line", radiusLabel: "1 km" },
 ];
 
 export function formatSurroundings(res: SurroundingsResponse): string {
@@ -799,7 +1334,10 @@ export function formatSurroundings(res: SurroundingsResponse): string {
       return;
     }
 
-    const cells = SURROUNDINGS_CATEGORIES.map(({ key, label, radiusLabel }) => {
+    // A category whose key is absent from the row is DROPPED, not rendered as "none within …": the
+    // service withholds a field it cannot yet answer for, and turning that silence into a negative
+    // statement is the one mistake this whole two-state contract exists to avoid.
+    const cells = SURROUNDINGS_CATEGORIES.filter(({ key }) => key in r).map(({ key, label, radiusLabel }) => {
       const raw = r[key];
       const dist = raw == null ? null : Number(raw);
       if (dist == null || !Number.isFinite(dist)) {
@@ -817,6 +1355,88 @@ export function formatSurroundings(res: SurroundingsResponse): string {
     lines.push("", "Showing the first 500 plots (the transaction is linked to more).");
   }
 
+  return lines.join("\n");
+}
+
+// ── Road access formatting (per-transaction, per-parcel) ───────────
+
+// Carried once per breakdown. It is the whole framing of the layer and must not be trimmed to save
+// lines: the indicator is evidence, not a determination, and a reader who acts on it as if it settled
+// legal access is the failure mode this layer has to design against.
+const ROADS_NOTE =
+  "Note: access_indicator is geometric evidence measured from carriageway centrelines in reference road-network data. It does NOT determine legal access and says nothing about easements or rights of way, which are recorded in the land register and are not published here. Distances are approximate and measured from the plot boundary; a public road and a road of any kind are searched within 500 m, a motorway/expressway/dual-carriageway (a traffic-nuisance proxy, not access) within 3 km. A null distance means nothing of that kind within that radius — never a guarantee of absence.";
+
+const ROAD_INDICATOR_GLOSS: Record<string, string> = {
+  likely: "access likely",
+  uncertain: "access uncertain",
+  unlikely: "access unlikely",
+};
+
+/** One "label: value" cell list for a plot's road evidence. Absent measurements are stated as absent. */
+function roadCells(r: RoadsBreakdownRow): string[] {
+  const cells: string[] = [];
+  const indicator = typeof r.access_indicator === "string" ? r.access_indicator : null;
+  // An unknown indicator from a newer service keeps the "access" prefix, so slot 1 always reads as an
+  // indicator rather than a bare token.
+  cells.push(indicator ? ROAD_INDICATOR_GLOSS[indicator] ?? `access ${indicator}` : "access not classified");
+  // The rule version travels WITH the indicator, not in a footnote: a later recalibration must be visible
+  // to the client instead of silently changing what "access likely" means.
+  if (typeof r.access_rule_version === "number") cells.push(`rule v${r.access_rule_version}`);
+
+  const pub = toNum(r.public_road_distance_m);
+  const edge = toNum(r.public_road_edge_distance_m);
+  if (pub == null) {
+    cells.push("public road: none within 500 m");
+  } else {
+    const kind = [r.public_road_category, r.public_road_class].filter((x): x is string => typeof x === "string");
+    const edgePart = edge != null ? `, ~${Math.round(edge)} m to the carriageway edge` : "";
+    cells.push(`public road: ~${Math.round(pub)} m${kind.length > 0 ? ` (${kind.join(", ")})` : ""}${edgePart}`);
+    if (r.public_road_at_grade === false) cells.push("that road crosses on a viaduct or in a tunnel");
+  }
+
+  const any = toNum(r.any_road_distance_m);
+  cells.push(any == null ? "any road: none within 500 m" : `any road: ~${Math.round(any)} m`);
+  const major = toNum(r.major_road_distance_m);
+  cells.push(major == null ? "major road: none within 3 km" : `major road: ~${Math.round(major)} m`);
+  return cells;
+}
+
+export function formatRoads(res: RoadsBreakdownResponse): string {
+  const { data, truncated } = res;
+  // TWO-STATE: empty covers both "the transaction has no linked plots" and "unknown/garbage id" (the
+  // service answers 200 + [] for both). One neutral message fits both without leaking which case it was.
+  if (data.length === 0) {
+    return "No road-access data is available for this transaction (no linked plots, or the id was not found).";
+  }
+
+  const lines: string[] = [
+    `Per-parcel road access (${data.length} plot${data.length === 1 ? "" : "s"}; distances from the plot boundary, "~" = approximate):`,
+    "",
+  ];
+
+  data.forEach((r, i) => {
+    if (!r.assessed) {
+      lines.push(`${i + 1}. not assessed yet — this plot has not been evaluated (no statement either way)`);
+      return;
+    }
+    lines.push(`${i + 1}. ${roadCells(r).join(" | ")}`);
+  });
+
+  if (truncated) {
+    lines.push("", "Showing the first 500 plots (the transaction is linked to more).");
+  }
+
+  // Freshness signal, same shape as farmland. The road layer is loaded county by county, so the snapshot
+  // date is more load-bearing here than for a nationally refreshed layer, not less.
+  // The OLDEST date across the plots, not the first one found: a transaction can span counties loaded on
+  // different dates, and the freshest of them would overstate how current the whole answer is.
+  const dates = data
+    .map((r) => r.source_as_of)
+    .filter((d): d is string => typeof d === "string" && d.length > 0)
+    .sort();
+  if (dates.length > 0) lines.push("", `Reference road-network snapshot as of ${dates[0]} (oldest of the plots shown).`);
+
+  lines.push("", ROADS_NOTE);
   return lines.join("\n");
 }
 
@@ -868,8 +1488,14 @@ export function formatTransitBreakdown(res: TransitBreakdownResponse): string {
 // TWO-STATE: an empty list is never rendered as "nothing was ever planned". Covers both
 // "no registered case for any linked parcel" and "unknown/garbage id" (REST returns 200 + []
 // for both) — one message fits both without leaking which case it was.
+//
+// This constant carries the whole disclaimer on its own: `res.note` from the API is not rendered
+// anywhere in formatPermitsBreakdown, so an empty result shows nothing but this string. Hence the
+// wording states what is held — permits once a decision has been issued, notifications only where
+// they were accepted without objection — and never characterises the outcome of a decision, which
+// is not part of the data at all.
 const PERMITS_EMPTY_NOTE =
-  "No positively-resolved building permit or works notification is on record for this transaction's parcels (or the id was not found). The register covers cases resolved since 2016, matched by the parcel's current identifier — an empty list is never a statement that nothing was ever planned.";
+  "No building permit or works notification is on record for this transaction's parcels (or the id was not found). Permits are held once a decision has been issued, and notifications only where they were accepted without objection; cases registered since 2016 are matched by the parcel's current identifier — an empty list is never a statement that nothing was ever planned.";
 
 export function formatPermitsBreakdown(res: PermitsResponse): string {
   const { data, truncated } = res;
@@ -1132,6 +1758,103 @@ export function formatLocationHierarchy(items: LocationItem[], parent?: string):
   }
 
   return lines.join("\n");
+}
+
+// ── Location name-search formatting ───────────────────────────────
+
+const SEARCH_LEVEL_ORDER: Record<string, number> = {
+  voivodeship: 0,
+  county: 1,
+  municipality: 2,
+  precinct: 3,
+};
+
+const SEARCH_LEVEL_LABEL: Record<string, string> = {
+  voivodeship: "Voivodeships",
+  county: "Counties",
+  municipality: "Municipalities",
+  precinct: "Precincts",
+};
+
+// Ready-to-use follow-up calls for one TERYT unit. What is valid depends on the level (the target
+// tools reject codes they cannot resolve) and on rcn_district (name-based calls only work when the
+// name is a valid location= value). Experimental catalogues (yield/spread/flood) are never printed —
+// they have their own coverage catalogues and list_locations does not stand in for them.
+function searchCallsForItem(it: LocationSearchItem): string[] {
+  const code = it.code;
+  const calls: string[] = [
+    `search_transactions(teryt="${code}")`,
+    `list_parcels_in_area(teryt="${code}")`,
+  ];
+  // Drill down into children — replaces the withdrawn auto-expansion.
+  if (it.level === "county" || it.level === "municipality") {
+    calls.push(`list_locations(parent="${code}")`);
+  }
+  // get_demographics accepts voivodeship / county / municipality codes, not precinct codes.
+  if (it.level !== "precinct") {
+    calls.push(`get_demographics(teryt="${code}")`);
+  }
+  // get_infrastructure_signals accepts county and municipality codes only.
+  if (it.level === "county" || it.level === "municipality") {
+    calls.push(`get_infrastructure_signals(teryt="${code}")`);
+  }
+  // Name-based calls: valid only when this name is an RCN district label.
+  if (it.rcn_district) {
+    calls.push(`search_transactions(location="${it.name}")`);
+    calls.push(`compare_locations(districts="${it.name},…")`);
+    calls.push(`get_price_statistics(location="${it.name}")`);
+  }
+  return calls;
+}
+
+// Multi-level result: TERYT units (grouped by administrative level, each with the codes and the
+// exact follow-up calls) followed by RCN district names that carry no TERYT code. A name present on
+// the TERYT side is printed there only — the caller passes such names in rcnOnly already deduped.
+export function formatLocationSearch(
+  items: LocationSearchItem[],
+  rcnOnly: string[],
+  query: string,
+): string {
+  const lines: string[] = [`Location search for "${query}":`, ""];
+
+  const byLevel = new Map<string, LocationSearchItem[]>();
+  for (const it of items) {
+    const bucket = byLevel.get(it.level) ?? [];
+    bucket.push(it);
+    byLevel.set(it.level, bucket);
+  }
+  const levels = [...byLevel.keys()].sort(
+    (a, b) => (SEARCH_LEVEL_ORDER[a] ?? 99) - (SEARCH_LEVEL_ORDER[b] ?? 99),
+  );
+
+  for (const level of levels) {
+    lines.push(`${SEARCH_LEVEL_LABEL[level] ?? level}:`);
+    for (const it of byLevel.get(level)!) {
+      const typeSuffix = it.typeName ? ` (${it.typeName})` : "";
+      const parentSuffix = it.parent_name ? `, ${it.parent_name}` : "";
+      lines.push(`  ${it.code} - ${it.name}${typeSuffix}${parentSuffix}`);
+      for (const call of searchCallsForItem(it)) {
+        lines.push(`      ${call}`);
+      }
+    }
+    lines.push("");
+  }
+
+  if (rcnOnly.length > 0) {
+    lines.push("RCN district names without a TERYT code:");
+    for (const name of rcnOnly) {
+      lines.push(`  - ${name}`);
+      lines.push(`      search_transactions(location="${name}")`);
+    }
+    lines.push("");
+  }
+
+  // Bare array response, no pagination envelope — signal the cap in prose (§ route contract).
+  if (items.length === 50) {
+    lines.push("Showing the first 50 matches — type more letters to narrow the search.");
+  }
+
+  return lines.join("\n").trimEnd();
 }
 
 // ── Compare locations formatting ───────────────────────────────────
@@ -1527,6 +2250,68 @@ export function formatPriceSpreadLocations(r: PriceSpreadLocationsResponse): str
   return lines.join("\n");
 }
 
+// ── Flood-risk formatting ───────────────────────────────
+
+// Version-agnostic substring (no /api prefix) — strips the backend discovery note for /api/ and /api/v1/.
+const FLOOD_RISK_LOCATIONS_PATH = "flood-risk/locations";
+
+export function formatFloodRisk(r: FloodRiskResponse): string {
+  const q = r.quality;
+  const sev = r.result.by_severity;
+  const lines: string[] = [`Flood-hazard exposure — ${r.location.name}`, ""];
+
+  lines.push(
+    r.result.flood_share_pct != null
+      ? `Share in a mapped flood-hazard zone: ${r.result.flood_share_pct}% of assessed transactions`
+      : `Share: N/A (coverage: ${q.coverage})`,
+  );
+
+  // Severity breakdown only when not suppressed (all null → skip the block).
+  if (sev.low != null || sev.medium != null || sev.high != null) {
+    lines.push("");
+    lines.push("Transactions by severity (return period):");
+    lines.push(`  High (~1-in-10-year): ${formatNumber(sev.high ?? 0)}`);
+    lines.push(`  Medium (~1-in-100-year): ${formatNumber(sev.medium ?? 0)}`);
+    lines.push(`  Low (~1-in-500-year): ${formatNumber(sev.low ?? 0)}`);
+  }
+
+  lines.push("");
+  lines.push(
+    `Assessed transactions: ${r.inputs.assessed_sample_n != null ? formatNumber(r.inputs.assessed_sample_n) : "N/A"} (all-time)`,
+  );
+  lines.push(`Coverage: ${q.coverage} | Confidence: ${q.confidence}${q.stale ? " | transaction data lags publication" : ""}`);
+  if (q.as_of) lines.push(`Transaction data as of: ${q.as_of}`);
+
+  // Drop the REST-flavored discovery note (names the HTTP path); the tool tip below carries the same
+  // cross-link as a tool name an LLM can call.
+  const visibleNotes = q.notes.filter((n) => !n.includes(FLOOD_RISK_LOCATIONS_PATH));
+  if (visibleNotes.length > 0) {
+    lines.push("", "Notes:");
+    for (const n of visibleNotes) lines.push(`  - ${n}`);
+  }
+
+  return lines.join("\n");
+}
+
+// Discovery catalog formatter. Entries arrive pre-sorted (assessed_sample_n desc) from the API.
+export function formatFloodRiskLocations(r: FloodRiskLocationsResponse): string {
+  const { data, meta } = r;
+  if (data.length === 0) {
+    return "No flood-risk-covered locations match.";
+  }
+  const dateSuffix = meta.snapshot_date ? `, data from ${meta.snapshot_date}` : "";
+  const lines: string[] = [
+    `Flood-risk coverage — ${meta.total} location${meta.total === 1 ? "" : "s"}${dateSuffix}`,
+    "",
+  ];
+  for (const loc of data) {
+    lines.push(
+      `- ${loc.location} (teryt ${loc.county_code}, ${loc.voivodeship}, ${loc.type}) — n=${formatNumber(loc.assessed_sample_n)}, ${loc.confidence} confidence`,
+    );
+  }
+  return lines.join("\n");
+}
+
 // ── Valuation formatting (comparable-sales apartment estimate) ──────
 
 // One comparable line. market_type / district appended only when present.
@@ -1609,6 +2394,25 @@ function fourStateGloss(coverage: string): string {
   }
 }
 
+/** A wire array narrowed to the strings in it — anything else on the wire is dropped, never rendered. */
+function stringList(v: unknown): string[] {
+  return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
+}
+
+/**
+ * The one headline for a land-use / soil-quality result, shared by the standalone layer and the report's
+ * section so the two surfaces never describe the same parcel differently.
+ *
+ * SETS, joined — never a prevailing category and never a share. The source records no per-category area,
+ * so any ranking or percentage here would be invented rather than read.
+ */
+function landClassHeadline(useNames: string[], soilClasses: string[]): string {
+  return [
+    useNames.length ? useNames.join(", ") : null,
+    soilClasses.length ? `soil class ${soilClasses.join(", ")}` : null,
+  ].filter(Boolean).join("; ");
+}
+
 // A NUMERIC-or-string wire value coerced to a number (the API sends some NUMERIC columns as strings).
 function toNum(v: unknown): number | null {
   if (v == null) return null;
@@ -1644,6 +2448,19 @@ function reportSectionDetail(name: string, s: ReportSection): string {
       const risk = typeof s.landslide_risk === "string" ? s.landslide_risk : null;
       return risk ? LANDSLIDE_RISK_NOTE[risk] ?? risk : "";
     }
+    case "subsurface": {
+      // Neutral, source-register-free rendering (the register is never named). Two dimensions: a mining
+      // terrain (status + the deformation-risk mineral class) and a major groundwater reservoir (documented
+      // /undocumented). A reservoir's extent alone is not a restriction; absence is never rendered as "safe".
+      if (!covered) return "";
+      const parts: string[] = [];
+      const mining = typeof s.mining_status === "string" ? s.mining_status : null;
+      const mineral = typeof s.mineral_class === "string" ? s.mineral_class : null;
+      if (mining) parts.push(`mining terrain ${mining}${mineral ? ` (${mineral})` : ""}`);
+      const gw = typeof s.groundwater_status === "string" ? s.groundwater_status : null;
+      if (gw) parts.push(`groundwater reservoir ${gw}`);
+      return parts.join("; ");
+    }
     case "surroundings": {
       if (!covered) return "";
       // Nearest of the nuisance distances (a null = none within the search radius, never "none exists").
@@ -1657,6 +2474,19 @@ function reportSectionDetail(name: string, s: ReportSection): string {
       ]);
       if (dists.length === 0) return "no mapped nuisance object within range";
       return dists.slice(0, 3).map(([k, m]) => `${k} ${Math.round(m)} m`).join(", ");
+    }
+    case "roads": {
+      // Geometric evidence, never a determination of legal access — so the indicator is glossed, not
+      // reduced to a yes/no, and the distance that produced it travels with it.
+      if (!covered) return "";
+      const indicator = typeof s.access_indicator === "string" ? s.access_indicator : null;
+      if (!indicator) return "";
+      const edge = toNum(s.public_road_edge_distance_m);
+      const pub = toNum(s.public_road_distance_m);
+      const gloss = ROAD_INDICATOR_GLOSS[indicator] ?? indicator;
+      if (edge != null) return `${gloss} (~${Math.round(edge)} m to the nearest public road's carriageway edge)`;
+      if (pub != null) return `${gloss} (nearest public road ~${Math.round(pub)} m)`;
+      return `${gloss} (no public road within 500 m)`;
     }
     case "transit": {
       if (!covered) return "";
@@ -1677,8 +2507,20 @@ function reportSectionDetail(name: string, s: ReportSection): string {
     }
     case "buildings": {
       if (!covered) return "";
-      const rows = Array.isArray(s.data) ? s.data : [];
-      return `${rows.length} building(s) on the parcel`;
+      const rows = Array.isArray(s.data) ? (s.data as Array<Record<string, unknown>>) : [];
+      // Summarise the age dimension rather than repeating it per building: the report is a dossier,
+      // and "1 of 3 dated" tells the reader whether it is worth asking for the breakdown. Silent when
+      // the API does not send the field.
+      const ages = rows
+        .map((r) => (r.age_estimate as BuildingAgeEstimate | undefined)?.status)
+        .filter((x): x is NonNullable<typeof x> => x != null);
+      const dated = ages.filter((x) => x === "estimated").length;
+      const agePart = ages.length === 0
+        ? ""
+        : dated === 0
+          ? "; construction year not established for any of them"
+          : `; construction year estimated for ${dated} of ${ages.length} (estimate from permit records, not a registry date)`;
+      return `${rows.length} building(s) on the parcel${agePart}`;
     }
     case "permits": {
       if (!covered) return "";
@@ -1690,6 +2532,24 @@ function reportSectionDetail(name: string, s: ReportSection): string {
       const area = toNum(s.eligible_area_m2);
       const pct = toNum(s.pct_of_parcel);
       return area != null ? `${formatArea(area)} eligible${pct != null ? ` (${pct}% of parcel)` : ""}` : "";
+    }
+    case "land_class": {
+      if (!covered) return "";
+      const note = typeof s.legal_note === "string" ? s.legal_note : null;
+      const head = landClassHeadline(stringList(s.use_names), stringList(s.soil_classes));
+      return [head || null, note].filter(Boolean).join(" — ");
+    }
+    case "nature": {
+      if (!covered) return "";
+      const rank = toNum(s.protection_rank);
+      const dist = toNum(s.forest_distance_m);
+      const parts: string[] = [];
+      if (rank != null) {
+        const label = PROTECTION_RANK_LABEL[rank] ?? `protection rank ${rank}`;
+        parts.push(s.building_restriction === "statutory_ban" ? `${label} (statutory build ban)` : label);
+      }
+      if (dist != null) parts.push(dist === 0 ? "overlaps forest" : `forest ${Math.round(dist)} m`);
+      return parts.join(", ");
     }
     default:
       return "";
@@ -1732,16 +2592,23 @@ function reportBillingFooter(billing: { charged: number; refunded: number; rule:
 }
 
 // The layers rendered in report order, with a readable label each.
-const REPORT_LAYER_ORDER: Array<[string, string]> = [
+// Exported for the test that pins it against the report fixture in both directions. That test is the
+// only mechanical guard on this list: the render loop below reads `sections[key as ...]` through a cast,
+// so dropping an entry costs a layer in every rendered report and costs the compiler nothing.
+export const REPORT_LAYER_ORDER: Array<[string, string]> = [
   ["flood", "Flood risk"],
   ["heritage", "Heritage listing"],
   ["landslide", "Landslide risk"],
+  ["subsurface", "Subsurface constraints"],
   ["surroundings", "Nuisance surroundings"],
   ["transit", "Public transport"],
   ["planning", "Planning (general plan)"],
   ["buildings", "Buildings"],
   ["permits", "Building activity"],
   ["farmland", "Agricultural land"],
+  ["land_class", "Land use & soil class"],
+  ["nature", "Nature (forest & protected areas)"],
+  ["roads", "Road access"],
 ];
 
 export function formatParcelReport(res: ParcelReportResponse): string {
@@ -1753,7 +2620,9 @@ export function formatParcelReport(res: ParcelReportResponse): string {
   // is NOT transient — so it gets its own header (no misleading "retry").
   if (res.coverage !== "covered") {
     const head = res.coverage === "not_covered"
-      ? `Parcel ${id} could not be resolved — it is not in our cadastral copy.`
+      // Honest about the cause: "not ours" is a much weaker statement than "does not exist", and a
+      // report is exactly where that gets read as the strong one.
+      ? `Parcel ${id} could not be resolved — we do not hold it. Coverage is near-complete but not the whole cadastral register and not live, so this is not a finding that the parcel does not exist.`
       : res.billing.rule === "disabled"
         ? `The composite report is temporarily unavailable for parcel ${id}.`
         : `Parcel ${id} could not be resolved right now (a live lookup did not finish — retry).`;
@@ -1778,7 +2647,13 @@ export function formatParcelReport(res: ParcelReportResponse): string {
   lines.push("", "Enrichment layers:");
   const sections = res.sections;
   for (const [key, label] of REPORT_LAYER_ORDER) {
-    const s = sections[key as keyof typeof sections] as ReportSection;
+    const s = sections[key as keyof typeof sections] as ReportSection | undefined;
+    // A section this client knows about but the server did not send: SKIP the line, never throw. The
+    // cast above is a promise the compiler cannot keep — a newer client always can, and eventually will,
+    // talk to an older service, which need not send every section this client knows about. Reading
+    // `s.coverage` blind would take down the formatting of the ENTIRE report over one absent key,
+    // turning a missing line into a total failure.
+    if (s == null) continue;
     const detail = reportSectionDetail(key, s);
     lines.push(`- ${label}: ${fourStateGloss(s.coverage)}${detail ? ` — ${detail}` : ""}`);
   }
@@ -1830,5 +2705,72 @@ export function formatParcelReport(res: ParcelReportResponse): string {
 
   if (res.note) lines.push("", res.note);
   lines.push("", "---", reportBillingFooter(res.billing));
+  return lines.join("\n");
+}
+
+// ── Land-use / soil-quality classification (standalone layer) ──────
+
+/**
+ * Render the standalone land-class layer. The four states are told apart in words, because the difference
+ * between "this county publishes no classification" and "the county publishes one and this parcel has no
+ * entry" is the whole answer for a caller deciding whether to look elsewhere.
+ */
+export function formatParcelLandClass(res: ParcelLandClassResponse): string {
+  // Fall back to the internal id before the paid-plan wording: a parcel addressed by an internal id only
+  // HAS no cadastral id, so telling a paying caller to upgrade would be plain wrong.
+  const id = res.parcel.parcel_id ?? res.parcel.parcel_key ?? res.parcel.id ?? "(identifier withheld)";
+  const asOfDay = typeof res.as_of === "string" ? res.as_of.split("T")[0] : null;
+
+  if (res.coverage === "not_computed") {
+    return `The classification lookup for parcel ${id} could not be completed, so this says nothing about what is recorded for it (the tokens are refunded). Retry shortly.`;
+  }
+  if (res.coverage === "not_covered") {
+    // Three different causes share this state (the county publishes nothing, we do not hold this parcel,
+    // the parcel has no cadastral id at all), so the lead must not name one of them. The server's own
+    // note says which applies when it knows; pass it through rather than guessing.
+    const why = res.note ? ` ${res.note}` : "";
+    return `No land-use or soil-quality classification is available for parcel ${id} (the tokens are refunded). Either the county does not publish one, or we hold no classification for this parcel.${why}`;
+  }
+  if (res.coverage === "covered_no_data") {
+    const asOf = asOfDay ? ` (county data as of ${asOfDay})` : "";
+    return `The county publishes the classification, but parcel ${id} has no entry in it${asOf}. That is a checked negative, not a gap in coverage: it says nothing about what the land is, only that the county's dataset holds no entry for this parcel — and it is billed as an answer.`;
+  }
+  if (res.coverage !== "covered") {
+    // Anything else on the wire is a state this build does not know. Degrading to the full rendering
+    // would state "Protected soil grade (I-III) present: no" out of an empty body — a categorical legal
+    // claim from no data. A published npm build is pinned and immutable, so a future fifth state would
+    // meet THIS code on an installed client; say plainly that we cannot read it. Same discipline as
+    // fourStateGloss, which renders an unexpected token verbatim instead of guessing.
+    return `The classification for parcel ${id} came back in a state this client does not recognise (${String(res.coverage)}); it says nothing about what is recorded for the parcel.`;
+  }
+
+  // Wire arrays are narrowed here for the same reason: a missing or dirty array must not throw AFTER the
+  // call was billed, and a non-string member must never reach the caller as "[object Object]".
+  const useNames = stringList(res.use_names);
+  const soilClasses = stringList(res.soil_classes);
+  const useCodes = stringList(res.use_codes);
+  const lines: string[] = [`Land-use and soil-quality classification: ${id}`];
+  const headline = landClassHeadline(useNames, soilClasses);
+  if (headline) lines.push(headline);
+  if (useCodes.length > 0) lines.push(`Use codes: ${useCodes.join(", ")}`);
+  lines.push(
+    `Protected soil grade (I-III) present: ${res.protected_class_present ? "yes" : "no"}`,
+  );
+  // in_city drives which re-designation rule applies, and it is read from the cadastral id, so an
+  // undetermined value is a real third answer rather than a missing field.
+  lines.push(
+    `Inside a city's administrative boundary: ${res.in_city == null ? "could not be determined from the parcel id" : res.in_city ? "yes" : "no"}`,
+  );
+  // The sets are exhaustive for the parcel and carry no area, so state that instead of letting a reader
+  // infer an order from the listing.
+  lines.push("", "Categories and grades are listed as sets: the source records no area for any of them, so this cannot say which prevails on the parcel.");
+  if (res.legal_note) {
+    lines.push("", `Re-designation: ${res.legal_note}`);
+  }
+  if (res.legal_state_as_of) {
+    lines.push(`Legal state verified as of ${res.legal_state_as_of}.`);
+  }
+  if (asOfDay) lines.push(`Classification data as of ${asOfDay}.`);
+  if (res.note) lines.push("", res.note);
   return lines.join("\n");
 }

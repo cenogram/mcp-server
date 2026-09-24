@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll, afterEach, vi } from "vitest";
-import { generateKeyPair, exportSPKI, SignJWT } from "jose";
+import { SignJWT } from "jose";
 import type { CryptoKey } from "jose";
+import { loadTestKeyA, loadTestKeyB } from "./fixtures/test-keys.js";
 
 // ── Module-level mocks (must be at top level for Vitest hoisting) ──
 
@@ -21,20 +22,10 @@ let keys: TestKeyPair;
 let keys2: TestKeyPair;
 
 beforeAll(async () => {
-  const kp1 = await generateKeyPair("RS256");
-  const kp2 = await generateKeyPair("RS256");
-  keys = {
-    publicKey: kp1.publicKey,
-    privateKey: kp1.privateKey,
-    publicPem: await exportSPKI(kp1.publicKey),
-    kid: "test-kid-1",
-  };
-  keys2 = {
-    publicKey: kp2.publicKey,
-    privateKey: kp2.privateKey,
-    publicPem: await exportSPKI(kp2.publicKey),
-    kid: "test-kid-2",
-  };
+  // Static precomputed keys (see fixtures/test-keys.ts) — no runtime RSA keygen,
+  // so a loaded machine can never blow the hook timeout on prime generation.
+  keys = await loadTestKeyA("test-kid-1");
+  keys2 = await loadTestKeyB("test-kid-2");
 });
 
 // ── JWT helper ────────────────────────────────────────────────────

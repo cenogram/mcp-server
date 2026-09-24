@@ -46,6 +46,58 @@ export const SOURCE_TOKENS = decode([
   "enRt",
   "cGtw",
   "Z3pt",
+  // Nature layer (forest + protected areas), as stems so inflected forms trip too, in both spellings
+  // and in English — the package is English, so an accidental leak most likely arrives translated.
+  // Deliberately NO bare three-letter acronym of the forestry data source: it collides with an
+  // unrelated public term another layer names legitimately, and a guard that cries wolf gets deleted.
+  "Z2Rvcw==",
+  "Z2RvxZs=",
+  "cmRscA==",
+  "bmFkbGVzbmljdHc=",
+  "bmFkbGXFm25pY3R3",
+  "bGFzeSBwYW5zdHdvdw==",
+  "bGFzeSBwYcWEc3R3b3c=",
+  "bGFzb3cgcGFuc3R3b3c=",
+  "bGFzw7N3IHBhxYRzdHdvdw==",
+  "bGFzYWNoIHBhbnN0d293",
+  "bGFzYWNoIHBhxYRzdHdvdw==",
+  "ZGFueWNoIG8gbGFz",
+  "emlwb3A=",
+  "c3RhdGUgZm9yZXN0cw==",
+  "Zm9yZXN0IGRhdGEgYmFuaw==",
+  "Z2VuZXJhbCBkaXJlY3RvcmF0ZSBmb3IgZW52aXJvbm1lbnRhbCBwcm90ZWN0aW9u",
+  // The environmental agency's Polish name, as the invariant tail of it: the leading noun inflects
+  // ("Generalna/Generalnej Dyrekcja/Dyrekcji") and the regional bodies share the same tail, so one
+  // stem covers every form and both national and regional variants.
+  "b2Nocm9ueSBzcm9kb3dpc2th",
+  "b2Nocm9ueSDFm3JvZG93aXNrYQ==",
+  // Subsurface layer (mining terrains + groundwater reservoirs): source-register and
+  // publisher acronyms, lowercase — the guard lowercases before matching.
+  "bWlkYXM=",
+  "Z3p3cA==",
+  "Y2JkZw==",
+  "cGlnLXBpYg==",
+  // …and the full names those acronyms stand for, as stems, the same way the nature layer above
+  // does it: an acronym-only list is trivially bypassed by spelling the source out. Stems, because
+  // the leading noun inflects while the tail does not, so one stem covers every case form — and the
+  // tokens are the tails only, for the reason this whole file is encoded. English variants too:
+  // the package is English, so an accidental leak most likely arrives translated.
+  //
+  // The Polish name of the reservoir dataset is guarded by its own tail, NOT by the English
+  // "major groundwater reservoirs": that English phrase is what we deliberately publish (it names
+  // the RESULT, not the register), so guarding it would fire on our own tool description.
+  // Likewise NOT guarded: the mining-supervision authority. Its name is a field we intentionally
+  // return per terrain, so a guard on it would contradict the product decision.
+  "aW5zdHl0dXQgZ2VvbG9naWN6bg==",
+  "Z2VvbG9naWNhbCBpbnN0aXR1dGU=",
+  "ZGFueWNoIGdlb2xvZ2ljem4=",
+  "Z2VvbG9naWNhbCBkYXRhYmFzZQ==",
+  "d29kIHBvZHppZW1u",
+  "d8OzZCBwb2R6aWVtbg==",
+  "Ym9nYWN0dyBtaW5lcmFsbg==",
+  // Roads layer: the national road-administration authority whose network we read. We publish the
+  // measured distance and the road's own class, never who supplied the geometry.
+  "Z2Rka2lh",
 ]);
 
 /**
@@ -64,6 +116,16 @@ export const NOTATION_TOKENS = decode([
   "cHJhd28gYnVkb3dsYW5l",
   "aW5zcGlyZQ==",
   "d2Zz",
+  // The forest inventory's unit of division (stem — it inflects). Not a name, but nobody outside that
+  // dataset calls a patch of woodland this, so quoting it back names the source as surely as the source
+  // would. Two stems, because the genitive plural swaps the final letter for a diacritic one and the
+  // ASCII stem stops matching there.
+  "d3lkemllbGVu",
+  "d3lkemllbGXFhA==",
+  // Roads layer: the source dataset's own layer codes for a carriageway and for a road centreline.
+  // Four letters that mean nothing outside that dataset, so quoting one back names the dataset.
+  "c2tqeg==",
+  "c3Vsbg==",
 ]);
 
 /** Internal column names and prefixes that would describe our storage layout. */
@@ -72,6 +134,18 @@ export const INTERNAL_FIELD_TOKENS = decode([
   "cGFyY2VsX3JlZg==",
   "YXJlYV9nZW9tX20y",
   "aHNf",
+  // The forest source's own record key, which we store and never surface.
+  "YWRyX2Zvcg==",
+  // Roads layer: the source dataset's attribute names (management category, road class, carriageway
+  // width, lane count) and its record key, plus our own derived per-parcel column. We publish the
+  // road class as a value; the column names stay ours. The record key would also trip the source stem
+  // in the group above — listed here too, so narrowing that stem cannot silently uncover it.
+  "a2F0X3phcnphZHphbmlh",
+  "a2xhc2FfZHJvZ2k=",
+  "c3plcl9uYXdpZXJ6Y2huaQ==",
+  "bF9wYXNvdw==",
+  "YmRvdF9pZA==",
+  "cGFyY2VsX3JvYWRfYWNjZXNz",
 ]);
 
 export const ALL_GUARD_TOKENS = [

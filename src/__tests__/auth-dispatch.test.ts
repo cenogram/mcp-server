@@ -1,18 +1,23 @@
 import { describe, it, expect, beforeAll, afterEach, vi } from "vitest";
-import { generateKeyPair, exportSPKI, SignJWT } from "jose";
+import { SignJWT } from "jose";
 import type { CryptoKey } from "jose";
 import { sanitizeForLog } from "../auth-dispatch.js";
+import { loadTestKeyA, loadTestKeyB, type StaticTestKey } from "./fixtures/test-keys.js";
 
 // ── Test key setup ─────────────────────────────────────────────────
 
 let pubKeyPem: string;
 let privateKey: CryptoKey;
+// A second, distinct key for unknown_key / kid-mismatch scenarios.
+let otherKp: StaticTestKey;
 const KID = "test-kid-1";
 
 beforeAll(async () => {
-  const kp = await generateKeyPair("RS256");
+  // Static precomputed keys (see fixtures/test-keys.ts) — no runtime RSA keygen.
+  const kp = await loadTestKeyA();
   privateKey = kp.privateKey;
-  pubKeyPem = await exportSPKI(kp.publicKey);
+  pubKeyPem = kp.publicPem;
+  otherKp = await loadTestKeyB();
 });
 
 async function makeJwt(opts: {
@@ -250,7 +255,6 @@ describe("dispatchAuth", () => {
 
   it("returns 401 with generic 'Token validation failed' for unknown_key (no leak)", async () => {
     setupEnv();
-    const otherKp = await generateKeyPair("RS256");
     const { dispatchAuth } = await import("../auth-dispatch.js");
     const token = await makeJwt({ kid: "other-kid", privateKey: otherKp.privateKey });
     const r = await dispatchAuth(`Bearer ${token}`);
@@ -296,7 +300,6 @@ describe("dispatchAuth", () => {
   it("returns 500 server_misconfigured when OAuth env vars missing for JWT input", async () => {
     // No env stubbed → OAuthConfigError thrown by validateOAuthJwt
     const { dispatchAuth } = await import("../auth-dispatch.js");
-    const otherKp = await generateKeyPair("RS256");
     const token = await new SignJWT({ scope: "mcp" })
       .setProtectedHeader({ alg: "RS256", kid: "any" })
       .setSubject("u")
@@ -371,8 +374,7 @@ describe("dispatchAuth", () => {
 
   it("sanitizes kid in log when JWT header contains BiDi RLO", async () => {
     setupEnv();
-    const otherKp = await generateKeyPair("RS256"); // unknown_key path triggers kid logging
-    const { dispatchAuth } = await import("../auth-dispatch.js");
+    const { dispatchAuth } = await import("../auth-dispatch.js"); // unknown_key path triggers kid logging
     const token = await makeJwt({ kid: "‮test", privateKey: otherKp.privateKey });
     const r = await dispatchAuth(`Bearer ${token}`);
     expect(r.kind).toBe("401");
@@ -385,7 +387,6 @@ describe("dispatchAuth", () => {
 
   it("sanitizes kid in log when JWT header contains NEL byte", async () => {
     setupEnv();
-    const otherKp = await generateKeyPair("RS256");
     const { dispatchAuth } = await import("../auth-dispatch.js");
     const token = await makeJwt({ kid: "test\x85kid", privateKey: otherKp.privateKey });
     const r = await dispatchAuth(`Bearer ${token}`);
