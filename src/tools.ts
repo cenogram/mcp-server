@@ -293,8 +293,8 @@ Location matches TERYT districts only - for neighborhoods (osiedla), use search_
     maxPrice: z.number().optional().describe("Maximum price in PLN"),
     dateFrom: z.string().optional().describe("Start date (YYYY-MM-DD)"),
     dateTo: z.string().optional().describe("End date (YYYY-MM-DD)"),
-    street: z.string().optional().describe("Street name filter, matched anywhere inside the name (e.g. 'Puławska', 'Trakt Lubelski'). Give it in the NOMINATIVE and with its Polish diacritics — matching is literal, so 'Karmelickiej' does not find 'Karmelicka' and 'Marszalkowska' does not find 'Marszałkowska'. Either mistake answers with nothing, which reads exactly like 'no such transactions'."),
-    buildingNumber: z.string().optional().describe("Building/house number (e.g. '251C', '12A'). Requires location or street to be set."),
+    street: z.string().optional().describe("Street name filter, matched anywhere inside the name (e.g. 'Puławska', 'Aleja Waszyngtona'). Give it in the NOMINATIVE and with its Polish diacritics — matching is literal, so 'Karmelickiej' does not find 'Karmelicka' and 'Marszalkowska' does not find 'Marszałkowska'. Either mistake answers with nothing, which reads exactly like 'no such transactions'."),
+    buildingNumber: z.string().optional().describe("Building/house number (e.g. '30', '12A'). Requires location or street to be set."),
     parcelId: z.string().optional().describe("Exact parcel ID as returned in search results (e.g. '146518_8.0108.27'). Must match exactly - copy from a previous search result's parcel_id field."),
     minArea: z.number().optional().describe("Minimum area in m²"),
     maxArea: z.number().optional().describe("Maximum area in m²"),
@@ -842,10 +842,10 @@ const PARCEL_RADIUS_MAX_KM = 12.6;
 // Scope and shape limits for the address filters, mirroring the server's. A TERYT of at least this
 // many digits is a county; anything coarser turns a street name into a national search.
 const ADDRESS_FILTER_MIN_TERYT_DIGITS = 4;
-// Counted in letters and digits, not characters: an index over street names is built out of
-// three-character fragments and punctuation yields none, so a shorter fragment cannot be answered
-// from it. Refusing here rather than letting the server refuse saves the caller a round trip.
-const STREET_MIN_WORD_CHARS = 3;
+// Counted in letters and digits, not characters, and mirrors the server. Four, not three: a
+// three-letter fragment matches too broadly for a fast lookup; four stays fast. Refusing here rather
+// than letting the server refuse saves the caller a round trip.
+const STREET_MIN_WORD_CHARS = 4;
 // The TERYT name index answers only queries of at least this many letters/digits; a shorter one is
 // served from RCN alone rather than provoking the server's 400.
 const TERYT_SEARCH_MIN_WORD_CHARS = 2;
@@ -886,9 +886,9 @@ Truncation is the normal case on outlines, not an edge case. An area the size of
 
 minArea / maxArea (m²) filter on the registered parcel surface without returning it. They need a narrow scope — a bbox, a circle, a location name, or a teryt of at least 4 digits (county level) — and are refused elsewhere with a message saying what to add. They are not available on the outline calls.
 
-Every row of the light list carries the street address held for that parcel, whether or not you asked about one, and says where it came from: a street on record, or one we worked out for a parcel the record left without a street (shown with a note saying so). A building number is only ever on record, so a worked-out street never carries one. Most rural parcels have no street at all — for those the way in is resolve_parcel with the precinct name and the parcel number, not a street.
-- street: matches the name case-insensitively anywhere inside it, ${STREET_MIN_WORD_CHARS} letters or digits minimum, ${ADDRESS_FILTER_MAX_CHARS} characters maximum. It is a NAME, not a pattern: % and _ match themselves. Both sources are searched at once and a parcel found in both appears once, attributed to the record. Matching is case- and accent-insensitive, so 'karmelicka' and 'Karmelicką' both find 'Karmelicka' — but it does NOT inflect: pass the name in the NOMINATIVE, because an inflected form like 'Karmelickiej' answers with an empty list. That empty page costs nothing (the tokens are refunded) and carries a suggestions block with close names to retry, so read the suggestions before you conclude anything about the data.
-- buildingNumber: matches EXACTLY ('12A' does not find '12a') and needs street alongside it. RCN often records a compound or split number ('84/92'), so an exact '84' will not find '84/92' — when a plain number comes back empty on a street that exists, that page costs nothing (the tokens are refunded) and lists the numbers held on the street as suggestions to retry. Because a number is only ever on record, a call carrying one answers only with parcels whose street is on record.
+Every row of the light list carries the street address held for that parcel, whether or not you asked about one, and says where it came from: a street on record, one we worked out for a parcel the record left without a street (shown with a note saying so), or — only when a buildingNumber search on the record came back empty — one read off an official address point that falls inside the parcel (also noted). A building number is only ever on record or from that address point, so a worked-out street never carries one. When a page comes back with a requested buildingNumber, it also carries a note on which of the two the number came from. If the street exists in the area but not with that number, the answer says so instead of the generic "no such street". Most rural parcels have no street at all — for those the way in is resolve_parcel with the precinct name and the parcel number, not a street.
+- street: matches whole words of the name, case- and accent-insensitively — ${STREET_MIN_WORD_CHARS} letters or digits minimum, ${ADDRESS_FILTER_MAX_CHARS} characters maximum. It is a NAME, not a pattern: % and _ match themselves. 'Górna' finds 'ulica Górna' and 'Górna 15' but not 'Podgórna', and a fragment like 'Marsza' finds nothing. Both sources are searched at once and a parcel found in both appears once, attributed to the record. Matching folds accents, so 'karmelicka' finds 'Karmelicka' — but it does NOT inflect: pass the name in the NOMINATIVE, because an inflected form like 'Karmelickiej' answers with an empty list. That empty page costs nothing (the tokens are refunded) and carries a suggestions block with close names to retry, so read the suggestions before you conclude anything about the data.
+- buildingNumber: needs street alongside it. Against the record the match is EXACT ('12A' does not find '12a'); RCN often records a compound or split number ('84/92'), so an exact '84' will not find '84/92'. When that comes back empty, the same street+number is tried against official address points instead — that match ignores case ('12a' finds '12A') but is still exact on the number, no compound splitting, and it matches the street by the same whole-word rule as above, not a fragment ('Waszyngtona' finds 'Aleja Waszyngtona', 'szyng' does not). Only when BOTH miss does the page come back empty (the tokens are refunded), listing the numbers held on the street as suggestions to retry.
 Both need a narrow scope for the same reason minArea does — a bbox, a circle, a teryt of at least 4 digits, or a location name — and neither counts as naming the area: a common street name across the country is a national search, not a question. Neither is available on the outline calls.
 
 Parcel identity is gated: parcel_id comes back for API-token / OAuth callers and for paid or active-trial accounts, and is withheld for everyone else while the location and the outline still come back.
@@ -935,10 +935,10 @@ Limits: an area over ${PARCEL_AREA_MAX_KM2} km², a radius over ${PARCEL_RADIUS_
       "Maximum parcel surface in m². Same scope requirement as minArea.",
     ),
     street: z.string().max(ADDRESS_FILTER_MAX_CHARS).optional().describe(
-      `Street name, matched case-insensitively anywhere inside the name (min ${STREET_MIN_WORD_CHARS} letters or digits). A name, not a pattern — % and _ match themselves. NOMINATIVE and with Polish diacritics: 'Karmelickiej' and 'Marszalkowska' both answer empty. Needs a bbox, a circle, a location name, or a teryt of at least ${ADDRESS_FILTER_MIN_TERYT_DIGITS} digits. Not available with includeGeometry or a polygon.`,
+      `Street name, matched by whole words within the name, case- and accent-insensitively (min ${STREET_MIN_WORD_CHARS} letters or digits): 'Górna' finds 'ulica Górna' and 'Górna 15' but not 'Podgórna', and a fragment like 'Marsza' finds nothing. NOMINATIVE: 'Karmelickiej' does not fold to 'Karmelicka' and answers empty. Needs a bbox, a circle, a location name, or a teryt of at least ${ADDRESS_FILTER_MIN_TERYT_DIGITS} digits. Not available with includeGeometry or a polygon.`,
     ),
     buildingNumber: z.string().max(ADDRESS_FILTER_MAX_CHARS).optional().describe(
-      "Building number, matched exactly ('12A' does not find '12a'). RCN numbering is often compound ('84/92'), so an exact '84' misses '84/92' — if a plain number answers empty, drop it and read the numbers off the street's rows. Requires street, and answers only with parcels whose street is on record. Same scope requirement as street.",
+      "Building number. Against the record the match is exact ('12A' does not find '12a') and RCN numbering is often compound ('84/92'), so an exact '84' misses '84/92'. When that comes back empty, the same number is tried against official address points instead, case-insensitively ('12a' finds '12A') but still exact, matching the street by the same whole-word rule as street, not a fragment — if that also misses, drop the number and read the numbers off the street's rows. Requires street. Same scope requirement as street.",
     ),
     includeGeometry: z.boolean().optional().describe(
       "Return each parcel's full outline instead of the light row (5 tokens instead of 2, at most 100 parcels, no paging). Requires a bbox; with a polygon the outlines come back anyway.",

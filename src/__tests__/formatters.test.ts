@@ -11,6 +11,7 @@ import {
   formatHistogram,
   formatParcelResults,
   formatParcelResolve,
+  formatParcelList,
   formatSpatialResults,
   formatCompareResults,
   formatLocationHierarchy,
@@ -40,7 +41,7 @@ import {
   formatCorpusCoverage,
   REPORT_LAYER_ORDER,
 } from "../formatters.js";
-import type { Transaction, TransactionsResponse, StatsResponse, PricePerM2Row, HistogramBin, ParcelSearchResponse, SpatialSearchResponse, SpatialFeature, CompareResponse, LocationItem, LocationSearchItem, RentalYieldResponse, RentalYieldLocationsResponse, PriceSpreadResponse, PriceSpreadLocationsResponse, FloodRiskResponse, FloodRiskLocationsResponse, ValuationResponse, BuildingBreakdownResponse, FloodBreakdownResponse, HeritageBreakdownResponse, LandslideBreakdownResponse, NatureBreakdownResponse, SubsurfaceBreakdownResponse, SurroundingsResponse, RoadsBreakdownResponse, TransitBreakdownResponse, PermitsResponse, PlanningResponse, FarmlandResponse, DemographicsResponse, ParcelResolveResponse, ParcelReportResponse, ParcelLandClassResponse, CorpusCoverage } from "../api-client.js";
+import type { Transaction, TransactionsResponse, StatsResponse, PricePerM2Row, HistogramBin, ParcelSearchResponse, SpatialSearchResponse, SpatialFeature, CompareResponse, LocationItem, LocationSearchItem, RentalYieldResponse, RentalYieldLocationsResponse, PriceSpreadResponse, PriceSpreadLocationsResponse, FloodRiskResponse, FloodRiskLocationsResponse, ValuationResponse, BuildingBreakdownResponse, FloodBreakdownResponse, HeritageBreakdownResponse, LandslideBreakdownResponse, NatureBreakdownResponse, SubsurfaceBreakdownResponse, SurroundingsResponse, RoadsBreakdownResponse, TransitBreakdownResponse, PermitsResponse, PlanningResponse, FarmlandResponse, DemographicsResponse, ParcelResolveResponse, ParcelReportResponse, ParcelLandClassResponse, CorpusCoverage, ParcelListResponse } from "../api-client.js";
 
 const sampleTx: Transaction = {
   id: "1",
@@ -2212,6 +2213,60 @@ describe("formatParcelResults", () => {
     expect(result).toContain("N/A");
   });
 
+});
+
+describe("formatParcelList — address_source tags", () => {
+  const base: ParcelListResponse = {
+    data: [
+      { id: "u1", parcel_id: "146507_8.0100.1/1", parcel_key: "146507_8.0100.1/1", district: "Praga-Południe", lat: 52.3, lng: 21.0, street: "Aleja Waszyngtona", building_number: "30", address_source: "address_point" },
+    ],
+    pagination: { limit: 250, has_more: false },
+  };
+
+  it("tags an address-point row as not from a deed", () => {
+    const result = formatParcelList(base, "test scope");
+    expect(result).toContain("Aleja Waszyngtona 30");
+    expect(result).toContain("[number from an official address point on this parcel, not from a deed]");
+  });
+
+  it("tags an rcn row with a number as from a recorded sale deed", () => {
+    const result = formatParcelList({
+      ...base,
+      data: [{ ...base.data[0]!, address_source: "rcn" }],
+    }, "test scope");
+    expect(result).toContain("Aleja Waszyngtona 30");
+    expect(result).toContain("[number from a recorded sale deed]");
+    expect(result).not.toContain("[number from an official address point");
+    expect(result).not.toContain("[street approximate");
+  });
+
+  it("carries no deed tag for an rcn row without a number", () => {
+    const result = formatParcelList({
+      ...base,
+      data: [{ ...base.data[0]!, address_source: "rcn", building_number: undefined }],
+    }, "test scope");
+    expect(result).toContain("Aleja Waszyngtona");
+    expect(result).not.toContain("[number from a recorded sale deed]");
+  });
+
+  it("prints the server hint on an empty page and suppresses the generic widen-area advice", () => {
+    const result = formatParcelList({
+      data: [],
+      pagination: { limit: 250, has_more: false },
+      hint: "ulica jest, numeru nie ma",
+    }, "test scope");
+    expect(result).toContain("Server note: ulica jest, numeru nie ma");
+    // A specific hint replaces the generic advice, which would send the caller away from the number.
+    expect(result).not.toContain("Widening the area");
+  });
+
+  it("falls back to widen-area advice on an empty page with no hint and no suggestions", () => {
+    const result = formatParcelList({
+      data: [],
+      pagination: { limit: 250, has_more: false },
+    }, "test scope");
+    expect(result).toContain("Widening the area");
+  });
 });
 
 describe("formatParcelResolve", () => {
