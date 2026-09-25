@@ -612,7 +612,13 @@ function outlineCentre(geometry: ParcelFeature["geometry"]): { lat: number; lng:
 function formatParcelAddress(p: ParcelListRow): string | null {
   if (p.street == null || p.street === "") return null;
   const approx = p.address_source === "approx_high" || p.address_source === "approx_low";
-  const tag = approx ? " [street approximate — derived, not from the record]" : "";
+  const tag = approx
+    ? " [street approximate — derived, not from the record]"
+    : p.address_source === "address_point"
+    ? " [number from an official address point on this parcel, not from a deed]"
+    : p.address_source === "rcn" && p.building_number != null && p.building_number !== ""
+    ? " [number from a recorded sale deed]"
+    : "";
   return [p.street, p.building_number].filter(Boolean).join(" ") + tag;
 }
 
@@ -635,9 +641,13 @@ export function formatParcelList(res: ParcelListResponse, scope: string, credits
       lines.push("The street is on record but that number is not; these are the numbers held on it, in the compound form the register uses — retry with one of them:");
       for (const n of numbers) lines.push(`  - buildingNumber="${n}"`);
     }
-    if (streets.length === 0 && numbers.length === 0) {
+    // A server hint (e.g. the street is on record but that number is not) is specific guidance; when we
+    // have it, skip the generic "widen the area" advice, which would point the caller away from the number.
+    if (streets.length === 0 && numbers.length === 0 && !res.hint) {
       lines.push("Widening the area or dropping a surface filter is the next step.");
     }
+    // Server's human-facing sentence (e.g. street on record, number not) — else it never reaches the client.
+    if (res.hint) lines.push(`Server note: ${res.hint}`);
     lines.push(CORPUS_COVERAGE_HINT);
     return lines.join("\n") + formatCorpusCoverage(res.corpus_coverage);
   }

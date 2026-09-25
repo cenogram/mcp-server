@@ -3486,9 +3486,10 @@ describe("list_parcels_in_area", () => {
       );
     });
 
-    it("refuses a street fragment with fewer than three letters or digits", async () => {
-      // Three CHARACTERS is not the test: punctuation yields nothing an index over names can be
-      // searched by, so "!!!" would be answered by reading every street name we hold.
+    it("refuses a street fragment with fewer than four letters or digits", async () => {
+      // Character count is not the test: punctuation yields nothing an index over names can be
+      // searched by, so "!!!" would be answered by reading every street name we hold. A single-gram
+      // 3-letter fragment matches too many names to serve, so the floor is four.
       const text = await call({ teryt: "1465", street: "!!!" });
       expect(text).toContain("letters or digits");
       expectNoApiCall();
@@ -3497,9 +3498,9 @@ describe("list_parcels_in_area", () => {
     it("counts Polish letters toward the minimum", async () => {
       mockListParcels.mockResolvedValueOnce(withCredits(parcelList));
 
-      await call({ teryt: "1465", street: "Łąk" });
+      await call({ teryt: "1465", street: "Łąka" });
 
-      expect(mockListParcels).toHaveBeenCalledWith(expect.objectContaining({ street: "Łąk" }), "test-api-key");
+      expect(mockListParcels).toHaveBeenCalledWith(expect.objectContaining({ street: "Łąka" }), "test-api-key");
     });
 
     it("refuses an address filter on a bbox outline call rather than dropping it", async () => {

@@ -1006,13 +1006,14 @@ export interface ParcelListRow {
   //
   // address_source is the provenance and is never omitted: 'rcn' = the street is the one on record
   // for this parcel; 'approx_high'/'approx_low' = we worked it out for a parcel the record left
-  // without one, at the stated confidence; 'none' = we hold no street either way, and then `street`
-  // and `building_number` are both null. Surfaced so an approximated street is never quoted as a
-  // recorded one. A building number only ever comes from the record, so an approximated street
-  // carries none.
+  // without one, at the stated confidence; 'address_point' = the street search on the record came
+  // back empty and this number was found instead on an official address point that falls inside the
+  // parcel (a deed number, not this one, may still be on record for it); 'none' = we hold no street
+  // either way, and then `street` and `building_number` are both null. Surfaced so an approximated or
+  // address-point street is never quoted as a recorded one.
   street?: string | null;
   building_number?: string | null;
-  address_source?: "rcn" | "approx_high" | "approx_low" | "none" | null;
+  address_source?: "rcn" | "approx_high" | "approx_low" | "address_point" | "none" | null;
 }
 
 // Cursor paging. has_more says whether more rows remain; next_cursor is present ONLY when they do,

@@ -1,6 +1,6 @@
 {
   "name": "@cenogram/mcp-server",
-  "version": "0.11.0",
+  "version": "0.12.0",
   "description": "MCP server for Polish real estate: 8M+ transaction prices from notarial deeds (RCN registry, not listings), plus per-parcel context by cadastral ID - zoning, flood risk, heritage, building permits, agricultural land, land use and soil class, transit, nature, mining terrains and groundwater reservoirs",
   "type": "module",
   "bin": {

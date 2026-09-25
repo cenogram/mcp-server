@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.12.0
+
+### `list_parcels_in_area` finds a building number on an official address point
+
+- When a `buildingNumber` search comes back empty against the sale record, the same street and
+  number are now tried against official address points that fall inside the parcel. That match
+  ignores case on the number (`12a` finds `12A`) but is still exact — no compound splitting — and
+  matches the street by the same whole-word rule as `street=`. Only when both the record and the
+  address points miss does the page come back empty (with the tokens refunded and the street's
+  recorded numbers listed to retry).
+
+- A row whose number came from an address point is tagged
+  `[number from an official address point on this parcel, not from a deed]`, and one from the
+  register `[number from a recorded sale deed]`, so a number worked out from address points is
+  never read as a deed number. `address_source` gains the value `address_point` alongside `rcn`,
+  `approx_high`, `approx_low` and `none`.
+
+### `street=` now matches whole words, not any fragment
+
+- `street=` matches whole words of the name instead of any substring: `Górna` finds
+  `ulica Górna` and `Górna 15` but no longer `Podgórna`, and a partial fragment like `Marsza`
+  now finds nothing. Pass the whole word. Matching stays case- and accent-insensitive and still does
+  not inflect (nominative only).
+
+- The minimum `street=` length rises from 3 to 4 letters or digits. A three-letter fragment is a
+  single index gram that matches hundreds of thousands of names; four keeps the lookup fast. A
+  three-character query is now refused up front instead of being sent.
+
+- When the street exists in the area but not with the number you gave, the answer says so and drops
+  the generic "widen the area" advice, which would have pointed away from the number.
+
+These refine an existing call shape. `buildingNumber` behaviour is additive; the `street=`
+whole-word rule and the 3→4 minimum are stricter than before, so a fragment or three-letter query
+that used to match may now return an empty page — retry with the whole word.
+
 ## 0.11.0
 
 ### Accent- and case-tolerant street filter, with suggestions on a miss

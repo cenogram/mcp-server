@@ -60,14 +60,14 @@ describe("api-client", () => {
     const { getTransactions } = await import("../api-client.js");
     await getTransactions({
       district: "Wawer",
-      street: "Trakt Lubelski",
-      buildingNumber: "251C",
+      street: "Aleja Waszyngtona",
+      buildingNumber: "30",
       parcelId: "146518_8.0108.27",
     });
 
     const url = mockFetch.mock.calls[0]![0] as string;
-    expect(url).toContain("street=Trakt");
-    expect(url).toContain("buildingNumber=251C");
+    expect(url).toContain("street=Aleja");
+    expect(url).toContain("buildingNumber=30");
     expect(url).toContain("parcelId=146518");
   });
 
@@ -620,8 +620,8 @@ describe("api-client", () => {
     const { getTransactionsSummary } = await import("../api-client.js");
     await getTransactionsSummary({
       district: "Warszawa",
-      street: "Trakt Lubelski",
-      buildingNumber: "251C",
+      street: "Aleja Waszyngtona",
+      buildingNumber: "30",
       parcelId: "146518_8.0108.27",
       floodRisk: "high",
       heritageStatus: "listed",
@@ -630,7 +630,7 @@ describe("api-client", () => {
     const url = mockFetch.mock.calls[0]![0] as string;
     // Drift guard: summary must carry the same row-filtering params as getTransactions,
     // otherwise "Found N" reports an unfiltered total.
-    expect(url).toContain("buildingNumber=251C");
+    expect(url).toContain("buildingNumber=30");
     expect(url).toContain("parcelId=146518_8.0108.27");
     expect(url).toContain("floodRisk=high");
     expect(url).toContain("heritageStatus=listed");
