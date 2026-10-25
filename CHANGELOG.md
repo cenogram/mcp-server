@@ -1,5 +1,303 @@
 # Changelog
 
+## 0.18.0
+
+### Paging through results: `page` on `search_by_area` and `search_by_polygon`
+
+- New optional `page` parameter: `search_by_area` accepts pages 1-10, `search_by_polygon` pages 1-20.
+  Each page holds 50 rows.
+- When `page` is given, the answer states the total number of matches, whether further pages exist,
+  and the cost of the page.
+- Without `page` the response is unchanged.
+
+## 0.17.1
+
+### `get_rental_yield` and `get_price_spread` answer for a gmina name
+
+- A gmina name now resolves to its county instead of an error. The answer names the county and carries a note that the figure is county-level. A name shared by gminas in several counties returns the candidates, each with a ready `teryt=` call.
+- When the county has no offers, the answer opens with "No asking-offer data for <area>" (spread) or "No asking-rent data for <area>" (yield), ahead of the empty figures.
+- Shorter descriptions: the "call the catalog first" warning is gone, since a gmina name no longer needs it.
+
+## 0.17.0
+
+### The token footer shows the real cost of the whole call
+
+- `search_transactions` and `search_by_area` make two paid requests (the list and the summary). The
+  footer `API tokens: <balance> remaining as of this call (query cost: <n>)` now sums the net cost of
+  both, where it used to show only the list.
+- The balance is the lowest one seen across those requests, so it does not depend on which request
+  finished last. A refund is deducted from the cost and shown as `, <n> refunded`.
+- Below 45 tokens (the price of a parcel report) the footer adds a `Low balance` line with the tools
+  that still work at an empty balance.
+
+### A readable "out of tokens" error (HTTP 402)
+
+- **Changed text:** the error now starts with `Insufficient API tokens (balance: <n>, this call costs: <n>).`
+  It used to start with `Insufficient credits ...`. A client that matches the old text must be updated.
+- It also lists the free tools that still work and, on the free tier, the time the balance is restored
+  (UTC). An expired trial keeps its own message.
+- An unknown balance or cost is printed as `unknown`, not `0`.
+
+### Tool descriptions state the price
+
+- `search_by_area` (3 API tokens, 1 with `summaryOnly`) and `search_by_polygon` (5 API tokens) now say
+  what a call costs.
+
+## 0.16.1
+
+### Codex CLI setup and a clearer 401
+
+- README: new Codex CLI section covering API-key and OAuth setup, and a rewritten 401 troubleshooting entry.
+- A 401 for a missing token or one in an unrecognised format now points to the page where you get an API key.
+- No contract change: tool names, parameters and responses are the same.
+
+## 0.16.0
+
+### Statistics without rows: `summaryOnly` on `search_transactions` and `search_by_area`
+
+- New optional `summaryOnly`: when `true`, the tool returns only the aggregates for the filters (total
+  count, median price per m² with its sample size and period) and no transaction rows, at the cost of
+  the summary alone.
+
+## 0.15.1
+
+### A smaller tool listing
+
+- Tool and parameter descriptions and the server instructions are shorter, so the tool listing loads
+  with far fewer tokens in every conversation. Descriptions keep the parameter-choice rules and
+  coverage warnings.
+- No contract change: tool names, parameters and responses are the same.
+
+## 0.15.0
+
+### `get_price_statistics` covers the last 24 months by default and states the period
+
+- **Changed default:** `get_price_statistics` now computes the price per m² over the last 24 months,
+  the same window as the median in `search_transactions`. Until now it used the full history, which
+  made the two medians differ noticeably for the same place. The tool description says so.
+- New `period` parameter: `"all"` returns the full history (`"24m"` is the default).
+- New `dateFrom` / `dateTo` parameters (`YYYY-MM-DD`, inclusive) for a custom window. They override
+  `period`; `dateTo` defaults to today.
+- The answer always names the window in a `Period:` line under the header, for example
+  `Period: 2024-10-23 to 2026-10-23 (last 24 months)`. An empty answer names the requested period and
+  suggests widening it.
+- A first request for a new date range can answer "being prepared right now" in plain text; repeat the
+  call after the number of seconds it names.
+
+### `list_locations(search=...)` shows how much data stands behind an RCN district name
+
+- Each RCN district name in the result now carries its transaction count and the month range of its
+  deeds, for example `RCN label "Testville": 2 transactions, 2024-01..2024-02`. A label can be a small
+  fraction of a gmina, and the name alone does not show it.
+- When the name maps to exactly one gmina and the label holds fewer transactions than that gmina, the
+  result adds `Only part of gmina X (N transactions); full data: teryt=...`, so the full data is one
+  call away.
+- Follow-up calls by name are printed only for labels that have data: a label with no transactions
+  gets none, and `get_price_statistics(location=...)` is left out where the label has no price
+  sample.
+- Works against an older service: without the coverage data the output is unchanged.
+
+### Failures say what happened instead of passing as results
+
+- `get_demographics` and `get_infrastructure_signals`: a malformed `teryt` ("Invalid teryt ...") is now
+  returned as an error (`isError`), not as plain text, and points to `list_locations(search=...)`.
+  Likewise, a call with neither `location` nor `teryt` is an error.
+- `get_price_distribution` is a national histogram. The description says so, and when `location` or
+  `teryt` is passed, the answer opens with a note that it was not applied.
+- `search_transactions` and `search_by_area`: when the summary statistics request fails, the answer says
+  "Summary statistics unavailable for this query" above the results instead of silently dropping the
+  summary.
+- `search_by_area` and its description now state that the radius is turned into a bounding box, so
+  corners extend beyond `radiusKm`.
+- Transaction tools that take `transaction_id` also accept `transactionId` as an alias. One of the two
+  is required.
+- Optional parameters only; default results are unchanged.
+
+## 0.14.0
+
+### Place names resolve on more tools, and a failed name tells you what to do next
+
+- `list_parcels_in_area`, `get_demographics` and `get_infrastructure_signals` now accept a gmina
+  (municipality) name in `location`, for example `Wieliczka` or `Łomianki`, and answer at municipality
+  level. `get_flood_risk` accepts it too and answers for the county, with a note naming the gmina.
+- A name that is unknown or shared by several units no longer ends in a dead end. The error lists up to
+  five candidate units with their TERYT codes and a ready call for each tool, so the next step is one
+  call, not a guess. This covers all tools with `location`; `get_rental_yield` and `get_price_spread`
+  list candidates in the 404 but still answer only for the units in their catalogs.
+- `list_locations(search=...)` shows exact and prefix matches first, under "Best matches", and folds
+  weaker partial matches into one line. When the search finds only precincts or nothing, it adds a note
+  that a neighbourhood (osiedle) has no code of its own and tells you to get a point from the user.
+- `search_transactions` with a location name we do not know suggests close names ("Did you mean").
+- `resolve_parcel`: "locality + number" works for a gmina name whichever way the register spells it
+  (for example `Ełk 461/3`, `Sandomierz 1093/1`). When several parcels share a number, each row names
+  its precinct and the answer says to ask which one is meant. A coordinate that falls on a road
+  returns a note when the register marks the parcel as a road, and a street address typed into `q`
+  points to `list_parcels_in_area(street=, buildingNumber=)`.
+- Works against an older service: the extra fields are optional and the previous output is kept when
+  they are missing.
+
+### Cleaner land prices in `search_transactions`, `search_by_area` and `search_by_polygon`
+
+- New optional `excludeFractionalShares` on all three tools: when `true`, transactions priced as a
+  fractional share of a property are dropped, because the price covers the whole deed, not that share.
+  Without it, a share row is still shown, but without a price per m², and marked
+  "Share: x/y - price covers the whole deed, not this share".
+
+- Rows that look like one deed covering several plots stay separate on a page, but each carries a
+  note ("likely one deed with N other record(s) on this page - total price shared, price/m² not
+  comparable"), because the same total price repeats on every row.
+
+- Cheap land (under 100 zł/m²) is shown to the grosz instead of rounded to a whole złoty, and plots
+  whose registry area came in hectares show the cadastral area in m².
+
+- Without `dateFrom`, the summary footer adds the median price per m² over the last 24 months
+  (with its period and sample size) next to the all-time median. The window is skipped when a
+  `dateFrom` is given. When the 24-month sample is too small, only the all-time median is printed.
+
+- Land searches without a `landUse` filter end with a hint about it.
+
+- Works against an older service that does not send the new fields: the extra output is simply omitted.
+
+### `get_parcel_report` adds parcel shape
+
+- The report gains a "Parcel shape" block built from the cadastral outline alone: shape label with
+  length/width and how much of its bounding rectangle the outline fills, outline area, perimeter and
+  compactness (1 = circle), the bounding rectangle in metres, the widest circle that fits inside, and
+  the long-axis direction (only when the outline is clearly elongated). Simple outlines also list their
+  sides.
+
+- The block shows the area that stays at least 4 m and 3 m from every boundary, with its largest part
+  and widest circle, or says that no area is that far from the boundary. This is a geometric
+  illustration of the general distance rule only: it ignores local-plan building lines, road setbacks
+  and neighbouring buildings, so it is not a statement about what may be built or divided.
+
+- The widest-circle figure is an iterative approximation and can come out slightly low; when it is not
+  available the rest of the block is still shown.
+
+- Works against an older service that does not send the shape data: the block is simply omitted.
+
+### `get_parcel_report` prints the details behind each covered layer
+
+- Under the summary line of every covered section, the report now lists the details it used to leave out:
+  heritage entries (name, category, whether the parcel lies within a protected area or a listed object
+  stands on or at it), flood scenarios, building-activity cases, the distance to each nuisance category
+  including high- and extra-high-voltage overhead power lines, and the names of protected areas,
+  groundwater reservoirs and mining terrains, plus the landslide share and zone kinds.
+
+- Long lists are capped with a "… and N more" line. The summary lines keep their wording, the price and
+  billing are unchanged, and a section with an unexpected shape simply prints no details.
+
+- The `get_transaction_*` descriptions for heritage, permits, flood, surroundings, nature, landslide and
+  subsurface now point to `get_parcel_report` for a parcel that has no transaction.
+
+### Rate-limit guidance in the server instructions and `get_parcel_report`
+
+- The server instructions and the `get_parcel_report` description now say that requests are limited
+  per API key per minute, that parallel agents on one key share that limit, and that after a
+  "Too many requests" response the client should wait the given number of seconds and retry
+  sequentially. Copy only; no behaviour change.
+
+### New tool `get_permits_in_area`: building permits around a point
+
+- Lists the building permits and works notifications registered since 2016 within a radius of a point
+  (0.1 to 2 km, default 2): a deduplicated list, newest first, plus an aggregate by year and object
+  category that counts all matched cases, with the building volume where it is recorded. Filters:
+  `dateFrom`, `dateTo`, `intent` (multi-family, single-family or all), `categories` and
+  `excludeCategories` (statutory object categories I to XXX) and `worksType` (new construction or all).
+
+- Each case shows its distance from the centre of the circle (to the parcel, rounded to 10 m) and a
+  short category label. The list stays ordered by date, not by distance, and the description says so:
+  to see what is closest, use a smaller radius. The aggregate splits permits from notifications.
+
+- When more cases match than `limit`, the answer ends with a `cursor` to pass back with the same
+  filters for the next page; the aggregate covers all pages. `aggregateOnly` returns the aggregate
+  without the list, for "how many" questions. Category XXVI (utility networks) can make up most of a
+  list: `excludeCategories=["XXVI"]` drops it, `categories=["XXVI"]` shows only it.
+
+- A single-family volume far above one house is marked as suspect (usually several buildings filed as
+  one case); it stays in the sums. A volume of 1 m³ or less is treated as not stated. The building
+  number is given for every category.
+
+- The description now says where the coordinates come from (`resolve_parcel` for a parcel,
+  `list_parcels_in_area` with a location and street for a street, or the user), and a radius above 2 km
+  is refused with a hint to make several calls.
+
+- The answer says how many parcels we hold inside the circle, so an area with no parcel data reads as
+  missing data rather than as no permits, and it carries the data-refresh date. Only issued decisions are
+  held (no cases still pending, no outcome of a decision), and cases filed before a parcel split or
+  merge may not be visible, so a short or empty list never means nothing is being built.
+
+- Costs 5 API tokens per call, also when the list is empty. When the feature is switched off for
+  maintenance the tool answers with a plain "temporarily unavailable" message and charges nothing.
+
+### `get_transaction_permits` tells a missing transaction from one with no permits
+
+- An empty result now says whether the transaction id was not found or the transaction exists but its
+  parcels have no registered case. Against an older service the previous neutral message is kept.
+
+## 0.13.0
+
+### `mpzpDesignation` on `search_by_area`, and a warning for unrecognised codes
+
+- `search_by_area` now takes `mpzpDesignation`, the same filter `search_transactions`,
+  `search_by_polygon` and `compare_locations` already had. Several codes separated by commas match
+  as OR, each compared as a whole token (not a prefix).
+
+- When a code is not in the list of known designations, the filter is still sent unchanged, but the
+  reply (including an empty one) ends with a warning naming the code and listing every known one.
+  `unknown` never triggers it. The `compare_locations` description no longer calls the filter a
+  prefix filter.
+
+### `get_parcel_report` price context is now per property type
+
+- The local price context gives a median zł/m² for each property type (undeveloped land, developed
+  land, building, unit) at the county and at the gmina, with the sample size and the 12-month period.
+  The single median over all property types is no longer printed: it mixed land at a few hundred zł/m²
+  with units at ten thousand or more, so it described no actual sale. Per-type medians exclude shares
+  and non-market deeds.
+
+- The gmina level is now matched by the official gmina code of the parcel instead of by district name.
+  The name match could miss rows wherever a district is spelled differently in the register
+  (for example `Dzielnica Wawer` versus `Wawer`); the official code does not depend on spelling.
+
+- Against a service that does not yet send the per-type split, the tool prints the earlier two lines
+  and says they mix all property types.
+
+### `get_parcel_report` adds a nearby designation signal and clearer labels
+
+- The report gains a "Nearby designation signal" block: the plan designations recorded in sale-deed
+  data for land transactions within the radius shown, with their count, the dominant designation, a
+  confidence label and the rest of the distribution. It describes the neighbourhood, not the parcel's
+  planning status, and always says to confirm with an extract from the local plan (MPZP) or a zoning
+  decision. When there is too little to say, the block states "no signal" instead of implying that no
+  restrictions apply. A server that does not send the section simply leaves the block out.
+
+- Three existing lines are re-labelled so a registry value is not read as a planning fact. `Plan
+  designation` now names its origin and shows a readable label; `Land use` shows the land-use group
+  label and notes that it is not a planning designation; the soil-class section heading notes that
+  it is cadastral.
+
+These are additive to the report text; no input, tool name or price changed.
+
+### New tool: `estimate_land_value`
+
+- A comparable-sales value estimate for undeveloped land — a building plot or farmland — alongside
+  the existing `estimate_value` for apartments. Address it by `lat`+`lng` (with an `area` in m²) or
+  by `parcelId` (the plot area is read from the cadastre when you omit it). It returns the estimate
+  per m² and per hectare, a likely and a wide value range, a confidence band, the comparable count
+  and an `as_of` date, and echoes the comparables it weighed when `includeComps` is on.
+
+- `landType` picks the comparable segment — `plot` (a building plot, default) or `agricultural`
+  (farmland); the caller chooses it. Optional `mpzpDesignation` narrows the comparables to a
+  recorded land designation. The comparables are chosen by the designation recorded in the
+  transaction register for their parcels, which does not assert that the subject plot is buildable.
+  Costs 5 tokens, refunded when there are too few comparables or the area cannot be determined.
+
+- An orientation estimate, NOT a certified appraisal. The feature can be switched off for
+  maintenance; while it is, the call returns a plain "temporarily unavailable" message instead of an
+  estimate. The `estimate_value` description now points to `estimate_land_value` for land. Both
+  changes are additive — no existing call shape changes.
+
 ## 0.12.0
 
 ### `list_parcels_in_area` finds a building number on an official address point
@@ -24,9 +322,9 @@
   now finds nothing. Pass the whole word. Matching stays case- and accent-insensitive and still does
   not inflect (nominative only).
 
-- The minimum `street=` length rises from 3 to 4 letters or digits. A three-letter fragment is a
-  single index gram that matches hundreds of thousands of names; four keeps the lookup fast. A
-  three-character query is now refused up front instead of being sent.
+- The minimum `street=` length rises from 3 to 4 letters or digits. A three-letter fragment is too
+  broad for a fast lookup; four letters keep it fast. A three-character query is now refused up front
+  instead of being sent.
 
 - When the street exists in the area but not with the number you gave, the answer says so and drops
   the generic "widen the area" advice, which would have pointed away from the number.
@@ -164,10 +462,8 @@ These are description and output-text refinements only; every existing call shap
   Costs 4 API tokens. A transaction whose plots carry no assessment answers with an empty result and
   is refunded; an unknown but well-formed id is charged, as everywhere else in this family.
 
-  ⚠ **This tool has been available on the hosted server since 2026-08-26 and is only now reaching a
-  released package** - it went in without a version of its own, so anyone pinned to an older release
-  of this client had no way to see it existed. It is documented here rather than backdated into a
-  version that was never published.
+  This tool was already available on the hosted server before it appeared in a released package, so
+  it is documented here.
 
 ### Pricing
 
@@ -194,8 +490,7 @@ These are description and output-text refinements only; every existing call shap
 
   A street we worked out ourselves is marked as such in the rendered row, so an approximated street
   is never quoted back as one on record. A parcel we hold no street for prints no address line
-  rather than a line saying "none" - most rural parcels are in that position, and a line on every
-  one of them would bury the rows that do carry an address.
+  rather than a line saying "none", which would bury the rows that do carry an address.
 
   **Treat the address fields as optional permanently.** They are absent from any response an older
   service version produces, so read them defensively rather than assuming they are always present.

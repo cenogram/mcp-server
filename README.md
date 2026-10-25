@@ -24,8 +24,9 @@ New accounts start with 1,000 tokens and a 14-day trial of the Standard plan. Af
 working on 50 tokens a week - the balance is restored to 50 every 7 days rather than accumulating -
 with no expiry date and no card.
 
-A call costs 1 token for statistics, reference data, parcel identity and municipal context; 2 for a
-transaction search, a price histogram or a list of the parcels in an area; 4 for one context layer of
+A call costs 1 token for statistics, reference data, parcel identity and municipal context; 3 for a
+transaction search (the list plus its summary; 1 with `summaryOnly`); 2 for a price histogram or a
+list of the parcels in an area; 4 for one context layer of
 a parcel or transaction; 5 for spatial search, parcel outlines, valuation and a multi-district
 comparison; 45 for `get_parcel_report`, which returns every layer at once. Location catalogues are
 free. Paid plans raise the allowance - see [cenogram.pl/api](https://cenogram.pl/api?src=mcpstdio#cennik).
@@ -43,6 +44,38 @@ One command - zero config files:
 claude mcp add cenogram https://mcp.cenogram.pl/mcp \
   -t http -H "Authorization: Bearer YOUR_API_KEY"
 ```
+
+</details>
+
+<details>
+<summary><strong>Codex CLI</strong></summary>
+
+**API key.** Add to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.cenogram]
+url = "https://mcp.cenogram.pl/mcp"
+bearer_token_env_var = "CENOGRAM_API_KEY"
+```
+
+Then export the key in the shell that starts Codex:
+
+```bash
+export CENOGRAM_API_KEY=cngrm_...
+```
+
+**OAuth.** Use the same block without `bearer_token_env_var`, then sign in:
+
+```toml
+[mcp_servers.cenogram]
+url = "https://mcp.cenogram.pl/mcp"
+```
+
+```bash
+codex mcp login cenogram
+```
+
+Without an API key or an OAuth login the server answers 401. Configuration keys differ between Codex versions, so check the [Codex documentation](https://developers.openai.com/codex/mcp) for your version; this section does not guarantee that a particular version connects.
 
 </details>
 
@@ -198,7 +231,7 @@ You can also use the `--http` CLI flag instead of `MCP_TRANSPORT=http`.
 
 ## Tips
 
-- **Model selection**: For best results, use Claude **Opus 4.7**. It makes more sequential tool calls and produces richer analysis. You can switch the model in the dropdown at the bottom of the chat window.
+- **Model selection**: For best results, use Claude **Opus**. It makes more sequential tool calls and produces richer analysis. You can switch the model in the dropdown at the bottom of the chat window.
 
 ## Example Prompts
 
@@ -225,7 +258,7 @@ You can also use the `--http` CLI flag instead of `MCP_TRANSPORT=http`.
 | Tool | Description | Key Parameters |
 |---|---|---|
 | `search_transactions` | Search transactions with filters | location, street, buildingNumber, parcelId, propertyType, marketType, price/date/area range |
-| `get_price_statistics` | Price/m2 stats by location (residential only) | location (optional) |
+| `get_price_statistics` | Price/m2 stats by location (residential only); last 24 months by default, the answer states the period | location (optional), period (`24m`\|`all`), dateFrom/dateTo |
 | `get_price_distribution` | Price histogram | bins, maxPrice |
 | `search_by_area` | Search transactions by geographic radius | latitude, longitude, radiusKm |
 | `get_market_overview` | Database overview and stats | (none) |
@@ -235,17 +268,19 @@ You can also use the `--http` CLI flag instead of `MCP_TRANSPORT=http`.
 | `search_by_polygon` | Search transactions within a GeoJSON polygon | polygon, propertyType, dateFrom/dateTo |
 | `compare_locations` | Compare stats across 2-5 districts | districts (comma-separated), propertyType |
 | `get_building_breakdown` | Per-building breakdown for one transaction (footprint, storeys, est. floor area) | transaction_id (UUID from a search result) |
-| `get_parcel_report` | Composite dossier for one parcel: core, 13 enrichment layers, transaction history, local price context and municipal context | parcelId (cadastral id or UUID) |
+| `get_parcel_report` | Composite dossier for one parcel: core, 13 enrichment layers, transaction history, local price context (median zł/m² per property type for the county and the gmina), municipal context and a parcel-shape section (bounding rectangle, widest inscribed circle, shape class, area away from the boundaries - geometry of the outline only) | parcelId (cadastral id or UUID) |
 | `resolve_parcel` | Resolve a parcel to its cadastral identity | parcelId, q (full cadastral id or 'locality + parcel number' - not a street address), or lat + lng |
 | `get_demographics` | Population and demographic context for a location | location or teryt, year (or yearFrom/yearTo), category |
 | `get_infrastructure_signals` | Municipal infrastructure signals (tenders, utilities, capital spending) | location or teryt |
-| `estimate_value` | Comparable-sales value estimate for a property | area, plus lat + lng or parcelId; rooms, market |
+| `estimate_value` | Comparable-sales value estimate for an apartment | area, plus lat + lng or parcelId; rooms, market |
+| `estimate_land_value` | Comparable-sales value estimate for undeveloped land (building plot or farmland), per m² and per hectare | lat + lng (area required) or parcelId (area from the cadastre); landType, mpzpDesignation |
 | `get_transaction_flood` | Flood risk for the property in a transaction | transaction_id (UUID from a search result) |
 | `get_transaction_heritage` | Heritage-register status for the property | transaction_id |
 | `get_transaction_landslide` | Landslide risk for the property | transaction_id |
 | `get_transaction_surroundings` | Nuisance and land-use context around the property | transaction_id |
 | `get_transaction_transit` | Public transport accessibility for the property | transaction_id |
 | `get_transaction_permits` | Building permits recorded for the property | transaction_id |
+| `get_permits_in_area` | Building permits and works notifications registered since 2016 around a point (issued decisions only), as a list plus a year × category aggregate | lat + lng; radiusKm (max 2), dateFrom, dateTo, intent, categories, excludeCategories, worksType, limit, cursor, aggregateOnly |
 | `get_transaction_planning` | Local zoning and planning status for the property | transaction_id |
 | `get_transaction_farmland` | Agricultural land-use classification for the property | transaction_id |
 | `get_transaction_nature` | Nearby forest and overlapping protected natural areas for the property | transaction_id |
@@ -309,7 +344,7 @@ a truncated answer as the parcel list of the area.
 
 **A location returns 0 results** - The name may not be an administrative unit. Districts and neighbourhoods are two different things: "Mokotow" is a district and works, "Sluzew" is a neighbourhood inside it and does not. Use `list_locations(search="...")` to find valid names, or search by radius (`search_by_area`) for anything smaller than a district.
 
-**401 Unauthorized (HTTP mode)** - The `Authorization` header must be `Bearer cngrm_...` (with the `Bearer` prefix). Double-check that the full API key is included, not just the prefix.
+**401 Unauthorized (HTTP mode)** - The server accepts either an API key (`Authorization: Bearer cngrm_...`, with the `Bearer` prefix and the full key, not just the prefix) or an OAuth access token from a client that completed the OAuth sign-in. A missing token, or one in an unrecognised format, gets a 401 whose body links to [cenogram.pl/api](https://cenogram.pl/api?src=mcpstdio), where you get a key. A client with neither a key nor an OAuth login (Codex CLI, for example) gets 401 on every request - see its setup above.
 
 **402 Payment Required** - The account is out of tokens. On a free account the response says the date from which the balance is back at its weekly 50; the key and the connection stay valid until then. A paid plan lifts the limit - see [cenogram.pl/api](https://cenogram.pl/api?src=mcpstdio#cennik).
 

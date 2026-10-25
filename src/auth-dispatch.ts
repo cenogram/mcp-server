@@ -3,6 +3,9 @@ import { encodeOAuthCtx } from "./api-client.js";
 
 export const RESOURCE_METADATA = "https://mcp.cenogram.pl/.well-known/oauth-protected-resource";
 
+// Body-only hint: clients that hit 401 without a key (e.g. CLI agents) need to learn where to get one.
+const API_KEY_HINT = "Get an API key (cngrm_...) at https://cenogram.pl/api?src=mcp401 or use OAuth (resource metadata in WWW-Authenticate).";
+
 // RFC 6750 § 3 quoted-string alphabet: %x20-21 / %x23-5B / %x5D-7E (ASCII visible without " or \)
 const QUOTED_RE = /^[\x20\x21\x23-\x5B\x5D-\x7E]*$/;
 
@@ -136,7 +139,7 @@ export async function dispatchAuth(
       kind: "401",
       ...build401({
         bodyError: "missing_token",
-        bodyDesc: "Provide an OAuth access token or API key in Authorization: Bearer header.",
+        bodyDesc: `Provide an OAuth access token or API key in Authorization: Bearer header. ${API_KEY_HINT}`,
       }),
       log: { evt: "auth.rejected", reason: "missing", kid: null },
     };
@@ -159,7 +162,7 @@ export async function dispatchAuth(
         errorParam: "invalid_token",
         description: "Token format not recognized",
         bodyError: "invalid_token",
-        bodyDesc: "Expected OAuth JWT or Cenogram API key (cngrm_...)",
+        bodyDesc: `Expected OAuth JWT or Cenogram API key (cngrm_...). ${API_KEY_HINT}`,
       }),
       log: { evt: "auth.rejected", reason: "invalid_format", kid: null },
     };

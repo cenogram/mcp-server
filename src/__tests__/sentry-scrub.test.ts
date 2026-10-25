@@ -31,7 +31,7 @@ describe("scrubHeaders", () => {
 
 describe("scrubString", () => {
   it("replaces cngrm_ API key patterns", () => {
-    expect(scrubString("https://cenogram.pl/api?key=cngrm_c4678d5d80203972a43fa721b770a44b"))
+    expect(scrubString("https://cenogram.pl/api?key=cngrm_deadbeefdeadbeefdeadbeefdeadbeef"))
       .toBe("https://cenogram.pl/api?key=[Filtered]");
   });
 

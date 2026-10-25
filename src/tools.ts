@@ -6,6 +6,7 @@ import {
   getTransactions,
   getPricePerM2,
   getDistricts,
+  getDistrictCoverage,
   getLocations,
   searchLocations,
   getPriceHistogram,
@@ -26,6 +27,8 @@ import {
   getFloodRisk,
   getFloodRiskLocations,
   getValuation,
+  getLandValuation,
+  ApiHttpError,
   getBuildingBreakdown,
   getTransactionFlood,
   getTransactionHeritage,
@@ -36,6 +39,7 @@ import {
   getTransactionRoads,
   getTransactionTransit,
   getTransactionPermits,
+  getPermitsInArea,
   getTransactionPlanning,
   getTransactionFarmland,
   getDemographics,
@@ -44,14 +48,19 @@ import {
   isExpectedApiError,
   OAUTH_CTX_PREFIX,
 } from "./api-client.js";
-import type { CreditInfo, LocationSearchItem } from "./api-client.js";
+import type { ApiResponse, CreditInfo, LocationSearchItem, TransactionParams, TransactionsSummary } from "./api-client.js";
+import { formatCreditFooter } from "./credit-footer.js";
+import { experimentalToolsEnabled } from "./free-tools.js";
 import { signupUrl } from "./error-messages.js";
+import { withLocationErrors } from "./location-errors.js";
 import { channelSrc, isHttpMode } from "./transport-mode.js";
 import { sanitizeForLog } from "./auth-dispatch.js";
 import {
   formatTransactionList,
+  formatTransactionSummaryOnly,
   formatMarketOverview,
   formatPriceStats,
+  type PriceStatsPeriod,
   formatHistogram,
   formatParcelResults,
   formatParcelResolve,
@@ -63,6 +72,9 @@ import {
   formatCompareResults,
   formatLocationHierarchy,
   formatLocationSearch,
+  buildCoverageMap,
+  type LocationCoverage,
+  formatNeighbourhoodNote,
   formatRentalYield,
   formatRentalYieldLocations,
   formatPriceSpread,
@@ -70,6 +82,7 @@ import {
   formatFloodRisk,
   formatFloodRiskLocations,
   formatValuation,
+  formatLandValuation,
   formatBuildingBreakdown,
   formatFloodBreakdown,
   formatHeritageBreakdown,
@@ -80,11 +93,12 @@ import {
   formatRoads,
   formatTransitBreakdown,
   formatPermitsBreakdown,
+  formatPermitsInArea,
   formatPlanningBreakdown,
   formatFarmland,
   formatDemographics,
   formatInfrastructureSignals,
-  MARKET_CAVEAT,
+  landUseHint,
 } from "./formatters.js";
 import {
   mapPropertyType,
@@ -93,8 +107,12 @@ import {
   mapBuildingType,
   mapOwnershipTypes,
   mapTransactionTypes,
+  invalidMpzpTokens,
+  MPZP_DESIGNATIONS,
   radiusKmToBbox,
   filterByLocation,
+  rankByLocation,
+  capRcnSection,
   resolveDistrict,
   tryResolveCityKey,
   stripDiacritics,
@@ -106,19 +124,170 @@ function sanitizeInput(s: string, maxLen = 50): string {
   return s.replace(/[<>]/g, "").slice(0, maxLen);
 }
 
-// Mirror of the server-side guard, used by the per-transaction layer tools. Validating here means a
-// malformed id is rejected before the API call — those endpoints bill their full weight even for a
-// garbage id that resolves to empty, so validating up front protects the caller's tokens. The
-// per-call price is deliberately not repeated here; it is published in the API docs.
+// Soft check: the filter is still sent as given, so a code missing from the bundled list (data can
+// outgrow an old package version) is flagged, never refused.
+function mpzpWarning(raw: string | undefined): string {
+  const bad = invalidMpzpTokens(raw);
+  if (bad.length === 0) return "";
+  return (
+    `\n\nWarning: unrecognised mpzpDesignation value(s): ${bad.map((t) => `'${sanitizeInput(t)}'`).join(", ")}. ` +
+    "The filter was sent as given and matches tokens exactly, so it likely returned nothing. " +
+    `Known codes: ${MPZP_DESIGNATIONS.join(", ")}.`
+  );
+}
+
+const MPZP_DESIGNATION_DESCRIPTION =
+  "MPZP zoning designation, exact token match; comma-separated = OR (e.g. 'MN,MW'). " +
+  "'unknown' = none recorded (NULL), distinct from the code 'brakMPZPLubWZ' (no plan/WZ). " +
+  `Known codes: ${MPZP_DESIGNATIONS.join(", ")}. An unrecognised value is still sent, with a warning.`;
+// The code list is long: spelled out once (search_transactions); the other tools point at it.
+const MPZP_DESIGNATION_REF_DESCRIPTION =
+  "MPZP zoning designation, exact token match; comma-separated = OR; 'unknown' = none recorded. Same codes as search_transactions mpzpDesignation.";
+
+// Short stand-in for the registry-wide price caveat inside tool descriptions.
+const MARKET_NOTE = "Aggregates exclude fractional shares and non-market deeds.";
+
+// Mirror of the server-side guard, used by the per-transaction layer tools: a malformed id is
+// rejected before the API call.
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function textResponse(text: string) {
   return { content: [{ type: "text" as const, text }] };
 }
 
-function formatCreditFooter(creditInfo: CreditInfo | null): string {
-  if (!creditInfo) return "";
-  return `\n---\nAPI tokens: ${creditInfo.balance} remaining (query cost: ${creditInfo.cost})`;
+// Today (UTC) minus N calendar months as YYYY-MM-DD, day clamped to the target month's length
+// (2028-02-29 - 24 months = 2026-02-28), matching the server-side search_transactions median window.
+function utcMonthsBack(now: Date, months: number): string {
+  const total = now.getUTCFullYear() * 12 + now.getUTCMonth() - months;
+  const year = Math.floor(total / 12);
+  const month = total % 12;
+  const day = Math.min(now.getUTCDate(), new Date(Date.UTC(year, month + 1, 0)).getUTCDate());
+  return new Date(Date.UTC(year, month, day)).toISOString().slice(0, 10);
+}
+
+// Explicit dates win over `period`; default is the last 24 months (the search_transactions median window).
+// dateTo is always sent (today when absent) so the API reports the actual span and drops future-dated deeds.
+function resolvePriceStatsPeriod(
+  p: { period?: "24m" | "all"; dateFrom?: string; dateTo?: string },
+  now: Date = new Date(),
+): PriceStatsPeriod {
+  const today = now.toISOString().slice(0, 10);
+  if (p.dateFrom || p.dateTo) {
+    return { kind: "custom", dateFrom: p.dateFrom, dateTo: p.dateTo ?? today };
+  }
+  if (p.period === "all") return { kind: "full_history", dateTo: today };
+  return { kind: "last_24_months", dateFrom: utcMonthsBack(now, 24), dateTo: today };
+}
+
+function errorResponse(text: string) {
+  return { content: [{ type: "text" as const, text }], isError: true };
+}
+
+// Both spellings are declared because a key missing from the shape is stripped silently, so a
+// camelCase call would otherwise fail as "required". `carries` narrows the source in the building tool.
+function txIdShape(carries = "") {
+  const idField = (name: string) =>
+    z.string().regex(UUID_RE, `${name} must be a UUID — copy the id from a search_transactions result${carries}`).optional();
+  return {
+    transaction_id: idField("transaction_id").describe(
+      `Transaction id (UUID) from a search result${carries}. This or transactionId is required.`,
+    ),
+    transactionId: idField("transactionId"),
+  };
+}
+
+// transaction_id wins when both are sent; a call with neither is answered, not left to a schema error.
+function resolveTxId(params: { transaction_id?: string; transactionId?: string }) {
+  return params.transaction_id ?? params.transactionId
+    ?? errorResponse("transaction_id is required - copy the id from a search_transactions result");
+}
+
+type SummaryOutcome =
+  | { failed: false; summary: TransactionsSummary; creditInfo: CreditInfo | null }
+  | { failed: true; error: unknown };
+
+// The summary only enriches the list, so its failure degrades the reply instead of failing it. The
+// error is reported after the rows arrive, so one outage that fails both calls is not reported twice.
+function settleSummary(call: Promise<ApiResponse<TransactionsSummary>>): Promise<SummaryOutcome> {
+  return call.then(
+    (res): SummaryOutcome => ({ failed: false, summary: res.data, creditInfo: res.creditInfo }),
+    (error: unknown): SummaryOutcome => ({ failed: true, error }),
+  );
+}
+
+function summaryNote(outcome: SummaryOutcome, toolName: string, follows: string): string {
+  if (!outcome.failed) return "";
+  if (!isExpectedApiError(outcome.error)) {
+    Sentry.captureException(outcome.error, { tags: { tool: toolName, error_layer: "summary" } });
+  }
+  return `Summary statistics unavailable for this query (temporary error); transaction results below follow the requested ${follows}.\n\n`;
+}
+
+// Only successful responses carry credit metadata; a failed summary's charge is unknown, so only the list's cost is shown.
+function listAndSummaryFooter(list: CreditInfo | null, summary: SummaryOutcome): string {
+  return formatCreditFooter(list, summary.failed ? null : summary.creditInfo);
+}
+
+const SUMMARY_ONLY_DESCRIPTION =
+  "Return only aggregate stats (total, median price/m² with its sample size, period) and no rows. Costs only the summary call; limit/sort/page are ignored.";
+const DEFAULT_WINDOW_MONTHS = 24;
+const MAX_WINDOW_MONTHS = 120;
+
+function parseIsoDate(s: string): { y: number; m: number; d: number } | null {
+  const mt = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+  if (!mt) return null;
+  const y = Number(mt[1]), m = Number(mt[2]), d = Number(mt[3]);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  return dt.getUTCFullYear() === y && dt.getUTCMonth() === m - 1 && dt.getUTCDate() === d ? { y, m, d } : null;
+}
+
+// summaryOnly asks for a median window because only it carries a sample size; the API anchors it at min(today, dateTo).
+// Months run from dateFrom to that anchor, rounded up so the window starts on or before dateFrom; undefined = bad date or over 10 years.
+export function summaryWindowMonths(
+  dateFrom: string | undefined,
+  now: Date = new Date(),
+  dateTo?: string,
+): number | undefined {
+  const today = { y: now.getUTCFullYear(), m: now.getUTCMonth() + 1, d: now.getUTCDate() };
+  const to = dateTo ? parseIsoDate(dateTo) : null;
+  const dateKey = (p: { y: number; m: number; d: number }): number => p.y * 10000 + p.m * 100 + p.d;
+  const anchor = to && dateKey(to) < dateKey(today) ? to : today;
+  const startKey = (months: number): number => {
+    const idx = anchor.y * 12 + (anchor.m - 1) - months;
+    const y = Math.floor(idx / 12), m = idx - y * 12 + 1;
+    const daysInMonth = new Date(Date.UTC(y, m, 0)).getUTCDate();
+    return y * 10000 + m * 100 + Math.min(anchor.d, daysInMonth);
+  };
+  if (!dateFrom) return DEFAULT_WINDOW_MONTHS;
+  const from = parseIsoDate(dateFrom);
+  if (!from) return undefined;
+  const fromKey = dateKey(from);
+  if (fromKey >= dateKey(anchor)) return 1;
+  let months = Math.max(1, (anchor.y - from.y) * 12 + (anchor.m - from.m));
+  while (startKey(months) > fromKey) months++;
+  return months <= MAX_WINDOW_MONTHS ? months : undefined;
+}
+
+// summaryOnly branch shared by search_transactions and search_by_area: one summary call, no rows, no
+// error swallowing (an API error should reach the caller rather than read as an empty result).
+async function summaryOnlyResponse(
+  txParams: TransactionParams,
+  hints: { propertyType?: string; landUse?: string[]; mpzpDesignation?: string },
+  apiKey: string,
+  location?: string,
+) {
+  const summary = await getTransactionsSummary(
+    { ...txParams, medianWindowMonths: summaryWindowMonths(txParams.dateFrom, new Date(), txParams.dateTo) },
+    apiKey,
+  );
+  const dateFrom = txParams.dateFrom && parseIsoDate(txParams.dateFrom) ? txParams.dateFrom : undefined;
+  const dateTo = txParams.dateTo && parseIsoDate(txParams.dateTo) ? txParams.dateTo : undefined;
+  return textResponse(
+    formatTransactionSummaryOnly(summary.data, location, dateFrom, dateTo) +
+    landUseHint(hints.propertyType, hints.landUse?.join(",")) +
+    mpzpWarning(hints.mpzpDesignation) +
+    formatCreditFooter(summary.creditInfo),
+  );
 }
 
 // Two very different situations produce a missing key, and the old wording described both as
@@ -205,17 +374,46 @@ async function withErrorHandling(
 
 // ── Optional tools flag ────────────────────────────────────────────
 
-/** Whether tools outside the default set are registered. Read once, at registration time. */
-export function experimentalToolsEnabled(): boolean {
-  return process.env.CENOGRAM_EXPERIMENTAL_TOOLS === "1";
-}
+// Re-exported: the flag moved to free-tools.ts so error messages can read it without importing the registry.
+export { experimentalToolsEnabled };
 
-// ── Shared land / building filters ─────────────────────────────────
+// ── Shared filters ─────────────────────────────────────────────────
 //
-// The same four filters are exposed on search_transactions, search_by_area and search_by_polygon.
-// Declared once and reused so the three tools cannot drift. Each description carries the
-// "absence of a value ≠ absence of the phenomenon" caveat — that is the line the model reads to
-// decide whether to trust a missing value, so it must never be dropped.
+// Declared once and reused so the transaction-search tools cannot drift. Hazard/listing filters keep
+// the "absence of a value ≠ absence of the phenomenon" caveat: the model reads it to judge a missing value.
+
+const unitFunctionParam = z.enum(["residential", "commercial", "office", "production", "garage", "other", "unknown"]).optional()
+  .describe("Unit function; 'unknown' = none recorded (NULL), any other value excludes such rows. Garages only via 'garage'.");
+
+const buildingTypeParam = z.enum(["residential", "commercial", "industrial", "transport", "office", "warehouse", "education_sports", "farm_utility", "hospital", "other_nonresidential", "unknown"]).optional()
+  .describe("Building type (PKOB); 'unknown' = none recorded (NULL, ~39% of buildings), any other value excludes such rows.");
+
+const marketTypeParam = z.enum(["primary", "secondary"]).optional()
+  .describe("primary (developer) or secondary (resale); the ~55% of records with no market type drop out when this is set.");
+
+const ownershipTypeParam = z.array(z.enum(["land_ownership", "perpetual_usufruct", "cooperative_ownership", "unit_sale", "ownership", "unit_ownership_with_appurtenant_right", "building_ownership_with_appurtenant_right", "unknown"])).optional()
+  .describe("Legal-right type (rodzaj prawa), multi-select; perpetual_usufruct = użytkowanie wieczyste; 'unknown' = none recorded.");
+
+const transactionTypeParam = z.array(z.enum(["free_market", "auction", "non_auction", "subsidized", "public_purpose", "foreclosure", "unknown"])).optional()
+  .describe("Multi-select. For market analysis ALWAYS set it to exclude non-market deeds (subsidized, foreclosure, public_purpose); no-type rows (~2%) drop out unless 'unknown' is listed.");
+
+const roomsParam = z.array(z.enum(["1", "2", "3", "4", "5", "6", "7", "8plus", "unknown"])).optional()
+  .describe("Rooms (izby), residential units only; multi-select ('8plus' = 8 or more). Rows with no count drop out unless 'unknown' is listed.");
+
+const floorParam = z.array(z.string().regex(/^(-?\d+|\d+plus|unknown)$/i, "Invalid floor token - use an integer (e.g. '2','0','-1'), 'Nplus' (e.g. '10plus'), or 'unknown'.")).optional()
+  .describe("Unit floor, multi-select: integers ('0' = parter, negatives = basement), 'Nplus' ('0plus' = ground and above), 'unknown' (none recorded). Not building storeys; rows with no floor drop out unless 'unknown' is listed.");
+
+const floodRiskParam = z.array(z.enum(["low", "medium", "high"])).optional()
+  .describe("Flood-hazard zone, multi-select: high ~1-in-10-year, medium ~1-in-100, low ~1-in-500. Mapped zones only; absence of a zone is never 'safe'.");
+
+const heritageStatusParam = z.array(z.enum(["listed", "zone"])).optional()
+  .describe("Heritage listing, multi-select: listed = protected monument on the land; zone = protected urban layout or monument surroundings. Detected listings only; absence of a detection is never 'not listed'.");
+
+const landslideRiskParam = z.array(z.enum(["landslide", "threatened"])).optional()
+  .describe("Landslide hazard, multi-select: landslide = mapped landslide area; threatened = area threatened by mass movements. Mapped areas only; absence of a zone is never 'safe'.");
+
+const mpzpDesignationParam = z.string().optional().describe(MPZP_DESIGNATION_DESCRIPTION);
+const mpzpDesignationRefParam = z.string().optional().describe(MPZP_DESIGNATION_REF_DESCRIPTION);
 
 const landUseParam = z.array(z.enum([
   "gruntyZabudowaneIZurbanizowane",
@@ -225,21 +423,26 @@ const landUseParam = z.array(z.enum([
   "inne",
   "unknown",
 ])).optional().describe(
-  "Recorded land-use category of the transaction's land. Multi-select from: gruntyZabudowaneIZurbanizowane (built-up and urbanised), gruntyRolne (agricultural), gruntyLesne (forest), terenyKomunikacyjne (transport), inne (other). 'unknown' = no category recorded for the land (NULL) — a legitimate bucket, never a claim that the land has no use. Values are case-sensitive. E.g. ['gruntyRolne'] for farmland, or ['gruntyZabudowaneIZurbanizowane','gruntyRolne'] to compare developed vs farmland.",
+  "Land-use category, multi-select, case-sensitive (gruntyZabudowaneIZurbanizowane = built-up, gruntyRolne = agricultural, gruntyLesne = forest, terenyKomunikacyjne = transport); 'unknown' = none recorded (NULL), not 'no use'.",
 );
 
 const buildingStoreysParam = z.array(
   z.string().regex(/^(\d+|\d+plus|unknown)$/i, "Invalid buildingStoreys token - use a non-negative integer (e.g. '1','2'), 'Nplus' (e.g. '3plus'), or 'unknown'."),
 ).optional().describe(
-  "Number of above-ground storeys of the building. Multi-select buckets: exact non-negative integers (e.g. '1','2'), 'Nplus' e.g. '3plus' = 3 or more, 'unknown' = no storey count recorded (NULL). Recorded ONLY for single-building transactions, so 'unknown' covers BOTH a deed with several buildings (no single storey count exists) and a single building with missing data — never read it as 'a building with no storeys'. This is NOT the floor of a unit (see floor). Without 'unknown', rows with no storey count are excluded.",
+  "Above-ground storeys, multi-select: integers, 'Nplus' ('3plus' = 3+), 'unknown' (no count). Single-building deeds only, so 'unknown' also covers multi-building deeds. Not the unit floor; rows with no count drop out unless 'unknown' is listed.",
 );
 
 const minFootprintAreaParam = z.number().optional().describe(
-  "Minimum building footprint (ground-plan) area in m², summed over all buildings of the transaction. Distinct from minArea, which measures usable floor area (units) or land/parcel area. Set only where every linked building has footprint data, so this bound selects only measured rows — absence means 'not measured', not 'no building'.",
+  "Minimum building footprint in m², summed over the transaction's buildings; measured rows only (absence = 'not measured', not 'no building'). Not usable area.",
 );
 
 const maxFootprintAreaParam = z.number().optional().describe(
-  "Maximum building footprint (ground-plan) area in m², summed over all buildings of the transaction. Distinct from maxArea, which measures usable floor area (units) or land/parcel area. Set only where every linked building has footprint data, so this bound selects only measured rows — absence means 'not measured', not 'no building'.",
+  "Maximum building footprint in m², summed over the transaction's buildings; measured rows only (absence = 'not measured', not 'no building'). Not usable area.",
+);
+
+// Opt-in: default false keeps every existing caller's results unchanged.
+const excludeFractionalSharesParam = z.boolean().optional().default(false).describe(
+  "true = clean land prices: drops fractional ownership shares, whose price reflects the whole deed. Default false.",
 );
 
 // ── Tool registration ──────────────────────────────────────────────
@@ -250,58 +453,45 @@ export function registerTools(server: McpServer, apiKey?: string): void {
 
 server.tool(
   "search_transactions",
-  `Search Polish real estate transactions from the national RCN registry (8M+ records).
-Returns transaction details: address, date, price, area, price/m², property type.
-Call list_locations(search=...) first to resolve a place: prefer the returned TERYT code as teryt= (exact administrative match). Pass a name to location= only when the result flags it as an RCN district (rcn_district) — most TERYT names are not valid location= values and silently return zero rows.
-Example: search for apartments in Mokotów sold in 2024 above 500,000 PLN.
-Data notes: marketType is NULL for ~55% of records (notary didn't classify) - filtering by marketType excludes them. ~1.7% of records have no transaction_date.
-Permalink: every result is shareable on the map. From a result's "id:" line and its "Location: <A>°N, <B>°E" line, build https://cenogram.pl/ceny-transakcyjne?src=${channelSrc()}#v=1&lat=<A>&lng=<B>&z=16&tx=<id> (drop the °N/°E; lat = the °N number, lng = the °E number) — opens that exact transaction on the map. Omit &tx=<id> for the area only.
-Field provenance: values are from the notarial deed (RCN) by default; computed values (parcel area summed across plots or converted from hectares, an inferred/reclassified property type) and approximated streets are flagged inline with a neutral [...] note.
-Location matches TERYT districts only - for neighborhoods (osiedla), use search_by_area instead.`,
+  `Find individual Polish real-estate transactions from the national RCN registry (8M+ notarial deeds, not asking prices) by place, property type, price, area, date or street. Returns address, date, price, area, price/m² and property type.
+Resolve the place first: list_locations(search=...), then pass its TERYT code as teryt= (exact match). Use location= only for a name that result flags as an RCN district (rcn_district) - other names silently return zero rows. Neighborhoods (osiedla) are not TERYT districts: use search_by_area.
+Data notes: marketType is NULL for ~55% of records (filtering by it drops them); ~1.7% have no transaction_date.
+Permalink to a result: https://cenogram.pl/ceny-transakcyjne?src=${channelSrc()}#v=1&lat=<A>&lng=<B>&z=16&tx=<id> (<id> from the "id:" line, <A>/<B> from "Location: <A>°N, <B>°E"; omit &tx=<id> for the area only).
+Inline [...] notes flag computed values (summed or converted parcel area, inferred property type) and approximated streets; all else is as recorded in the deed.`,
   {
     location: z.string().optional().describe(
-      "Location name - city (e.g. 'Warszawa', 'Kraków', 'Gdańsk') or district (e.g. 'Mokotów', 'Kraków-Podgórze'). 'Warszawa', 'Kraków', 'Łódź' auto-expand to all sub-districts. Prefer teryt= for exact matches; call list_locations(search=...) to confirm a name is valid here — it flags valid ones as rcn_district.",
+      "City (e.g. 'Warszawa') or RCN district (e.g. 'Mokotów', 'Kraków-Podgórze'); 'Warszawa', 'Kraków', 'Łódź' expand to all sub-districts. Prefer teryt=; confirm a name with list_locations(search=...) (valid ones are flagged rcn_district).",
     ),
     teryt: z.string().min(1).optional().describe(
-      "TERYT administrative code(s) for precise area filtering. Comma-separated, max 10. 2-digit (voivodeship), 4-digit (county), 6-digit (municipality), or full precinct code (e.g. '321705_2.0054'). Use list_locations to find codes. More precise than 'location' - avoids name ambiguity.",
+      "TERYT code(s), comma-separated, max 10: 2-digit (voivodeship), 4 (county), 6 (municipality) or a precinct code (e.g. '321705_2.0054'). Find codes with list_locations. Exact - avoids name ambiguity.",
     ),
     propertyType: z.enum(["land", "building", "developed_land", "unit"]).optional()
       .describe("Property type filter"),
-    marketType: z.enum(["primary", "secondary"]).optional()
-      .describe("Market type: primary (developer) or secondary (resale). ~55% of records have unknown market type and will be excluded when this filter is used."),
-    unitFunction: z.enum(["residential", "commercial", "office", "production", "garage", "other", "unknown"]).optional()
-      .describe("Unit/apartment function filter. 'unknown' = no function recorded (NULL); without it such rows are excluded. Garages appear only when 'garage' is selected, not via 'unknown'."),
-    buildingType: z.enum(["residential", "commercial", "industrial", "transport", "office", "warehouse", "education_sports", "farm_utility", "hospital", "other_nonresidential", "unknown"]).optional()
-      .describe("Building type filter (PKOB classification). 'unknown' = no type recorded (NULL); without it such rows are excluded (~39% of buildings have no type)."),
-    ownershipType: z.array(z.enum(["land_ownership", "perpetual_usufruct", "cooperative_ownership", "unit_sale", "ownership", "unit_ownership_with_appurtenant_right", "building_ownership_with_appurtenant_right", "unknown"])).optional()
-      .describe("Ownership / legal-right type filter (rodzaj prawa do nieruchomości). land_ownership; perpetual_usufruct (użytkowanie wieczyste — covers both registry codes for this right); cooperative_ownership; unit_sale; ownership; unit_ownership_with_appurtenant_right; building_ownership_with_appurtenant_right. 'unknown' = no right recorded (NULL). Multi-select; e.g. ['land_ownership','perpetual_usufruct'] to compare ownership vs perpetual usufruct on undeveloped land."),
-    mpzpDesignation: z.string().optional()
-      .describe("MPZP zoning designation filter (exact match, e.g. 'budownictwoMieszkanioweWielorodzinne', 'terenObiektowProdukcyjnychSkladowIMagazynow'). Use 'unknown' for rows with no designation recorded (NULL); distinct from the registry code 'brakMPZPLubWZ' (= 'no plan/WZ' recorded as data)."),
-    transactionType: z.array(z.enum(["free_market", "auction", "non_auction", "subsidized", "public_purpose", "foreclosure", "unknown"])).optional()
-      .describe("Transaction type filter. For market analysis, ALWAYS specify transactionType to exclude non-market transactions (subsidized, foreclosure, public purpose). ~2% of transactions have unknown type (NULL) and are excluded when this filter is used unless 'unknown' is included."),
-    rooms: z.array(z.enum(["1", "2", "3", "4", "5", "6", "7", "8plus", "unknown"])).optional()
-      .describe("Number of rooms (izby) filter, residential units only. Multi-select; '8plus' means 8 or more, 'unknown' = no room count recorded (NULL). E.g. ['2','3'] for 2-3 izby flats. Without 'unknown', rows with no room count are excluded."),
-    floor: z.array(z.string().regex(/^(-?\d+|\d+plus|unknown)$/i, "Invalid floor token - use an integer (e.g. '2','0','-1'), 'Nplus' (e.g. '10plus'), or 'unknown'.")).optional()
-      .describe("Floor of the unit (piętro lokalu, residential). Multi-select buckets: exact integers incl. '0' (parter) and negatives e.g. '-1' (basement), 'Nplus' e.g. '10plus' = 10 or more, '0plus' = ground and above, 'unknown' = no floor recorded (NULL). E.g. ['0','1','2'] for ground-to-2nd floor. Building storeys are a different attribute. Without 'unknown', rows with no floor are excluded."),
-    floodRisk: z.array(z.enum(["low", "medium", "high"])).optional()
-      .describe("Flood-hazard filter. high = most frequent flooding (~1-in-10-year), medium (~1-in-100-year), low = rarest (~1-in-500-year). Selects ONLY transactions whose land sits in a mapped flood zone; absence of a zone is never asserted as 'safe'. Multi-select; e.g. ['medium','high'] = at least medium risk."),
-    heritageStatus: z.array(z.enum(["listed", "zone"])).optional()
-      .describe("Heritage-listing filter. listed = a protected monument on/at the property's land; zone = the land lies within a protected urban layout or the designated surroundings of a monument. Selects ONLY transactions where a listing was detected; absence of a detection is never asserted as 'not listed'. Multi-select; e.g. ['listed'] = individually listed properties only."),
-    landslideRisk: z.array(z.enum(["landslide", "threatened"])).optional()
-      .describe("Landslide-hazard filter, from official landslide-hazard maps (1:10,000 scale). 'landslide' = the land intersects a mapped landslide area; 'threatened' = an area threatened by mass movements. Selects ONLY transactions whose land intersects a mapped hazard area — an intersection means overlap with a mapped area, not that the parcel itself is a landslide; absence of a zone is never asserted as 'safe'. Multi-select; e.g. ['landslide','threatened'] = any mapped hazard."),
+    marketType: marketTypeParam,
+    unitFunction: unitFunctionParam,
+    buildingType: buildingTypeParam,
+    ownershipType: ownershipTypeParam,
+    mpzpDesignation: mpzpDesignationParam,
+    transactionType: transactionTypeParam,
+    rooms: roomsParam,
+    floor: floorParam,
+    floodRisk: floodRiskParam,
+    heritageStatus: heritageStatusParam,
+    landslideRisk: landslideRiskParam,
     minPrice: z.number().optional().describe("Minimum price in PLN"),
     maxPrice: z.number().optional().describe("Maximum price in PLN"),
     dateFrom: z.string().optional().describe("Start date (YYYY-MM-DD)"),
     dateTo: z.string().optional().describe("End date (YYYY-MM-DD)"),
-    street: z.string().optional().describe("Street name filter, matched anywhere inside the name (e.g. 'Puławska', 'Aleja Waszyngtona'). Give it in the NOMINATIVE and with its Polish diacritics — matching is literal, so 'Karmelickiej' does not find 'Karmelicka' and 'Marszalkowska' does not find 'Marszałkowska'. Either mistake answers with nothing, which reads exactly like 'no such transactions'."),
-    buildingNumber: z.string().optional().describe("Building/house number (e.g. '30', '12A'). Requires location or street to be set."),
-    parcelId: z.string().optional().describe("Exact parcel ID as returned in search results (e.g. '146518_8.0108.27'). Must match exactly - copy from a previous search result's parcel_id field."),
+    street: z.string().optional().describe("Street name, matched anywhere inside the name. Give the NOMINATIVE with Polish diacritics - matching is literal ('Karmelickiej' does not find 'Karmelicka'); a miss looks exactly like 'no such transactions'."),
+    buildingNumber: z.string().optional().describe("Building/house number (e.g. '30', '12A'). Requires location or street."),
+    parcelId: z.string().optional().describe("Exact parcel ID, copied from a search result's parcel_id field (e.g. '146518_8.0108.27')."),
     minArea: z.number().optional().describe("Minimum area in m²"),
     maxArea: z.number().optional().describe("Maximum area in m²"),
     landUse: landUseParam,
     buildingStoreys: buildingStoreysParam,
     minFootprintArea: minFootprintAreaParam,
     maxFootprintArea: maxFootprintAreaParam,
+    excludeFractionalShares: excludeFractionalSharesParam,
     limit: z.number().min(1).max(50).default(10)
       .describe("Number of results (1-50, default 10)"),
     sort: z.enum(["price", "date", "area", "pricePerM2", "district", "rooms", "floor"]).default("date")
@@ -310,6 +500,7 @@ Location matches TERYT districts only - for neighborhoods (osiedla), use search_
       .describe("Sort order (default: desc)"),
     page: z.number().min(1).default(1).optional()
       .describe("Page number for pagination (default: 1)"),
+    summaryOnly: z.boolean().optional().describe(SUMMARY_ONLY_DESCRIPTION),
   },
   { readOnlyHint: true, destructiveHint: false, title: "Search Real Estate Transactions" },
   async (params) =>
@@ -360,16 +551,22 @@ Location matches TERYT districts only - for neighborhoods (osiedla), use search_
         buildingStoreys: params.buildingStoreys?.join(","),
         minFootprintArea: params.minFootprintArea,
         maxFootprintArea: params.maxFootprintArea,
+        excludeFractionalShares: params.excludeFractionalShares,
+        // Default the summary median to a 24-month window UNLESS the caller set their own dateFrom
+        // (then their window governs). The rows endpoint ignores this param.
+        medianWindowMonths: params.dateFrom ? undefined : 24,
         limit: params.limit,
         sort: params.sort,
         order: params.order ?? "desc",
         page: params.page,
       };
-      const [txResult, summaryResult] = await Promise.all([
+      if (params.summaryOnly) return summaryOnlyResponse(txParams, params, apiKey, params.location);
+      const [txResult, summaryOutcome] = await Promise.all([
         getTransactions(txParams, apiKey),
-        getTransactionsSummary(txParams, apiKey).catch(() => null),
+        settleSummary(getTransactionsSummary(txParams, apiKey)),
       ]);
-      return textResponse(formatTransactionList(txResult.data, summaryResult?.data ?? null) + formatCreditFooter(txResult.creditInfo));
+      const note = summaryNote(summaryOutcome, "search_transactions", "limit and pagination");
+      return textResponse(note + formatTransactionList(txResult.data, summaryOutcome.failed ? null : summaryOutcome.summary, params.location) + landUseHint(params.propertyType, params.landUse?.join(",")) + mpzpWarning(params.mpzpDesignation) + listAndSummaryFooter(txResult.creditInfo, summaryOutcome));
     }),
 );
 
@@ -377,21 +574,41 @@ Location matches TERYT districts only - for neighborhoods (osiedla), use search_
 
 server.tool(
   "get_price_statistics",
-  `Get price per m² statistics by location for residential apartments in Poland.
-Note: only covers residential units (lokale mieszkalne). For other property types, use search_transactions.
-'Warszawa'/'Kraków'/'Łódź' auto-expand to all sub-districts (Warszawa=19, Kraków=5, Łódź=6). Other names use partial match.
-Data quality: based on transaction prices from notarial deeds, not asking/listing prices. Coverage varies by county (some have data gaps of 5+ years).
-${MARKET_CAVEAT}`,
+  `Price per m² statistics for residential apartments (lokale mieszkalne) by location; for other property types use search_transactions.
+Default window: last 24 months (same as the search_transactions median); period="all" for full history. The response states the period used.
+'Warszawa'/'Kraków'/'Łódź' auto-expand to all sub-districts; other names use partial match. Based on notarial-deed prices, not asking prices; coverage varies by county (some have data gaps of 5+ years).`,
   {
     location: z.string().optional().describe(
-      "Filter by location name. 'Warszawa'/'Kraków'/'Łódź' auto-expand to all sub-districts. Other names use case-insensitive partial match (e.g. 'Wrocł' matches 'Wrocław'). Omit for all Poland.",
+      "Location name; 'Warszawa'/'Kraków'/'Łódź' expand to all sub-districts, other names use case-insensitive partial match (e.g. 'Wrocł' matches 'Wrocław'). Omit for all Poland.",
+    ),
+    period: z.enum(["24m", "all"]).optional().describe(
+      'Window: "24m" (default) = last 24 months, "all" = full history. Ignored when dateFrom or dateTo is set.',
+    ),
+    dateFrom: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "dateFrom must be YYYY-MM-DD").optional().describe(
+      "Custom window start, YYYY-MM-DD. Overrides period.",
+    ),
+    dateTo: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "dateTo must be YYYY-MM-DD").optional().describe(
+      "Custom window end, YYYY-MM-DD, inclusive (default today). Overrides period.",
     ),
   },
   { readOnlyHint: true, destructiveHint: false, title: "Price per m² Statistics" },
   async (params) =>
     withErrorHandling("get_price_statistics", apiKey, async () => {
       requireApiKey(apiKey);
-      const { data: allRows, creditInfo } = await getPricePerM2(apiKey);
+      const period = resolvePriceStatsPeriod(params);
+      let priceRows;
+      try {
+        priceRows = await getPricePerM2(apiKey, { dateFrom: period.dateFrom, dateTo: period.dateTo });
+      } catch (error) {
+        // 503 + Retry-After: a retry will succeed.
+        if (error instanceof ApiHttpError && error.status === 503 && error.retryAfterSeconds !== undefined) {
+          return textResponse(
+            `Figures for this period are being prepared right now. Repeat the same call in about ${error.retryAfterSeconds} s.`,
+          );
+        }
+        throw error;
+      }
+      const { data: allRows, creditInfo } = priceRows;
       let rows = allRows;
       if (params.location) {
         // City keys (Warszawa/Kraków/Łódź) resolve from the static
@@ -414,7 +631,7 @@ ${MARKET_CAVEAT}`,
           }
         }
       }
-      return textResponse(formatPriceStats(rows, params.location) + formatCreditFooter(creditInfo));
+      return textResponse(formatPriceStats(rows, params.location, period) + formatCreditFooter(creditInfo));
     }),
 );
 
@@ -422,79 +639,94 @@ ${MARKET_CAVEAT}`,
 
 server.tool(
   "get_price_distribution",
-  `Get price distribution histogram showing how many transactions fall into each price range.
-Useful for understanding the overall market price structure in Poland.
-${MARKET_CAVEAT}`,
+  `National histogram (all Poland) of transactions per price range - use it for the overall price structure of the market. No location filter (location/teryt are ignored); for one place use get_price_statistics or search_transactions.`,
   {
     bins: z.number().min(5).max(50).default(20)
       .describe("Number of price bins (5-50, default 20)"),
     maxPrice: z.number().default(3_000_000)
       .describe("Maximum price to include (default 3,000,000 PLN)"),
+    // Declared only so they survive validation: an undeclared key is stripped silently and the caller
+    // would never learn the histogram is national.
+    location: z.string().optional().describe("Ignored: histogram is national."),
+    teryt: z.string().optional().describe("Ignored: histogram is national."),
   },
   { readOnlyHint: true, destructiveHint: false, title: "Price Distribution Histogram" },
   async (params) =>
     withErrorHandling("get_price_distribution", apiKey, async () => {
       requireApiKey(apiKey);
       const { data: bins, creditInfo } = await getPriceHistogram(params.bins, params.maxPrice, apiKey);
-      return textResponse(formatHistogram(bins) + formatCreditFooter(creditInfo));
+      const location = params.location?.trim();
+      const teryt = params.teryt?.trim();
+      const ignored = [
+        location ? `location '${sanitizeInput(location)}'` : "",
+        teryt ? `teryt '${sanitizeInput(teryt)}'` : "",
+      ].filter(Boolean);
+      const note = ignored.length > 0
+        ? `Note: this histogram is national (all Poland); ${ignored.join(" and ")} ${ignored.length > 1 ? "were" : "was"} not applied.\n\n`
+        : "";
+      return textResponse(note + formatHistogram(bins) + formatCreditFooter(creditInfo));
     }),
 );
 
 // ── Tool 4: search_by_area ──────────────────────────────────────────
 
+// The radius is turned into a bounding box, not a circle - say so, or corner results look like bugs.
+const BBOX_NOTE = "\n\nArea approximated by a bounding box around the radius (corners extend beyond radiusKm).";
+
+// Fixed page size; the caps bound how deep a caller can page.
+const PAGE_SIZE = 50;
+const AREA_MAX_PAGE = 10;
+const POLYGON_MAX_PAGE = 20;
+const AREA_PAGE_COST_NOTE = "Each page is a separate call billed like the first (2 + 1 API tokens).";
+const POLYGON_PAGE_COST_NOTE = "Each page is a separate call billed like the first (5 API tokens).";
+
+function pageParam(maxPage: number) {
+  return z.number().int().min(1).max(maxPage).optional()
+    .describe(`Page 1-${maxPage} (${PAGE_SIZE} rows).`);
+}
+
 server.tool(
   "search_by_area",
-  `Search real estate transactions within a geographic radius.
-Returns TRANSACTIONS — deeds and prices — despite the name. For the land plots themselves in an area, use list_parcels_in_area.
-Best tool for neighborhood/osiedle searches (neighborhoods are not TERYT districts).
-Radius guide: 0.3-0.5 km for a street, 0.5-1 km for a neighborhood, 2-5 km for a city area.
-Example: apartments in Wrocław's Nowy Dwór (lat 51.143, lng 16.993, radiusKm=0.7).
-Area filters (minArea/maxArea) work for all propertyType values.
-Permalink: every result is shareable on the map. From a result's "id:" line and its "Location: <A>°N, <B>°E" line, build https://cenogram.pl/ceny-transakcyjne?src=${channelSrc()}#v=1&lat=<A>&lng=<B>&z=16&tx=<id> (drop the °N/°E; lat = the °N number, lng = the °E number) — opens that exact transaction on the map. Omit &tx=<id> for the area only.
-Field provenance: values are from the notarial deed (RCN) by default; computed values (parcel area summed across plots or converted from hectares, an inferred/reclassified property type) and approximated streets are flagged inline with a neutral [...] note.`,
+  `Find transactions within a radius of a point - the tool for neighborhoods/osiedla (not TERYT districts) and street-level searches. Returns TRANSACTIONS (deeds and prices), despite the name; for the land plots themselves in an area use list_parcels_in_area.
+Radius: 0.3-0.5 km for a street, 0.5-1 km for a neighborhood, 2-5 km for a city area; the area is a bounding box around the radius, so corners extend beyond radiusKm. Take coordinates from the user, never invent them. minArea/maxArea work for every propertyType. Costs 3 API tokens (1 with summaryOnly).
+Permalink to a result: https://cenogram.pl/ceny-transakcyjne?src=${channelSrc()}#v=1&lat=<A>&lng=<B>&z=16&tx=<id> (<id> from the "id:" line, <A>/<B> from "Location: <A>°N, <B>°E"; omit &tx=<id> for the area only).`,
   {
     latitude: z.number().min(49).max(55)
       .describe("Latitude (Poland range: 49-55)"),
     longitude: z.number().min(14).max(25)
       .describe("Longitude (Poland range: 14-25)"),
     radiusKm: z.number().min(0.1).max(50).default(2)
-      .describe("Search radius in km (0.1-50, default 2). Use 0.5-1 for neighborhoods, 0.3-0.5 for streets."),
+      .describe("Search radius in km (0.1-50, default 2)."),
     propertyType: z.enum(["land", "building", "developed_land", "unit"]).optional()
       .describe("Property type filter"),
-    marketType: z.enum(["primary", "secondary"]).optional()
-      .describe("Market type: primary (developer) or secondary (resale). ~55% of records have unknown market type and will be excluded when this filter is used."),
-    unitFunction: z.enum(["residential", "commercial", "office", "production", "garage", "other", "unknown"]).optional()
-      .describe("Unit/apartment function filter. 'unknown' = no function recorded (NULL); without it such rows are excluded. Garages appear only when 'garage' is selected, not via 'unknown'."),
-    buildingType: z.enum(["residential", "commercial", "industrial", "transport", "office", "warehouse", "education_sports", "farm_utility", "hospital", "other_nonresidential", "unknown"]).optional()
-      .describe("Building type filter (PKOB classification). 'unknown' = no type recorded (NULL); without it such rows are excluded (~39% of buildings have no type)."),
-    ownershipType: z.array(z.enum(["land_ownership", "perpetual_usufruct", "cooperative_ownership", "unit_sale", "ownership", "unit_ownership_with_appurtenant_right", "building_ownership_with_appurtenant_right", "unknown"])).optional()
-      .describe("Ownership / legal-right type filter (rodzaj prawa do nieruchomości). land_ownership; perpetual_usufruct (użytkowanie wieczyste — covers both registry codes for this right); cooperative_ownership; unit_sale; ownership; unit_ownership_with_appurtenant_right; building_ownership_with_appurtenant_right. 'unknown' = no right recorded (NULL). Multi-select; e.g. ['land_ownership','perpetual_usufruct'] to compare ownership vs perpetual usufruct on undeveloped land."),
+    marketType: marketTypeParam,
+    unitFunction: unitFunctionParam,
+    buildingType: buildingTypeParam,
+    ownershipType: ownershipTypeParam,
+    mpzpDesignation: mpzpDesignationRefParam,
     minPrice: z.number().optional().describe("Minimum price in PLN"),
     maxPrice: z.number().optional().describe("Maximum price in PLN"),
     minArea: z.number().optional()
-      .describe("Minimum area in m² (usable_area_m2 for units, parcel_area for land)"),
+      .describe("Minimum area in m² (usable area for units, parcel area for land)"),
     maxArea: z.number().optional()
       .describe("Maximum area in m²"),
     dateFrom: z.string().optional().describe("Start date (YYYY-MM-DD)"),
     dateTo: z.string().optional().describe("End date (YYYY-MM-DD)"),
-    transactionType: z.array(z.enum(["free_market", "auction", "non_auction", "subsidized", "public_purpose", "foreclosure", "unknown"])).optional()
-      .describe("Transaction type filter. For market analysis, ALWAYS specify to exclude non-market transactions."),
-    rooms: z.array(z.enum(["1", "2", "3", "4", "5", "6", "7", "8plus", "unknown"])).optional()
-      .describe("Number of rooms (izby) filter, residential units only. Multi-select; '8plus' means 8 or more, 'unknown' = no room count recorded (NULL). E.g. ['2','3'] for 2-3 izby flats. Without 'unknown', rows with no room count are excluded."),
-    floor: z.array(z.string().regex(/^(-?\d+|\d+plus|unknown)$/i, "Invalid floor token - use an integer (e.g. '2','0','-1'), 'Nplus' (e.g. '10plus'), or 'unknown'.")).optional()
-      .describe("Floor of the unit (piętro lokalu, residential). Multi-select buckets: exact integers incl. '0' (parter) and negatives e.g. '-1' (basement), 'Nplus' e.g. '10plus' = 10 or more, '0plus' = ground and above, 'unknown' = no floor recorded (NULL). E.g. ['0','1','2'] for ground-to-2nd floor. Building storeys are a different attribute. Without 'unknown', rows with no floor are excluded."),
-    floodRisk: z.array(z.enum(["low", "medium", "high"])).optional()
-      .describe("Flood-hazard filter. high = most frequent flooding (~1-in-10-year), medium (~1-in-100-year), low = rarest (~1-in-500-year). Selects ONLY transactions whose land sits in a mapped flood zone; absence of a zone is never asserted as 'safe'. Multi-select; e.g. ['medium','high'] = at least medium risk."),
-    heritageStatus: z.array(z.enum(["listed", "zone"])).optional()
-      .describe("Heritage-listing filter. listed = a protected monument on/at the property's land; zone = the land lies within a protected urban layout or the designated surroundings of a monument. Selects ONLY transactions where a listing was detected; absence of a detection is never asserted as 'not listed'. Multi-select; e.g. ['listed'] = individually listed properties only."),
-    landslideRisk: z.array(z.enum(["landslide", "threatened"])).optional()
-      .describe("Landslide-hazard filter, from official landslide-hazard maps (1:10,000 scale). 'landslide' = the land intersects a mapped landslide area; 'threatened' = an area threatened by mass movements. Selects ONLY transactions whose land intersects a mapped hazard area — an intersection means overlap with a mapped area, not that the parcel itself is a landslide; absence of a zone is never asserted as 'safe'. Multi-select; e.g. ['landslide','threatened'] = any mapped hazard."),
+    transactionType: transactionTypeParam,
+    rooms: roomsParam,
+    floor: floorParam,
+    floodRisk: floodRiskParam,
+    heritageStatus: heritageStatusParam,
+    landslideRisk: landslideRiskParam,
     landUse: landUseParam,
     buildingStoreys: buildingStoreysParam,
     minFootprintArea: minFootprintAreaParam,
     maxFootprintArea: maxFootprintAreaParam,
+    excludeFractionalShares: excludeFractionalSharesParam,
     limit: z.number().min(1).max(50).default(20)
       .describe("Number of results (1-50, default 20)"),
+    page: pageParam(AREA_MAX_PAGE),
+    summaryOnly: z.boolean().optional().describe(SUMMARY_ONLY_DESCRIPTION),
   },
   { readOnlyHint: true, destructiveHint: false, title: "Search Transactions by Radius" },
   async (params) =>
@@ -508,6 +740,7 @@ Field provenance: values are from the notarial deed (RCN) by default; computed v
         unitFunction: mapUnitFunction(params.unitFunction),
         ownershipType: mapOwnershipTypes(params.ownershipType),
         buildingType: mapBuildingType(params.buildingType),
+        mpzpDesignation: params.mpzpDesignation,
         transactionType: mapTransactionTypes(params.transactionType),
         rooms: params.rooms?.join(","),
         floor: params.floor?.join(","),
@@ -524,15 +757,33 @@ Field provenance: values are from the notarial deed (RCN) by default; computed v
         maxFootprintArea: params.maxFootprintArea,
         dateFrom: params.dateFrom,
         dateTo: params.dateTo,
+        excludeFractionalShares: params.excludeFractionalShares,
+        // Default the summary median to a 24-month window UNLESS the caller set their own dateFrom.
+        medianWindowMonths: params.dateFrom ? undefined : 24,
         limit: params.limit,
         sort: "date",
         order: "desc" as const,
       };
-      const [txResult, summaryResult] = await Promise.all([
-        getTransactions(txParams, apiKey),
-        getTransactionsSummary(txParams, apiKey).catch(() => null),
+      if (params.summaryOnly) return summaryOnlyResponse(txParams, params, apiKey);
+      const rowParams = params.page ? { ...txParams, limit: PAGE_SIZE, page: params.page } : txParams;
+      const [txResult, summaryOutcome] = await Promise.all([
+        getTransactions(rowParams, apiKey),
+        settleSummary(getTransactionsSummary(txParams, apiKey)),
       ]);
-      return textResponse(formatTransactionList(txResult.data, summaryResult?.data ?? null) + formatCreditFooter(txResult.creditInfo));
+      const note = summaryNote(summaryOutcome, "search_by_area", params.page ? "page" : "limit");
+      // Exact total comes from the summary count; without it the rows' own (possibly estimated) total stands in.
+      const pagination = txResult.data.pagination;
+      const paging = params.page
+        ? {
+            page: params.page,
+            pageSize: PAGE_SIZE,
+            maxPage: AREA_MAX_PAGE,
+            total: summaryOutcome.failed ? pagination.total : summaryOutcome.summary.total,
+            estimated: summaryOutcome.failed && pagination.estimated === true,
+            costNote: AREA_PAGE_COST_NOTE,
+          }
+        : undefined;
+      return textResponse(note + formatTransactionList(txResult.data, summaryOutcome.failed ? null : summaryOutcome.summary, undefined, paging) + landUseHint(params.propertyType, params.landUse?.join(",")) + mpzpWarning(params.mpzpDesignation) + BBOX_NOTE + listAndSummaryFooter(txResult.creditInfo, summaryOutcome));
     }),
 );
 
@@ -540,10 +791,7 @@ Field provenance: values are from the notarial deed (RCN) by default; computed v
 
 server.tool(
   "get_market_overview",
-  `Get a comprehensive overview of the Polish real estate transaction database.
-Returns: total transaction count, date range, breakdown by property type and market type, top locations, price statistics.
-Note: data quality varies by field - marketType is unknown for ~55% of records, transaction_date missing for ~1.7%.
-${MARKET_CAVEAT}`,
+  `Start here for the shape of the whole Polish transaction database (not one place; for a place use get_price_statistics or search_transactions): total count, date range, breakdown by property and market type, top locations, price statistics. marketType is unknown for ~55% of records, transaction_date missing for ~1.7%.`,
   {},
   { readOnlyHint: true, destructiveHint: false, title: "Market Overview" },
   async () =>
@@ -558,20 +806,16 @@ ${MARKET_CAVEAT}`,
 
 server.tool(
   "list_locations",
-  `Browse locations in two modes:
-1. TERYT hierarchy (parent param): Navigate voivodeship → county → municipality → precinct. Returns TERYT codes for use in search_transactions(teryt=...).
-   - No parent: 16 voivodeships (2-digit codes)
-   - 2-digit: counties (4-digit), 4-digit: municipalities (6-digit), 6-digit: precincts
-2. Name search (search param): Look up a place by name across all levels (voivodeship, county, municipality, precinct). Each match comes with its TERYT code, its parent unit, and the exact follow-up calls to make — use teryt= for precise administrative filtering. Rows also flagged as RCN districts additionally accept the name in search_transactions(location=)/compare_locations. RCN district names that have no TERYT code are listed separately.
-If both provided, parent takes precedence.
-Returns administrative units — never streets. A street is not a level of this hierarchy and has no code of its own; to search for parcels on one, pass the name straight to list_parcels_in_area as street=.
-Use 'location' for quick city searches, 'teryt' for precise administrative filtering (avoids name ambiguity, e.g. 'Wałcz' is both a county and a municipality).`,
+  `Resolve a place name to TERYT codes, or browse the TERYT hierarchy - the first step before search_transactions (pass the returned code as teryt=).
+- search (a name): looks it up across all levels (voivodeship, county, municipality, precinct); each match carries its TERYT code, parent unit and the exact follow-up calls; exact and prefix matches come first under 'Best matches'. Rows flagged rcn_district also accept the name in search_transactions(location=) and compare_locations; RCN district names with no TERYT code are listed separately. RCN district matches also show their transaction count and date range, with a warning when the label covers only part of a gmina.
+- parent (a code): browse children - no parent = 16 voivodeships, 2-digit = counties, 4-digit = municipalities, 6-digit = precincts. parent wins when both are given.
+Returns administrative units, never streets: for parcels on a street pass the name to list_parcels_in_area as street=. Prefer teryt where a name is ambiguous ('Wałcz' is both a county and a municipality).`,
   {
     parent: z.string().min(1).optional().describe(
-      "TERYT parent code to browse children. 2-digit (voivodeship → counties), 4-digit (county → municipalities), 6-digit (municipality → precincts). Omit for all voivodeships.",
+      "TERYT parent code to browse children: 2-digit (voivodeship → counties), 4-digit (county → municipalities), 6-digit (municipality → precincts). Omit for all voivodeships.",
     ),
     search: z.string().min(1).optional().describe(
-      "Look up a place by name (case-insensitive, diacritics-insensitive partial match, e.g. 'wejher' for Wejherowo). Returns TERYT codes plus, where applicable, RCN district names. Ignored when parent is set.",
+      "Place name, case- and diacritics-insensitive partial match (e.g. 'wejher' for Wejherowo). Returns TERYT codes plus, where applicable, RCN district names. Ignored when parent is set.",
     ),
   },
   { readOnlyHint: true, destructiveHint: false, title: "List Locations & TERYT Codes" },
@@ -611,6 +855,7 @@ Use 'location' for quick city searches, 'teryt' for precise administrative filte
 
       let rcnDistricts: string[];
       let rcnCreditInfo: CreditInfo | null;
+      let rcnHasExact = false;
       const city = tryResolveCityKey(query);
       if (city) {
         rcnDistricts = city;
@@ -618,7 +863,9 @@ Use 'location' for quick city searches, 'teryt' for precise administrative filte
       } else {
         const res = await getDistricts(apiKey);
         rcnCreditInfo = res.creditInfo;
-        rcnDistricts = filterByLocation(query, res.data);
+        const ranked = rankByLocation(query, res.data);
+        rcnDistricts = ranked.names;
+        rcnHasExact = ranked.hasExact;
       }
 
       // The API requires >=2 letters/digits (punctuation yields none, mirroring the server's own
@@ -671,15 +918,35 @@ Use 'location' for quick city searches, 'teryt' for precise administrative filte
       // A name present on the TERYT side is printed there (with rcn_district); drop it from the
       // RCN-only section so it is shown once.
       const terytNames = new Set(terytItems.map((it) => stripDiacritics(it.name.toLowerCase())));
-      const rcnOnly = rcnDistricts.filter(
+      const rcnUnique = rcnDistricts.filter(
         (d) => !terytNames.has(stripDiacritics(d.toLowerCase())),
       );
+      // A city key lists its sub-districts in full; only the fragment-matched names get capped.
+      const exactPresent = rcnHasExact || terytItems.some((it) => it.match === "exact");
+      const { shown: rcnOnly, hidden: rcnHidden } = city
+        ? { shown: rcnUnique, hidden: 0 }
+        : capRcnSection(rcnUnique, exactPresent);
 
       const creditInfo = terytCreditInfo ?? rcnCreditInfo;
       if (terytItems.length === 0 && rcnOnly.length === 0) {
-        return textResponse(`No locations found matching "${query}".` + formatCreditFooter(creditInfo));
+        return textResponse(
+          `No locations found matching "${query}".\n\n${formatNeighbourhoodNote(query)}` + formatCreditFooter(creditInfo),
+        );
       }
-      return textResponse(formatLocationSearch(terytItems, rcnOnly, query) + formatCreditFooter(creditInfo));
+      // One batched lookup for every RCN label printed; any failure (older API: 404) prints the plain list.
+      const labelNames = [...new Set([
+        ...terytItems.filter((it) => it.rcn_district).map((it) => it.name),
+        ...rcnOnly,
+      ])].filter((n) => n.length <= COVERAGE_NAME_MAX_CHARS && !n.includes(",")).slice(0, COVERAGE_MAX_NAMES);
+      let coverage: LocationCoverage | undefined;
+      if (labelNames.length > 0) {
+        try {
+          coverage = buildCoverageMap((await getDistrictCoverage(labelNames, apiKey)).data.data);
+        } catch {
+          coverage = undefined;
+        }
+      }
+      return textResponse(formatLocationSearch(terytItems, rcnOnly, query, rcnHidden, coverage) + formatCreditFooter(creditInfo));
     }),
 );
 
@@ -687,16 +954,12 @@ Use 'location' for quick city searches, 'teryt' for precise administrative filte
 
 server.tool(
   "search_parcels",
-  `Search for land parcels by parcel ID prefix (autocomplete).
-Matches on the ID PREFIX only, never on an area: to list the parcels in a place or a shape use list_parcels_in_area, and to turn an address, a coordinate or 'locality + number' into one parcel use resolve_parcel.
-Returns matching parcels with their district, area, and GPS coordinates.
-Useful for finding exact parcel IDs, then searching transactions nearby.
-Example: search for parcels starting with '146518_8.01'.
-Coverage: this searches the cadastral register we hold — near-complete national coverage, though not the whole of it and not live — so an empty result more likely means a recent change or a mistyped prefix than that no such parcel exists. Do not report a missing match as "this parcel does not exist". The answer carries a corpus_coverage block with the measured figures for the county the prefix names, and resolve_parcel with the FULL id can still confirm and add a parcel we do not yet hold.
-Free: searching for parcels costs no API tokens.`,
+  `Autocomplete land parcels by cadastral ID PREFIX only, never by area: for the parcels in a place or shape use list_parcels_in_area; to turn a coordinate or 'locality + number' into one parcel use resolve_parcel (a street address: list_parcels_in_area). Returns matching parcels with district, area and GPS coordinates (e.g. prefix '146518_8.01').
+Coverage: the cadastral register we hold is near-complete but not live, so an empty result more likely means a recent change or a mistyped prefix than that no such parcel exists - never report it as "this parcel does not exist" (resolve_parcel with the FULL id can still confirm and add one).
+Free: costs no API tokens.`,
   {
     q: z.string().min(3).describe(
-      "Parcel ID prefix to search for (min 3 chars). E.g. '146518_8.01'",
+      "Parcel ID prefix (min 3 chars), e.g. '146518_8.01'",
     ),
     limit: z.number().min(1).max(10).default(10).optional()
       .describe("Max results (1-10, default 10)"),
@@ -715,24 +978,24 @@ Free: searching for parcels costs no API tokens.`,
 server.tool(
   "resolve_parcel",
   `Resolve a land parcel to its cadastral identity using exactly ONE of:
-- parcelId: a full cadastral id, either raw '/' form ('142907_2.0014.342/5') or URL-safe '-' form ('142907_2.0014.342-5'), or the internal UUID from search results.
-- q: a full cadastral id, a UUID, OR free-text 'locality name + parcel number' (e.g. 'Sabnie 342/5'). The name may be a gmina name or a cadastral precinct (obręb) name; matching is exact and case-insensitive, so an unusual spelling may miss. A precinct name is not unique nationwide, so an ambiguous name comes back as several candidates rather than a guess. This is NOT a street address: it is a locality name plus a PARCEL number, never a street name plus a building number. For a city address (street + building number) use list_parcels_in_area(street=, buildingNumber=) instead — resolve_parcel will not turn 'Marszałkowska 12' into a parcel.
-- lat & lng: a WGS84 point inside the parcel (returns the parcel(s) containing that point).
-Returns a list of matching parcels with district, area, and coordinates; 'truncated' when the name+number match was capped. When nothing matches, coverage is not_covered — and what that means depends on the mode. With a FULL cadastral id we confirm the parcel live and add it if it exists, so not_covered there really does mean we could not confirm one. With the DISCOVERY modes (locality name + number, or a coordinate) we only look at the register we hold — near-complete national coverage, though not the whole of it and not live — so not_covered means "not among the parcels we hold", which is a weaker statement, and a fresh change or an unusual spelling is a likelier cause than the parcel not existing. Never report it as "no such parcel". The corpus_coverage block in each answer says how much of the register was actually searched. When the lookup could not be completed at all — a live confirmation that failed, or a name carried by more precincts than one search covers and nothing found among them — coverage is not_computed instead: that is not a statement that the parcel does not exist. Matches found before such a search ran out are returned normally, with 'truncated'.
-Use this to turn an address point, a coordinate, or a locality+number into a concrete parcel id — then feed that id to search_transactions (parcelId) to see its sale history.
-Free: resolving a parcel costs no API tokens.`,
+- parcelId: a full cadastral id ('142907_2.0014.342/5' or the '-' form) or internal UUID.
+- q: a full id, a UUID, or 'locality name + parcel number' (e.g. 'Sabnie 342/5'): the name is a gmina or cadastral precinct (obręb), matched exactly, case-insensitively; a gmina name plus a number also works for a gmina made of several precincts (e.g. 'Ełk 461/3'). An ambiguous name returns several candidates, not a guess. NOT a street address: for a city address use list_parcels_in_area(street=, buildingNumber=).
+- lat & lng: a WGS84 point inside the parcel (a road parcel is flagged: the point probably fell on the street).
+Returns matching parcels with district, area and coordinates; 'truncated' when capped.
+not_covered: for a FULL id it means we could not confirm the parcel live; in the DISCOVERY modes (name + number, coordinate) only "not among the parcels we hold" (near-complete, not live) - a fresh change or an unusual spelling is likelier than a missing parcel, so never report "no such parcel". not_computed = the lookup could not finish, also not a finding. corpus_coverage says how much of the register was searched.
+Then feed the id to search_transactions(parcelId) for its sale history. Free.`,
   {
     q: z.string().max(200).optional().describe(
-      "Full cadastral id, a UUID, or 'locality name + parcel number' (e.g. 'Sabnie 342/5') — the name may be a gmina or a cadastral precinct (obręb). NOT a street address: for a street + building number use list_parcels_in_area instead. Mutually exclusive with parcelId and lat/lng.",
+      "Full cadastral id, UUID, or 'locality name + parcel number' (e.g. 'Sabnie 342/5'); not a street address. Exclusive with parcelId and lat/lng.",
     ),
     parcelId: z.string().max(200).optional().describe(
-      "Full cadastral id (slash or dash form) or internal UUID. Mutually exclusive with q and lat/lng.",
+      "Full cadastral id (slash or dash form) or internal UUID. Exclusive with q and lat/lng.",
     ),
     lat: z.number().min(-90).max(90).optional().describe(
-      "Latitude WGS84. Must be paired with lng. Mutually exclusive with q and parcelId.",
+      "Latitude WGS84; pair with lng. Exclusive with q and parcelId.",
     ),
     lng: z.number().min(-180).max(180).optional().describe(
-      "Longitude WGS84. Must be paired with lat. Mutually exclusive with q and parcelId.",
+      "Longitude WGS84; pair with lat. Exclusive with q and parcelId.",
     ),
   },
   { readOnlyHint: true, destructiveHint: false, title: "Resolve Land Parcel" },
@@ -756,10 +1019,10 @@ Free: resolving a parcel costs no API tokens.`,
       if ((hasLat || hasLng) && !(hasLat && hasLng)) {
         return textResponse("lat and lng must be provided together.");
       }
-      const { data, creditInfo } = await resolveParcel(
+      const { data, creditInfo } = await withLocationErrors("resolve_parcel", {}, () => resolveParcel(
         { q: params.q, parcelId: params.parcelId, lat: params.lat, lng: params.lng },
         apiKey,
-      );
+      ));
       return textResponse(formatParcelResolve(data) + formatCreditFooter(creditInfo));
     }),
 );
@@ -768,15 +1031,15 @@ Free: resolving a parcel costs no API tokens.`,
 
 server.tool(
   "get_parcel_report",
-  `The whole dossier for one land parcel in a single call: the parcel core (location, area, land use, plan designation), all thirteen enrichment layers (flood risk, heritage listing, landslide risk, subsurface: mining terrains and major groundwater reservoirs, nuisance surroundings, public-transport access, general-plan zoning, buildings on the parcel, recent building activity, agricultural-land eligibility, official land-use & soil-quality classification with its re-designation consequences where the county publishes it, nature: nearby forest and protected areas, roads: geometric road-access evidence measured from carriageway centrelines, which is not a determination of legal access), the parcel's transaction history (newest first, up to 20), a local price context (median zł/m² for the county and the locality over the last 12 months) and a municipal context (a headline demographic/economic subset plus upcoming-infrastructure signals for the gmina).
-Address it by a full cadastral id in the natural '/' form ('142907_2.0014.342/5'), the URL-safe '-' form, or the internal UUID from a search or resolve result.
-Each section carries its own state, shown explicitly: covered = a definitive result; covered_no_data = the parcel was checked and nothing was found (still billed); not_covered = outside our data (refunded); not_computed = a live computation could not finish in time (refunded — the rest of the report still returns, so a report can be partial). The two context sections instead use full / low_sample / suppressed / no_data.
-The buildings section additionally reports how many of the buildings could be given a construction-age estimate from building-permit records. That is an ESTIMATE with an interval, never a registry construction date, and the records only start in 2016, so for most buildings the answer is that the year could not be established — which is stated rather than omitted.
-Prefer this over calling the per-layer parcel tools one by one — it is one call at a flat price and never costs more than the sum of its parts. Use resolve_parcel first when you only have an address, a coordinate, or a 'locality + number'.
-Costs 45 API tokens. Billing is by outcome (see the billing line on the response): a parcel that cannot be resolved is fully refunded; a resolved parcel where no layer had data is billed only the core floor (1 token) with the rest refunded; a resolved parcel with at least one covered layer is billed in full.`,
+  `The whole dossier for one land parcel in one call - prefer it over the per-layer parcel tools. Contains the parcel core (location, area, land use, plan designation); thirteen layers (flood, heritage, landslide, subsurface, nuisance surroundings, transit, general-plan zoning, buildings, building activity, agricultural eligibility, land-use and soil classification, nature, road access); the parcel's transactions (newest first, up to 20); local price context (county and gmina median zł/m², last 12 months); municipal context (demographics, infrastructure signals); and a parcel-shape section (outline geometry only).
+For a coordinate or 'locality + number' use resolve_parcel first; for a street address use list_parcels_in_area.
+Every section has its own state: covered; covered_no_data (checked, nothing found; billed); not_covered (outside our data; refunded); not_computed (did not finish in time; refunded - the report can be partial). Context sections use full / low_sample / suppressed / no_data (shape: full / no_data). Long lists are capped with a count of the rest.
+Reading it: the nearby designation signal comes from RCN deeds of neighbouring land, not from the planning register - it describes the neighbourhood, not this parcel; confirm with the local plan (MPZP) or a zoning decision. Neither it nor the shape section (geometry only) says whether a parcel can be built on or divided. Construction age is an ESTIMATE with an interval (permit records start in 2016), often "not established".
+Costs 45 API tokens, billed by outcome: an unresolvable parcel is refunded in full; a resolved parcel with no layer data pays only the 1-token core floor; with at least one covered layer, in full.
+Requests are rate-limited per API key per minute, so parallel agents sharing one key share the same limit. On a "Too many requests" response, wait the given seconds and retry sequentially.`,
   {
     parcelId: z.string().min(3).max(200).describe(
-      "Full cadastral id ('142907_2.0014.342/5' or the '-' form) or the internal UUID from a search/resolve result.",
+      "Full cadastral id ('142907_2.0014.342/5' or the '-' form) or internal UUID.",
     ),
   },
   { readOnlyHint: true, destructiveHint: false, title: "Get Parcel Report" },
@@ -803,15 +1066,13 @@ Costs 45 API tokens. Billing is by outcome (see the billing line on the response
 
 server.tool(
   "get_parcel_land_class",
-  `The official land-use and soil-quality classification recorded for one land parcel, and what it implies for taking the land out of agricultural use. Returns the land-use categories and the soil-quality grades entered for the parcel, whether any of those grades is in the protected I-III range, whether the parcel lies inside a city's administrative boundary (which changes the rule that applies), and a note on the re-designation consequences with the date the legal state behind it was verified.
-Use it when the question is specifically about the classification or about re-designating farmland. For anything else about the parcel — price history, flood risk, zoning, buildings, permits, surroundings, transport — call get_parcel_report instead: it is one call at a flat price and includes this same classification as one of its sections.
-Address it by a full cadastral id in the natural '/' form ('142907_2.0014.342/5'), the URL-safe '-' form, or the internal UUID from a search or resolve result.
-The categories and grades come back as SETS. The source records no area for any of them, so the answer can never say which category prevails on the parcel or give a share — a parcel listing two categories has both, in unknown proportion.
-This layer answers only where the county publishes the classification; many counties, including several large cities, do not. Four states, told apart explicitly: covered = the county publishes it and the parcel has an entry; covered_no_data = the county publishes it and this parcel has none (a checked negative — still billed); not_covered = the county does not publish it, or we do not hold the parcel (refunded); not_computed = the lookup could not finish in time (refunded — retry).
+  `The official land-use and soil-quality classification of one land parcel and what it implies for taking the land out of agricultural use. Use it only for that question; for anything else about the parcel (prices, flood, zoning, buildings, permits, surroundings, transport) call get_parcel_report (one flat-price call, includes this classification).
+Returns the land-use categories and soil grades entered for the parcel, whether any grade is in the protected I-III range, whether the parcel is inside a city boundary (changes the rule), and a re-designation note with the date the legal state was verified. They come back as SETS: the source records no area for any of them, so the answer can never say which category prevails or give a share.
+Answers only where the county publishes the classification; many counties, including several large cities, do not. States: covered; covered_no_data (published, this parcel has none; billed); not_covered (county does not publish it, or we do not hold the parcel; refunded); not_computed (did not finish in time; refunded, retry).
 Costs 4 API tokens, refunded on not_covered and not_computed. Not legal advice, and never a statement that a parcel can or cannot be built on.`,
   {
     parcelId: z.string().min(3).max(200).describe(
-      "Full cadastral id ('142907_2.0014.342/5' or the '-' form) or the internal UUID from a search/resolve result.",
+      "Full cadastral id ('142907_2.0014.342/5' or the '-' form) or internal UUID.",
     ),
   },
   { readOnlyHint: true, destructiveHint: false, title: "Get Parcel Land Classification" },
@@ -849,6 +1110,9 @@ const STREET_MIN_WORD_CHARS = 4;
 // The TERYT name index answers only queries of at least this many letters/digits; a shorter one is
 // served from RCN alone rather than provoking the server's 400.
 const TERYT_SEARCH_MIN_WORD_CHARS = 2;
+// The coverage route refuses more names, or a longer one, with a 400 for the WHOLE request; trim here instead.
+const COVERAGE_MAX_NAMES = 200;
+const COVERAGE_NAME_MAX_CHARS = 100;
 const ADDRESS_FILTER_MAX_CHARS = 200;
 
 /** How much of `s` an index over names can actually be searched by: letters and digits. */
@@ -867,56 +1131,37 @@ function terytReachesCounty(teryt: string): boolean {
 
 server.tool(
   "list_parcels_in_area",
-  `List cadastral parcels in an area — the land plots themselves, NOT transactions.
-For deeds and prices in an area use search_by_area or search_by_polygon instead. To look up a parcel by an id prefix use search_parcels; to turn one address, coordinate or 'locality + number' into a parcel use resolve_parcel; for everything known about a single parcel use get_parcel_report.
+  `List cadastral parcels in an area - the land plots themselves, NOT transactions (for deeds and prices use search_by_area or search_by_polygon). For an id prefix use search_parcels; for a coordinate or 'locality + number' use resolve_parcel (a street address goes here, via street= and buildingNumber=); for everything about one parcel use get_parcel_report.
 
-Name the area in one of five ways — at least one is required:
-- teryt: administrative code prefix at any level (2 digits = voivodeship, 4 = county, 6 = municipality, finer allowed); comma-separate several. Browse codes with list_locations.
-- location: a county or city NAME, resolved to its code. A name shared by two counties comes back as an error listing both, never as a guess.
-- bbox: "minLng,minLat,maxLng,maxLat" in WGS84.
-- lat + lng + radiusKm: a circle (all three together).
-- polygon: a GeoJSON Polygon, for a drawn shape. Pass it on its own.
-A bbox and a circle cannot be combined — together they would mean the overlap of a rectangle and a circle, which is rarely the question.
+Name the area (at least one): teryt (codes from list_locations); location (county, city or gmina NAME; a name shared by several units is an error listing the candidates, never a guess); bbox; lat + lng + radiusKm (a circle; not together with a bbox); polygon (on its own).
 
-Two shapes of answer, priced differently:
-- Default: the LIGHT list — parcel id, district and centre point per row, with no outline and no surface. 2 API tokens. Pages by cursor: when more parcels match, the answer hands you an opaque cursor to pass back as cursor=.
-- includeGeometry=true (needs a bbox), or a polygon: OUTLINES — the full GeoJSON polygon of each parcel. 5 API tokens, at most 100 parcels per call (50 by default), no paging.
+Two answer shapes, priced differently: the default LIGHT list (parcel id, district, centre point, held street address; 2 API tokens; cursor paging) and OUTLINES, with includeGeometry=true (needs a bbox) or a polygon (GeoJSON polygon per parcel; 5 API tokens; max 100 parcels, 50 by default; no paging). An outline answer marked TRUNCATED is an arbitrary subset (not the first, nearest or largest): never report it as the area's parcel list, ask for a smaller area.
 
-Truncation is the normal case on outlines, not an edge case. An area the size of a city holds far more parcels than one call returns, so an outline answer is usually marked TRUNCATED and the parcels in it are an arbitrary subset — not the first, nearest or largest. Never report a truncated answer as the parcel list of an area; ask for a smaller area instead.
+Light-list filters (not on outline calls) need a narrow scope - a bbox, a circle, a location name, or a teryt of at least 4 digits (county) - and do not count as naming the area. minArea / maxArea (m²) = the registered parcel surface.
+- street: whole-word, case- and accent-insensitive ('Górna' does not find 'Podgórna'; a fragment finds nothing). Not inflected: pass the NOMINATIVE ('Karmelickiej' answers empty). An empty page is free and carries close-name suggestions - read them before concluding anything.
+- buildingNumber (needs street): exact ('12A' does not find '12a'); RCN often records compound numbers ('84/92'), so '84' will not find '84/92'. If empty, official address points are tried (still exact); if both miss, the page is empty (free) and lists the numbers held on the street.
+Most rural parcels have no street: outside towns use resolve_parcel with the precinct name and parcel number; an empty street search in the countryside says nothing about the parcel. parcel_id is returned only to API-token / OAuth callers and paid or trial accounts.
 
-minArea / maxArea (m²) filter on the registered parcel surface without returning it. They need a narrow scope — a bbox, a circle, a location name, or a teryt of at least 4 digits (county level) — and are refused elsewhere with a message saying what to add. They are not available on the outline calls.
-
-Every row of the light list carries the street address held for that parcel, whether or not you asked about one, and says where it came from: a street on record, one we worked out for a parcel the record left without a street (shown with a note saying so), or — only when a buildingNumber search on the record came back empty — one read off an official address point that falls inside the parcel (also noted). A building number is only ever on record or from that address point, so a worked-out street never carries one. When a page comes back with a requested buildingNumber, it also carries a note on which of the two the number came from. If the street exists in the area but not with that number, the answer says so instead of the generic "no such street". Most rural parcels have no street at all — for those the way in is resolve_parcel with the precinct name and the parcel number, not a street.
-- street: matches whole words of the name, case- and accent-insensitively — ${STREET_MIN_WORD_CHARS} letters or digits minimum, ${ADDRESS_FILTER_MAX_CHARS} characters maximum. It is a NAME, not a pattern: % and _ match themselves. 'Górna' finds 'ulica Górna' and 'Górna 15' but not 'Podgórna', and a fragment like 'Marsza' finds nothing. Both sources are searched at once and a parcel found in both appears once, attributed to the record. Matching folds accents, so 'karmelicka' finds 'Karmelicka' — but it does NOT inflect: pass the name in the NOMINATIVE, because an inflected form like 'Karmelickiej' answers with an empty list. That empty page costs nothing (the tokens are refunded) and carries a suggestions block with close names to retry, so read the suggestions before you conclude anything about the data.
-- buildingNumber: needs street alongside it. Against the record the match is EXACT ('12A' does not find '12a'); RCN often records a compound or split number ('84/92'), so an exact '84' will not find '84/92'. When that comes back empty, the same street+number is tried against official address points instead — that match ignores case ('12a' finds '12A') but is still exact on the number, no compound splitting, and it matches the street by the same whole-word rule as above, not a fragment ('Waszyngtona' finds 'Aleja Waszyngtona', 'szyng' does not). Only when BOTH miss does the page come back empty (the tokens are refunded), listing the numbers held on the street as suggestions to retry.
-Both need a narrow scope for the same reason minArea does — a bbox, a circle, a teryt of at least 4 digits, or a location name — and neither counts as naming the area: a common street name across the country is a national search, not a question. Neither is available on the outline calls.
-
-Parcel identity is gated: parcel_id comes back for API-token / OAuth callers and for paid or active-trial accounts, and is withheld for everyone else while the location and the outline still come back.
-
-Coverage, so you can allow for it — TWO SEPARATE GAPS:
-1. We hold near-complete coverage of the cadastral register, though not the whole of it and not live: what we hold was measured county by county on a fixed date, so a freshly split, merged or renumbered parcel may not be in yet. This applies to EVERY entrance here, teryt and location included. A short list, and the absence of a truncation marker, mean only that nothing further matched what we hold as of that measurement — never that you have every parcel in the area. Each answer carries a corpus_coverage block: for teryt and location it gives the measured parcels-held and parcels-in-register figures for the counties you asked about; for bbox, circle and polygon those figures are null, because sizing an arbitrary shape needs county boundaries we do not have — the measurement still applies, we just cannot put a number on it for that shape.
-2. Separately, the spatial entrances (bbox, circle, polygon) work off the stored outline, and a small share of the parcels we DO hold keep theirs in a coordinate system those queries cannot read — those are missing from spatial answers specifically. The teryt and location entrances never touch geometry and are unaffected BY THAT SECOND GAP; a parcel whose outline we do not hold shows up there with no location.
-Neither gap is a reason to distrust what comes back: a returned parcel is a real parcel. They are a reason never to read an empty or short answer as evidence that the land is not there.
-
-Limits: an area over ${PARCEL_AREA_MAX_KM2} km², a radius over ${PARCEL_RADIUS_MAX_KM} km (the same ground) or a polygon over 500 vertices is refused rather than scanned, and a query that outruns its time limit answers with an error asking you to narrow it.`,
+Coverage has two gaps. (1) The cadastral data we hold is near-complete but not live (measured per county; fresh splits, merges or renumbering may be missing), for EVERY entrance: a short list or no truncation marker never means you have every parcel. Each answer has a corpus_coverage block (figures for teryt/location, null for bbox/circle/polygon). (2) bbox, circle and polygon miss the few held parcels whose outline is in an unreadable coordinate system; teryt/location list those with no location. A returned parcel is real; never read an empty or short answer as proof the land is not there.
+Limits: an area over ${PARCEL_AREA_MAX_KM2} km², a radius over ${PARCEL_RADIUS_MAX_KM} km or a polygon over 500 vertices is refused.`,
   {
     teryt: z.string().max(200).optional().describe(
-      "TERYT administrative code prefix (2/4/6 digits or finer), comma-separated for several. Wins over location when both are given.",
+      "TERYT code prefix (2/4/6 digits or finer), comma-separated for several. Wins over location.",
     ),
     location: z.string().max(200).optional().describe(
-      "County, city, or district name, resolved to its TERYT code. A Warszawa district name (e.g. 'Mokotów') narrows to that district; another city's delegatura (e.g. 'Kraków-Podgórze') resolves to its parent county. An ambiguous name is an error listing the candidates.",
+      "County, city, gmina or district name, resolved to its TERYT code ('Mokotów' = that Warszawa district; 'Kraków-Podgórze' = its parent county; a gmina name answers at municipality level).",
     ),
     bbox: z.string().max(200).optional().describe(
-      `Bounding box in WGS84 as "minLng,minLat,maxLng,maxLat", covering at most ${PARCEL_AREA_MAX_KM2} km². Required for includeGeometry=true.`,
+      `Bounding box "minLng,minLat,maxLng,maxLat" (WGS84), at most ${PARCEL_AREA_MAX_KM2} km². Required for includeGeometry=true.`,
     ),
     lat: z.number().min(-90).max(90).optional().describe(
-      "Latitude of the circle centre (WGS84). Requires lng and radiusKm.",
+      "Circle centre latitude (WGS84). Needs lng and radiusKm.",
     ),
     lng: z.number().min(-180).max(180).optional().describe(
-      "Longitude of the circle centre (WGS84). Requires lat and radiusKm.",
+      "Circle centre longitude (WGS84). Needs lat and radiusKm.",
     ),
     radiusKm: z.number().positive().max(PARCEL_RADIUS_MAX_KM).optional().describe(
-      `Circle radius in km (max ${PARCEL_RADIUS_MAX_KM} — the radius covering the ${PARCEL_AREA_MAX_KM2} km² ceiling). Requires lat and lng.`,
+      `Circle radius in km (max ${PARCEL_RADIUS_MAX_KM}, the radius covering ${PARCEL_AREA_MAX_KM2} km²). Needs lat and lng.`,
     ),
     polygon: z.object({
       type: z.literal("Polygon"),
@@ -926,28 +1171,28 @@ Limits: an area over ${PARCEL_AREA_MAX_KM2} km², a radius over ${PARCEL_RADIUS_
       (poly) => poly.coordinates.reduce((sum, ring) => sum + ring.length, 0) <= 500,
       { message: "polygon exceeds 500 total vertices (sum across all rings)" },
     ).optional().describe(
-      "GeoJSON Polygon geometry. Coordinates: [longitude, latitude] pairs, first and last point identical, at most 500 vertices. Always returns outlines. Pass it instead of the other area parameters, not alongside them.",
+      "GeoJSON Polygon: [longitude, latitude] pairs, first and last point identical, max 500 vertices. Always returns outlines. Pass it instead of the other area parameters.",
     ),
     minArea: z.number().positive().optional().describe(
-      "Minimum parcel surface in m². Needs a bbox, a circle, a location name, or a teryt of at least 4 digits. Not available with includeGeometry or a polygon.",
+      "Minimum parcel surface in m². Needs a narrow scope; not with includeGeometry or a polygon.",
     ),
     maxArea: z.number().positive().optional().describe(
       "Maximum parcel surface in m². Same scope requirement as minArea.",
     ),
     street: z.string().max(ADDRESS_FILTER_MAX_CHARS).optional().describe(
-      `Street name, matched by whole words within the name, case- and accent-insensitively (min ${STREET_MIN_WORD_CHARS} letters or digits): 'Górna' finds 'ulica Górna' and 'Górna 15' but not 'Podgórna', and a fragment like 'Marsza' finds nothing. NOMINATIVE: 'Karmelickiej' does not fold to 'Karmelicka' and answers empty. Needs a bbox, a circle, a location name, or a teryt of at least ${ADDRESS_FILTER_MIN_TERYT_DIGITS} digits. Not available with includeGeometry or a polygon.`,
+      `Street name in the NOMINATIVE (min ${STREET_MIN_WORD_CHARS} letters or digits). Needs a bbox, a circle, a location name, or a teryt of at least ${ADDRESS_FILTER_MIN_TERYT_DIGITS} digits; not with includeGeometry or a polygon.`,
     ),
     buildingNumber: z.string().max(ADDRESS_FILTER_MAX_CHARS).optional().describe(
-      "Building number. Against the record the match is exact ('12A' does not find '12a') and RCN numbering is often compound ('84/92'), so an exact '84' misses '84/92'. When that comes back empty, the same number is tried against official address points instead, case-insensitively ('12a' finds '12A') but still exact, matching the street by the same whole-word rule as street, not a fragment — if that also misses, drop the number and read the numbers off the street's rows. Requires street. Same scope requirement as street.",
+      "Building number, exact; needs street, same scope requirement. If nothing is found, drop the number and read the numbers off the street's rows.",
     ),
     includeGeometry: z.boolean().optional().describe(
-      "Return each parcel's full outline instead of the light row (5 tokens instead of 2, at most 100 parcels, no paging). Requires a bbox; with a polygon the outlines come back anyway.",
+      "Return full outlines instead of the light row (5 tokens instead of 2). Requires a bbox; with a polygon outlines come back anyway.",
     ),
     limit: z.number().min(1).max(1000).optional().describe(
-      "Max parcels returned. Light list: up to 1000, default 250. Outlines: up to 100, default 50 — a larger value is clamped there.",
+      "Max parcels. Light list: up to 1000, default 250. Outlines: up to 100, default 50.",
     ),
     cursor: z.string().max(500).optional().describe(
-      "Opaque cursor from the previous light-list answer, to get the next page. Pass it back unchanged; it is not available on outline calls.",
+      "Opaque cursor from the previous light-list answer, for the next page; pass it back unchanged. Not available on outline calls.",
     ),
   },
   { readOnlyHint: true, destructiveHint: false, title: "List Parcels in an Area" },
@@ -1057,7 +1302,7 @@ Limits: an area over ${PARCEL_AREA_MAX_KM2} km², a radius over ${PARCEL_RADIUS_
         return textResponse(formatParcelFeatures(data, "the bounding box") + formatCreditFooter(creditInfo));
       }
 
-      const { data, creditInfo } = await listParcels(
+      const { data, creditInfo } = await withLocationErrors("list_parcels_in_area", { location: params.location }, () => listParcels(
         {
           teryt: params.teryt,
           location: params.location,
@@ -1073,7 +1318,7 @@ Limits: an area over ${PARCEL_AREA_MAX_KM2} km², a radius over ${PARCEL_RADIUS_
           cursor: params.cursor,
         },
         apiKey,
-      );
+      ));
       // teryt wins over location on the server, so the label has to follow the same order — naming
       // the parameter the answer did not come from would misreport what was searched.
       const area = hasTeryt ? `teryt ${sanitizeInput(params.teryt!)}`
@@ -1090,30 +1335,16 @@ Limits: an area over ${PARCEL_AREA_MAX_KM2} km², a radius over ${PARCEL_RADIUS_
     }),
 );
 
-// ── Street catalogue: answered over REST, not exposed as a tool here ──
-//
-// A caller on this side already knows the name of the street it wants — it is not typing one letter
-// at a time waiting for suggestions. Completing a partial name is an affordance of a text box with
-// a keyboard, and there is no keyboard on this side. The parcels on a named street are one call to
-// list_parcels_in_area with street=, and a catalogue lookup placed in front of that call costs a
-// turn to hand back a name the caller already had.
-//
-// getStreets() in api-client.ts and formatStreetList() in formatters.ts stay typed and tested: the
-// REST route they speak to answers a different audience (a browser typeahead), not this one.
+// ── Street catalogue: not exposed as a tool ──
+// list_parcels_in_area(street=) takes a street name directly. getStreets() in api-client.ts and
+// formatStreetList() in formatters.ts stay typed and tested.
 
 // ── Tool 8: search_by_polygon ──────────────────────────────────────
 
 server.tool(
   "search_by_polygon",
-  `Search real estate transactions within a geographic polygon.
-Returns TRANSACTIONS — deeds and prices — despite the name. For the land plots themselves inside a drawn shape, pass the same polygon to list_parcels_in_area.
-Provide a GeoJSON Polygon geometry to search within a custom area.
-Returns transactions found inside the polygon with coordinates.
-Use for precise neighborhood/osiedle boundaries. Can estimate coordinates from search_by_area results. For quick searches, start with search_by_area instead.
-Coordinates are [longitude, latitude]. First and last point must be identical.
-Permalink: every result is shareable on the map. From a result's "id:" line and its "Location: <A>°N, <B>°E" line, build https://cenogram.pl/ceny-transakcyjne?src=${channelSrc()}#v=1&lat=<A>&lng=<B>&z=16&tx=<id> (drop the °N/°E; lat = the °N number, lng = the °E number) — opens that exact transaction on the map. Omit &tx=<id> for the area only.
-Field provenance: values are from the notarial deed (RCN) by default; computed values (parcel area summed across plots or converted from hectares, an inferred/reclassified property type) and approximated streets are flagged inline with a neutral [...] note.
-Example: {"type":"Polygon","coordinates":[[[21.0,52.2],[21.01,52.2],[21.01,52.21],[21.0,52.21],[21.0,52.2]]]}`,
+  `Find transactions inside a GeoJSON Polygon - for precise neighborhood/osiedla boundaries; for a quick look start with search_by_area (its results can help estimate coordinates). Returns TRANSACTIONS (deeds and prices) with coordinates, despite the name; for the land plots inside a drawn shape pass the same polygon to list_parcels_in_area. Costs 5 API tokens.
+Permalink to a result: https://cenogram.pl/ceny-transakcyjne?src=${channelSrc()}#v=1&lat=<A>&lng=<B>&z=16&tx=<id> (<id> from the "id:" line, <A>/<B> from "Location: <A>°N, <B>°E"; omit &tx=<id> for the area only).`,
   {
     polygon: z.object({
       type: z.literal("Polygon"),
@@ -1122,25 +1353,17 @@ Example: {"type":"Polygon","coordinates":[[[21.0,52.2],[21.01,52.2],[21.01,52.21
       // Mirror of the server-side guard - keep in sync
       (poly) => poly.coordinates.reduce((sum, ring) => sum + ring.length, 0) <= 500,
       { message: "polygon exceeds 500 total vertices (sum across all rings)" },
-    ).describe("GeoJSON Polygon geometry. Coordinates: [longitude, latitude] pairs. First and last point must be identical. Max 500 vertices total."),
+    ).describe("GeoJSON Polygon: [longitude, latitude] pairs, first and last point identical, max 500 vertices total."),
     propertyType: z.enum(["land", "building", "developed_land", "unit"]).optional()
       .describe("Property type filter"),
-    marketType: z.enum(["primary", "secondary"]).optional()
-      .describe("Market type filter"),
-    unitFunction: z.enum(["residential", "commercial", "office", "production", "garage", "other", "unknown"]).optional()
-      .describe("Unit/apartment function filter. 'unknown' = no function recorded (NULL); without it such rows are excluded. Garages appear only when 'garage' is selected, not via 'unknown'."),
-    buildingType: z.enum(["residential", "commercial", "industrial", "transport", "office", "warehouse", "education_sports", "farm_utility", "hospital", "other_nonresidential", "unknown"]).optional()
-      .describe("Building type filter (PKOB classification). 'unknown' = no type recorded (NULL); without it such rows are excluded (~39% of buildings have no type)."),
-    ownershipType: z.array(z.enum(["land_ownership", "perpetual_usufruct", "cooperative_ownership", "unit_sale", "ownership", "unit_ownership_with_appurtenant_right", "building_ownership_with_appurtenant_right", "unknown"])).optional()
-      .describe("Ownership / legal-right type filter (rodzaj prawa do nieruchomości). land_ownership; perpetual_usufruct (użytkowanie wieczyste — covers both registry codes for this right); cooperative_ownership; unit_sale; ownership; unit_ownership_with_appurtenant_right; building_ownership_with_appurtenant_right. 'unknown' = no right recorded (NULL). Multi-select; e.g. ['land_ownership','perpetual_usufruct'] to compare ownership vs perpetual usufruct on undeveloped land."),
-    mpzpDesignation: z.string().optional()
-      .describe("MPZP zoning designation filter (exact match). Use 'unknown' for rows with no designation recorded (NULL); distinct from the registry code 'brakMPZPLubWZ'."),
-    transactionType: z.array(z.enum(["free_market", "auction", "non_auction", "subsidized", "public_purpose", "foreclosure", "unknown"])).optional()
-      .describe("Transaction type filter. For market analysis, ALWAYS specify to exclude non-market transactions."),
-    rooms: z.array(z.enum(["1", "2", "3", "4", "5", "6", "7", "8plus", "unknown"])).optional()
-      .describe("Number of rooms (izby) filter, residential units only. Multi-select; '8plus' means 8 or more, 'unknown' = no room count recorded (NULL). E.g. ['2','3'] for 2-3 izby flats. Without 'unknown', rows with no room count are excluded."),
-    floor: z.array(z.string().regex(/^(-?\d+|\d+plus|unknown)$/i, "Invalid floor token - use an integer (e.g. '2','0','-1'), 'Nplus' (e.g. '10plus'), or 'unknown'.")).optional()
-      .describe("Floor of the unit (piętro lokalu, residential). Multi-select buckets: exact integers incl. '0' (parter) and negatives e.g. '-1' (basement), 'Nplus' e.g. '10plus' = 10 or more, '0plus' = ground and above, 'unknown' = no floor recorded (NULL). E.g. ['0','1','2'] for ground-to-2nd floor. Building storeys are a different attribute. Without 'unknown', rows with no floor are excluded."),
+    marketType: marketTypeParam,
+    unitFunction: unitFunctionParam,
+    buildingType: buildingTypeParam,
+    ownershipType: ownershipTypeParam,
+    mpzpDesignation: mpzpDesignationRefParam,
+    transactionType: transactionTypeParam,
+    rooms: roomsParam,
+    floor: floorParam,
     minPrice: z.number().optional().describe("Minimum price in PLN"),
     maxPrice: z.number().optional().describe("Maximum price in PLN"),
     dateFrom: z.string().optional().describe("Start date (YYYY-MM-DD)"),
@@ -1153,8 +1376,10 @@ Example: {"type":"Polygon","coordinates":[[[21.0,52.2],[21.01,52.2],[21.01,52.21
     buildingStoreys: buildingStoreysParam,
     minFootprintArea: minFootprintAreaParam,
     maxFootprintArea: maxFootprintAreaParam,
+    excludeFractionalShares: excludeFractionalSharesParam,
     limit: z.number().min(1).max(3000).default(100).optional()
-      .describe("Max results (1-3000, default 100). MCP displays up to 50 transactions."),
+      .describe("Max results (1-3000); 50 shown."),
+    page: pageParam(POLYGON_MAX_PAGE),
   },
   { readOnlyHint: true, destructiveHint: false, title: "Search Transactions by Polygon" },
   async (params) =>
@@ -1183,9 +1408,14 @@ Example: {"type":"Polygon","coordinates":[[[21.0,52.2],[21.01,52.2],[21.01,52.21
         maxFootprintArea: params.maxFootprintArea,
         district: params.district,
         street: params.street,
-        limit: params.limit,
+        excludeFractionalShares: params.excludeFractionalShares,
+        // The endpoint has no offset: ask for rows 1..page*PAGE_SIZE and let the formatter slice the page.
+        limit: params.page ? Math.min(3000, params.page * PAGE_SIZE) : params.limit,
       }, apiKey);
-      return textResponse(formatSpatialResults(data) + formatCreditFooter(creditInfo));
+      const paging = params.page
+        ? { page: params.page, pageSize: PAGE_SIZE, maxPage: POLYGON_MAX_PAGE, total: data.total, costNote: POLYGON_PAGE_COST_NOTE }
+        : undefined;
+      return textResponse(formatSpatialResults(data, paging) + mpzpWarning(params.mpzpDesignation) + formatCreditFooter(creditInfo));
     }),
 );
 
@@ -1193,12 +1423,8 @@ Example: {"type":"Polygon","coordinates":[[[21.0,52.2],[21.01,52.2],[21.01,52.21
 
 server.tool(
   "compare_locations",
-  `Compare real estate statistics across multiple locations side-by-side.
-Provide 2-5 district names to compare median price/m², average area, and transaction counts.
-This tool matches on name only. Call list_locations(search=...) first: use names it flags as RCN districts (rcn_district) — other names (most TERYT unit names) silently return no data here.
-Requires at least one filter besides districts (e.g., propertyType).
-Example: compare Mokotów, Wola, Ursynów for apartments.
-${MARKET_CAVEAT}`,
+  `Compare 2-5 districts side-by-side: median price/m², average area and transaction counts.
+Matches names only: call list_locations(search=...) first and use names it flags as RCN districts (rcn_district) - other names (most TERYT unit names) silently return no data. Needs at least one filter besides districts (e.g. propertyType).`,
   {
     districts: z.string()
       // Mirror of the server-side guard - server dedupes then enforces 1..5; MCP requires 2..5 for compare semantics
@@ -1209,21 +1435,15 @@ ${MARKET_CAVEAT}`,
         },
         { message: "districts must be 2-5 unique comma-separated names (e.g. 'Mokotów,Wola,Ursynów')" },
       )
-      .describe("Comma-separated district names to compare (2-5, must be unique). E.g. 'Mokotów,Wola,Ursynów'"),
+      .describe("Comma-separated district names (2-5, unique), e.g. 'Mokotów,Wola,Ursynów'"),
     propertyType: z.enum(["land", "building", "developed_land", "unit"]).optional()
       .describe("Property type filter (recommended - API requires at least one filter)"),
-    marketType: z.enum(["primary", "secondary"]).optional()
-      .describe("Market type filter"),
-    unitFunction: z.enum(["residential", "commercial", "office", "production", "garage", "other", "unknown"]).optional()
-      .describe("Unit/apartment function filter. 'unknown' = no function recorded (NULL); without it such rows are excluded. Garages appear only when 'garage' is selected, not via 'unknown'."),
-    buildingType: z.enum(["residential", "commercial", "industrial", "transport", "office", "warehouse", "education_sports", "farm_utility", "hospital", "other_nonresidential", "unknown"]).optional()
-      .describe("Building type filter (PKOB classification). 'unknown' = no type recorded (NULL); without it such rows are excluded (~39% of buildings have no type)."),
-    ownershipType: z.array(z.enum(["land_ownership", "perpetual_usufruct", "cooperative_ownership", "unit_sale", "ownership", "unit_ownership_with_appurtenant_right", "building_ownership_with_appurtenant_right", "unknown"])).optional()
-      .describe("Ownership / legal-right type filter (rodzaj prawa do nieruchomości). land_ownership; perpetual_usufruct (użytkowanie wieczyste — covers both registry codes for this right); cooperative_ownership; unit_sale; ownership; unit_ownership_with_appurtenant_right; building_ownership_with_appurtenant_right. 'unknown' = no right recorded (NULL). Multi-select; e.g. ['land_ownership','perpetual_usufruct'] to compare ownership vs perpetual usufruct on undeveloped land."),
-    mpzpDesignation: z.string().optional()
-      .describe("MPZP zoning designation prefix filter (e.g. 'terenRolniczy', 'budownictwoMieszkanioweJednorodzinne', 'budownictwoMieszkanioweWielorodzinne'). Use 'unknown' for rows with no designation recorded (NULL); distinct from the registry code 'brakMPZPLubWZ'."),
-    transactionType: z.array(z.enum(["free_market", "auction", "non_auction", "subsidized", "public_purpose", "foreclosure", "unknown"])).optional()
-      .describe("Transaction type filter. For market analysis, ALWAYS specify to exclude non-market transactions."),
+    marketType: marketTypeParam,
+    unitFunction: unitFunctionParam,
+    buildingType: buildingTypeParam,
+    ownershipType: ownershipTypeParam,
+    mpzpDesignation: mpzpDesignationRefParam,
+    transactionType: transactionTypeParam,
     minPrice: z.number().optional().describe("Minimum price in PLN"),
     maxPrice: z.number().optional().describe("Maximum price in PLN"),
     dateFrom: z.string().optional().describe("Start date (YYYY-MM-DD)"),
@@ -1231,19 +1451,17 @@ ${MARKET_CAVEAT}`,
     minArea: z.number().optional().describe("Minimum area in m²"),
     maxArea: z.number().optional().describe("Maximum area in m²"),
     street: z.string().optional().describe("Street name filter"),
-    rooms: z.array(z.enum(["1", "2", "3", "4", "5", "6", "7", "8plus", "unknown"])).optional()
-      .describe("Number of rooms (izby) filter, residential units only. Multi-select; '8plus' means 8 or more, 'unknown' = no room count recorded (NULL). E.g. ['2','3'] for 2-3 izby flats. Without 'unknown', rows with no room count are excluded."),
-    floor: z.array(z.string().regex(/^(-?\d+|\d+plus|unknown)$/i, "Invalid floor token - use an integer (e.g. '2','0','-1'), 'Nplus' (e.g. '10plus'), or 'unknown'.")).optional()
-      .describe("Floor of the unit (piętro lokalu, residential). Multi-select buckets: exact integers incl. '0' (parter) and negatives e.g. '-1' (basement), 'Nplus' e.g. '10plus' = 10 or more, '0plus' = ground and above, 'unknown' = no floor recorded (NULL). E.g. ['0','1','2'] for ground-to-2nd floor. Building storeys are a different attribute. Without 'unknown', rows with no floor are excluded."),
+    rooms: roomsParam,
+    floor: floorParam,
     includeDemographics: z.boolean().optional()
-      .describe("Add a GUS BDL demographics block per district (county-level: population density, wages, unemployment, median age, plus a few cross-source ratios like price-to-income). Districts that don't resolve to a county are omitted from the demographics section."),
+      .describe("Add a GUS BDL demographics block per district (county-level: density, wages, unemployment, median age, price-to-income). Districts that do not resolve to a county are omitted from it."),
   },
   { readOnlyHint: true, destructiveHint: false, title: "Compare Locations" },
   async (params) =>
     withErrorHandling("compare_locations", apiKey, async () => {
       requireApiKey(apiKey);
       // Mirror of the server-side guard - at least one filter required besides districts.
-      // Free-text strings use .trim() (server's safeString treats "" and whitespace-only as missing).
+      // Free-text strings use .trim() (the server treats "" and whitespace-only as missing).
       // Enums are validated by zod first, so "" / "   " never reach here.
       const hasFilter =
         !!params.propertyType ||
@@ -1285,12 +1503,11 @@ ${MARKET_CAVEAT}`,
         minArea: params.minArea,
         maxArea: params.maxArea,
         street: params.street,
-        // Comma-separated on the wire, per the API's list-param convention — but a boolean is clearer
-        // for an LLM; forward-compat: a future
-        // includeAsking would join with a comma. Demo mode (REST) silently drops enrichment.
+        // Comma-separated on the wire, per the API's list-param convention; the tool exposes a boolean
+        // because it is clearer for an LLM.
         include: params.includeDemographics ? "demographics" : undefined,
       }, apiKey);
-      return textResponse(formatCompareResults(data) + formatCreditFooter(creditInfo));
+      return textResponse(formatCompareResults(data) + mpzpWarning(params.mpzpDesignation) + formatCreditFooter(creditInfo));
     }),
 );
 
@@ -1307,23 +1524,23 @@ const DEMOGRAPHICS_CATEGORIES = [
 
 server.tool(
   "get_demographics",
-  `Demographic, economic, housing and other local statistics for a Polish location, from GUS BDL (Bank Danych Lokalnych) — Poland's public Central Statistical Office open-data bank. ~50 indicators across 11 categories (population, economy, housing, spatial planning, infrastructure, environment, safety, education, prices) plus a few derived metrics.
-Address by location (city/county name) OR teryt. A name resolves to county/powiat (4-digit) level; for richer gmina/district-level data (L6) pass a 6 or 7-digit teryt. teryt wins when both are given. Use list_locations to find TERYT codes — neighborhoods/osiedla are NOT addressable here.
-A query returns the requested level PLUS all parent levels (a gmina query also yields powiat, NUTS3 region and voivodeship indicators). Optional year, or yearFrom+yearTo for a time series, and category to filter. Cost: 1 token.`,
+  `Local statistics for a Polish location from GUS BDL (Poland's Central Statistical Office): ~50 indicators across 11 categories (population, economy, housing, planning, infrastructure, environment, safety, education, prices) plus a few derived metrics.
+Address by location (city, county or gmina name; a city or county resolves to county level) OR teryt (codes from list_locations). Neighborhoods/osiedla are NOT addressable.
+Returns the requested level PLUS all parent levels. Optional year, or yearFrom+yearTo for a time series, and category. Cost: 1 token.`,
   {
     location: z.string().optional().describe(
-      "City, county, or district name (e.g. 'Warszawa', 'Kraków'). A city/county name resolves to county/powiat level; a Warszawa district name (e.g. 'Mokotów') resolves to that district, another city's delegatura (e.g. 'Kraków-Podgórze') to its parent county. Use this OR teryt. For gmina-level data on other units pass a 6/7-digit teryt instead.",
+      "City, county, gmina or district name (e.g. 'Warszawa', 'Wieliczka'): city/county → county level, gmina → that gmina, a Warszawa district ('Mokotów') → that district, another city's delegatura ('Kraków-Podgórze') → its parent county. Shared name → candidates; pass one as teryt. Use this OR teryt.",
     ),
     teryt: z.string().optional().describe(
-      "TERYT code: 2-digit (voivodeship, e.g. 14), 4-digit (county, e.g. 1465), 6 or 7-digit (gmina, e.g. 1465011). The 7th digit selects the unit type: 3 = urban-rural gmina overall, 4/5 = urban/rural part only, 8 = Warszawa district (1465011 = all of Warszawa, 1465108 = Śródmieście). Wins over location. Use list_locations to find codes.",
+      "TERYT: 2-digit voivodeship (14), 4 county (1465), 6 or 7 gmina (1465011). 7th digit: 3 = urban-rural gmina overall, 4/5 = urban/rural part only, 8 = Warszawa district (1465108 = Śródmieście). Wins over location.",
     ),
     year: z.number().int().optional().describe(
-      "Single year (2003-present). Mutually exclusive with yearFrom/yearTo. Omit for the latest available year per indicator.",
+      "Single year (2003-present); exclusive with yearFrom/yearTo. Omit for the latest year per indicator.",
     ),
     yearFrom: z.number().int().optional().describe("Start year for a time series (min 2003)."),
     yearTo: z.number().int().optional().describe("End year for a time series (max current year + 1)."),
     category: z.array(z.enum(DEMOGRAPHICS_CATEGORIES)).optional().describe(
-      "Filter to these categories. Omit to return all available.",
+      "Categories to return; omit for all.",
     ),
   },
   { readOnlyHint: true, destructiveHint: false, title: "Demographics & Local Statistics" },
@@ -1333,18 +1550,18 @@ A query returns the requested level PLUS all parent levels (a gmina query also y
       const location = params.location?.trim();
       const teryt = params.teryt?.trim();
       if (!location && !teryt) {
-        return textResponse(
-          'Provide a location (city/county name) or teryt (administrative code). Example: get_demographics(location="Warszawa").',
+        return errorResponse(
+          'Provide a location (city/county name) or teryt (administrative code). Example: get_demographics(location="Warszawa"). Use list_locations(search=...) to find codes.',
         );
       }
-      // Obvious format error → reject before the API call (saves the 1-credit charge). A name that
-      // doesn't resolve (e.g. a neighborhood) is left to REST → 404 → auto-refunded by the global hook.
+      // Obvious format error → reject before the API call. A name that doesn't resolve (e.g. a
+      // neighborhood) is left to REST → 404.
       if (teryt && !DEMOGRAPHICS_TERYT_RE.test(teryt)) {
-        return textResponse(
-          `Invalid teryt '${sanitizeInput(teryt)}'. Use 2 digits (voivodeship), 4 (county), or 6-7 (gmina). Use list_locations to find codes.`,
+        return errorResponse(
+          `Invalid teryt '${sanitizeInput(teryt)}'. Use 2 digits (voivodeship), 4 (county), or 6-7 (gmina). Use list_locations(search=...) to find codes.`,
         );
       }
-      const { data, creditInfo } = await getDemographics(
+      const { data, creditInfo } = await withLocationErrors("get_demographics", { location }, () => getDemographics(
         {
           location,
           teryt,
@@ -1354,7 +1571,7 @@ A query returns the requested level PLUS all parent levels (a gmina query also y
           category: params.category?.join(","),
         },
         apiKey,
-      );
+      ));
       return textResponse(formatDemographics(data) + formatCreditFooter(creditInfo));
     }),
 );
@@ -1366,13 +1583,12 @@ const INFRA_TERYT_RE = /^(\d{4}|\d{6,7})$/;
 
 server.tool(
   "get_infrastructure_signals",
-  `Signals that a Polish municipality is about to build infrastructure — sewerage, water supply, roads, street lighting, gas network or cycling infrastructure. Three independent public sources: tenders published in the national public procurement bulletin (rolling 12-month window), membership in an agglomeration of the national urban waste-water treatment programme (where collective sewerage exists or is planned), and the municipality's own planned capital expenditure from its multi-year financial forecast.
-Address by location (city/county name → aggregates every municipality in that county) OR teryt (6-7 digits = one municipality, 4 digits = a county aggregate). teryt wins when both are given. Use list_locations to find codes.
-Known limits, state them when you report results: the bulletin carries only contracts BELOW the EU procurement thresholds (from 2021), so the largest investments are not visible here. A tender is attributed to the SEAT of the contracting authority, not to the works location — county and national authorities tender works in other municipalities. The category counters therefore include municipal authorities only, while the recent-notice list shows every authority with a flag. Absence of tenders is NOT evidence that a municipality is not investing.
-Cost: 1 token.`,
+  `Signals that a Polish municipality is about to build infrastructure, from three public sources: tenders in the national procurement bulletin (rolling 12 months), membership in an agglomeration of the national urban waste-water programme, and the municipality's planned capital expenditure from its multi-year forecast.
+Address by location (city/county name → every municipality in the county) OR teryt (codes from list_locations; wins when both are given).
+State these limits when reporting: the bulletin has only contracts BELOW EU thresholds (from 2021), so the largest investments are invisible; a tender is attributed to the contracting authority's SEAT, not the works location, so the counters include municipal authorities only while the notice list shows every authority with a flag. Absence of tenders is NOT evidence that a municipality is not investing. Cost: 1 token.`,
   {
     location: z.string().optional().describe(
-      "City, county, or district name (e.g. 'Warszawa', 'Krotoszyn'). A city/county name aggregates every municipality in the county; a Warszawa district name (e.g. 'Mokotów') narrows to that gmina, another city's delegatura (e.g. 'Kraków-Podgórze') resolves to its parent county. Use this OR teryt.",
+      "City, county, gmina or district name (e.g. 'Warszawa', 'Krotoszyn'): city/county → every municipality in the county, gmina → that gmina alone, a Warszawa district ('Mokotów') → that gmina, another city's delegatura ('Kraków-Podgórze') → its parent county. Shared name → candidates; pass one as teryt. Use this OR teryt.",
     ),
     teryt: z.string().optional().describe(
       "TERYT code: 6 or 7 digits = one municipality (e.g. 146501), 4 digits = a county aggregate (e.g. 1465). Wins over location.",
@@ -1385,18 +1601,18 @@ Cost: 1 token.`,
       const location = params.location?.trim();
       const teryt = params.teryt?.trim();
       if (!location && !teryt) {
-        return textResponse(
-          'Provide a location (city/county name) or teryt (administrative code). Example: get_infrastructure_signals(location="Krotoszyn").',
+        return errorResponse(
+          'Provide a location (city/county name) or teryt (administrative code). Example: get_infrastructure_signals(location="Krotoszyn"). Use list_locations(search=...) to find codes.',
         );
       }
-      // Obvious format error → reject before the API call (saves the 1-credit charge). A code that
-      // is well-formed but nonexistent is left to REST → 404 → auto-refunded by the global hook.
+      // Obvious format error → reject before the API call. A code that is well-formed but
+      // nonexistent is left to REST → 404.
       if (teryt && !INFRA_TERYT_RE.test(teryt)) {
-        return textResponse(
-          `Invalid teryt '${sanitizeInput(teryt)}'. Use 4 digits (county) or 6-7 digits (municipality). Use list_locations to find codes.`,
+        return errorResponse(
+          `Invalid teryt '${sanitizeInput(teryt)}'. Use 4 digits (county) or 6-7 digits (municipality). Use list_locations(search=...) to find codes.`,
         );
       }
-      const { data, creditInfo } = await getInfrastructureSignals({ location, teryt }, apiKey);
+      const { data, creditInfo } = await withLocationErrors("get_infrastructure_signals", { location }, () => getInfrastructureSignals({ location, teryt }, apiKey));
       return textResponse(formatInfrastructureSignals(data) + formatCreditFooter(creditInfo));
     }),
 );
@@ -1406,34 +1622,33 @@ Cost: 1 token.`,
 
 server.tool(
   "estimate_value",
-  `[Beta] Estimate the market value of an apartment from comparable registered transaction prices near a point. An orientation estimate, NOT a certified appraisal (operat szacunkowy) — it does not account for the unit's condition, finish standard or floor, and does not replace a surveyor's valuation.
-Address by lat + lng (a point on the map) OR parcelId (a full cadastral id or internal UUID; the parcel centroid is used) — exactly one. area (usable area in m², 10–250) is REQUIRED: there is no per-address floor-area source in Poland, so the caller supplies it.
-Optional: rooms (1–10) and market (primary/secondary) narrow the comparables; includeComps (default true) echoes the nearest comparables it weighed.
-Returns the point estimate, a likely and a wide value range, a confidence band, the comparable count, and an as_of date. as_of reflects transaction-data freshness, which lags by county — estimates are NOT directly comparable across cities with different as_of.
-Apartments only (v1), 10–250 m². Too few comparables near the point → no estimate (the credit is refunded). Costs 5 API tokens, refunded when no estimate is produced. ${MARKET_CAVEAT}`,
+  `[Beta] Estimate an apartment's market value from comparable registered transaction prices near a point. An orientation estimate, NOT a certified appraisal (operat szacunkowy): it ignores condition, finish standard and floor.
+Address by lat + lng OR parcelId (the parcel centroid is used) - exactly one. area (usable m², 10–250) is REQUIRED. Optional: rooms (1–10) and market (primary/secondary) narrow the comparables; includeComps (default true) echoes them.
+Returns the point estimate, a likely and a wide range, a confidence band, the comparable count and an as_of date; as_of lags by county, so estimates are NOT comparable across cities with different as_of.
+Apartments only; for a building plot or farmland use estimate_land_value. Too few comparables → no estimate. Costs 5 API tokens, refunded when no estimate is produced. ${MARKET_NOTE}`,
   {
     // Bounds are the Poland bbox, same as search_by_area — the data is Polish, and a point far outside it
     // only buys a slow round-trip that ends in "no estimate".
     lat: z.number().min(49).max(55).optional().describe(
-      "Latitude of the apartment (WGS84, Poland). Must be paired with lng. Use this OR parcelId.",
+      "Latitude of the apartment (WGS84, Poland); pair with lng. Use this OR parcelId.",
     ),
     lng: z.number().min(14).max(25).optional().describe(
-      "Longitude of the apartment (WGS84, Poland). Must be paired with lat. Use this OR parcelId.",
+      "Longitude of the apartment (WGS84, Poland); pair with lat. Use this OR parcelId.",
     ),
     parcelId: z.string().max(200).optional().describe(
-      "Full cadastral id (slash or dash form) or internal UUID; the parcel centroid is used. Use instead of lat/lng.",
+      "Full cadastral id (slash or dash form) or internal UUID; the parcel centroid is used. Instead of lat/lng.",
     ),
     area: z.number().min(10).max(250).describe(
-      "Apartment usable area in m² (REQUIRED, 10–250). Estimates for 300+ m² are unreliable and rejected.",
+      "Apartment usable area in m² (REQUIRED, 10–250).",
     ),
     rooms: z.number().int().min(1).max(10).optional().describe(
-      "Room count (1–10, optional) — narrows the comparables to ±1 room.",
+      "Room count (1–10); narrows comparables to ±1 room.",
     ),
     market: z.enum(["primary", "secondary"]).optional().describe(
-      "Restrict comparables to the primary (new-build) or secondary market (optional).",
+      "Restrict comparables to the primary (new-build) or secondary market.",
     ),
     includeComps: z.boolean().optional().describe(
-      "Echo the nearest comparables the estimate weighed (default true). Set false for the estimate only.",
+      "Echo the comparables weighed (default true); false = estimate only.",
     ),
   },
   { readOnlyHint: true, destructiveHint: false, title: "[Beta] Apartment Value Estimate" },
@@ -1470,6 +1685,92 @@ Apartments only (v1), 10–250 m². Too few comparables near the point → no es
     }),
 );
 
+// ── Tool: estimate_land_value ───────────────────────────────────────
+// Part of the default tool set, flagged "[Beta]" in the description. Sibling of estimate_value for
+// undeveloped land. The feature can be unavailable, so the description says so and the handler
+// degrades a 503 carrying a feature-off mode into a plain message.
+
+// The handler composes this message itself instead of echoing the 503 body.
+const LAND_VALUATION_DISABLED_MESSAGE =
+  "The land value estimate is temporarily unavailable — this feature is briefly switched off. No credit was charged; please try again later.";
+
+server.tool(
+  "estimate_land_value",
+  `[Beta] Estimate an undeveloped plot's market value from comparable registered transaction prices near a point. An orientation estimate, NOT a certified appraisal (operat szacunkowy).
+Address by lat + lng OR parcelId (the parcel centroid is used) - exactly one. area (m², 100–1000000) is REQUIRED with lat/lng; with parcelId it defaults to the cadastre area. landType: plot (building plot, default) or agricultural (farmland) - the caller chooses. Optional mpzpDesignation narrows the comparables; includeComps (default true) echoes them.
+Returns the estimate per m² and per hectare, a likely and a wide range, a confidence band, the comparable count and an as_of date (as_of lags by county: estimates are NOT comparable across areas with different as_of).
+Comparables are chosen by the designation recorded in the transaction register (not a local zoning plan), so this does not assert the plot is buildable. Undeveloped land only. Too few comparables, or an area that cannot be determined → no estimate. Costs 5 API tokens, refunded when no estimate is produced. It can be switched off for maintenance (a plain "temporarily unavailable" reply). ${MARKET_NOTE}`,
+  {
+    // Bounds are the Poland bbox, same as estimate_value — the data is Polish.
+    lat: z.number().min(49).max(55).optional().describe(
+      "Latitude of the plot (WGS84, Poland); pair with lng. Use this OR parcelId (area is then required).",
+    ),
+    lng: z.number().min(14).max(25).optional().describe(
+      "Longitude of the plot (WGS84, Poland); pair with lat. Use this OR parcelId (area is then required).",
+    ),
+    parcelId: z.string().max(200).optional().describe(
+      "Full cadastral id or internal UUID; the parcel centroid is used. Instead of lat/lng.",
+    ),
+    area: z.number().min(100).max(1_000_000).optional().describe(
+      "Plot area in m² (100–1000000). REQUIRED with lat/lng; with parcelId read from the cadastre when omitted.",
+    ),
+    landType: z.enum(["plot", "agricultural"]).optional().describe(
+      "Comparable segment: plot (building plot, default) or agricultural (farmland); the caller chooses.",
+    ),
+    mpzpDesignation: z.string().max(100).optional().describe(
+      "Narrow comparables to a recorded land-designation token (e.g. 'budownictwoMieszkanioweJednorodzinne'); 'unknown' = none recorded.",
+    ),
+    includeComps: z.boolean().optional().describe(
+      "Echo the comparables weighed (default true); false = estimate only.",
+    ),
+  },
+  { readOnlyHint: true, destructiveHint: false, title: "[Beta] Land Value Estimate" },
+  async (params) =>
+    withErrorHandling("estimate_land_value", apiKey, async () => {
+      requireApiKey(apiKey);
+      // Exactly-one-mode guard (mirrors estimate_value + the server's 400): enforce lat/lng-XOR-parcelId
+      // pre-flight so a malformed request returns a clear message without spending a call/credit.
+      const hasLat = params.lat != null;
+      const hasLng = params.lng != null;
+      const hasParcel = params.parcelId != null && params.parcelId !== "";
+      const latLngMode = hasLat || hasLng;
+      const modeCount = (latLngMode ? 1 : 0) + (hasParcel ? 1 : 0);
+      if (modeCount !== 1) {
+        return textResponse("Provide exactly one location: lat= and lng=, OR parcelId=.");
+      }
+      if (latLngMode && !(hasLat && hasLng)) {
+        return textResponse("lat and lng must be provided together.");
+      }
+      // area is required on the lat/lng path (no cadastre to fall back to) — reject before the HTTP call.
+      if (latLngMode && params.area == null) {
+        return textResponse("area (the plot size in m², 100–1000000) is required when addressing by lat/lng.");
+      }
+      try {
+        const { data, creditInfo } = await getLandValuation(
+          {
+            lat: params.lat,
+            lng: params.lng,
+            parcelId: params.parcelId,
+            area: params.area,
+            landType: params.landType,
+            mpzpDesignation: params.mpzpDesignation,
+            includeComps: params.includeComps ?? true,
+          },
+          apiKey,
+        );
+        return textResponse(formatLandValuation(data) + formatCreditFooter(creditInfo));
+      } catch (error) {
+        // A 503 with the feature-off mode degrades into a plain message and is not reported to
+        // error tracking.
+        // Other 503s stay on the normal path (rethrown → withErrorHandling).
+        if (error instanceof ApiHttpError && error.status === 503 && error.mode === "avm-disabled") {
+          return { content: [{ type: "text" as const, text: LAND_VALUATION_DISABLED_MESSAGE }], isError: true };
+        }
+        throw error;
+      }
+    }),
+);
+
 // Tools outside the default set (off unless enabled).
 if (experimentalToolsEnabled()) {
 
@@ -1477,23 +1778,20 @@ if (experimentalToolsEnabled()) {
 
 server.tool(
   "get_rental_yield",
-  `EXPERIMENTAL (beta): this tool may change or be withdrawn without notice; do not build critical workflows on it.
-Estimate the gross rental yield for a Polish city or county: annualized median asking rent (PLN/m²/month × 12) divided by the median apartment transaction price per m² (secondary market) from the RCN registry.
-Gross and top-line only — excludes vacancy, management, tax and maintenance. Indicative, not investment advice.
-Address by location (city name → resolves to a county) OR teryt (4-digit county code; 6-digit = dzielnica where available, today Warszawa's 18 districts, otherwise truncated to the county; teryt wins when both are given). Both sides need at least 5 samples or the result is suppressed.
-Not comparable across cities with different as_of dates (RCN publication lag varies by county). Rent and transaction prices come from different sources, so the yield is an approximation.
-Coverage is county-level only (miasta na prawach powiatu) plus Warszawa's 18 districts, and further limited to cities with asking-rent data. A town inside a larger powiat (e.g. Sandomierz, Pruszków), a non-Warszawa city district, or an osiedle does NOT resolve and returns a 404 — do not pass such names. Unless the location is a major city you already know is covered, call list_rental_yield_locations FIRST to get valid names, or pass a 4-digit county TERYT.
-Optional areaBucket restricts both sides to an apartment area range in m2 (e.g. '40-50'). Area ranges are NOT additive — a bucket does not sum back to 'all'.
-The transaction-price denominator uses the market median. ${MARKET_CAVEAT}`,
+  `EXPERIMENTAL (beta): may change or be withdrawn; no critical workflows on it.
+Gross rental yield for a Polish city or county: annualized median asking rent (PLN/m²/month × 12) divided by the median secondary-market apartment transaction price per m² (RCN). Top-line only (excludes vacancy, management, tax, maintenance), indicative, not investment advice. Different sources, so an approximation; not comparable across cities with different as_of dates.
+Address by location (city name → a county) OR teryt (teryt wins). Both sides need at least 5 samples or the result is suppressed.
+Coverage: counties (miasta na prawach powiatu) plus Warszawa's 18 districts, only cities with asking-rent data. A gmina name resolves to its county (shown in the answer); a name shared by gminas in several counties returns candidates.
+Optional areaBucket restricts both sides to an apartment area range. ${MARKET_NOTE}`,
   {
     location: z.string().optional().describe(
-      "County-level city name — a miasto na prawach powiatu or a catalog entry from list_rental_yield_locations (e.g. 'Warszawa', 'Kraków', 'Gdańsk'). A Warszawa district name (e.g. 'Mokotów') narrows to that district; another city's delegatura (e.g. 'Kraków-Podgórze') resolves to its parent county. A town within a larger powiat or an osiedle will 404 — check the catalog or use teryt first. Use this OR teryt.",
+      "County-level city name (a miasto na prawach powiatu or a catalog entry, e.g. 'Warszawa', 'Gdańsk'); a Warszawa district ('Mokotów') narrows to it, 'Kraków-Podgórze' resolves to its parent county. A gmina name resolves to its county (candidates if shared by gminas in several counties); an osiedle 404s - use teryt. This OR teryt.",
     ),
     teryt: z.string().optional().describe(
-      "TERYT code. 4 digits = county (e.g. 1465 = Warszawa). 6 digits = dzielnica where available (today: Warszawa's 18 districts, e.g. 146510 = Śródmieście) → yield for that district. Other longer codes (gmina/precinct) are truncated to the county. Wins over location when both are provided.",
+      "TERYT: 4 digits = county (1465 = Warszawa); 6 digits = a Warszawa district (146510 = Śródmieście); other longer codes truncate to the county. Wins over location.",
     ),
     areaBucket: z.enum(["all", "0-30", "30-40", "40-50", "50-60", "60-80", "80+"]).optional().describe(
-      "Apartment area range in m2: all (default, whole stock), 0-30, 30-40, 40-50, 50-60, 60-80, 80+. Bucket values are not additive.",
+      "Apartment area range in m² (all = whole stock, default). Buckets are not additive.",
     ),
   },
   { readOnlyHint: true, destructiveHint: false, title: "[Beta] Rental Yield Estimate" },
@@ -1505,10 +1803,10 @@ The transaction-price denominator uses the market median. ${MARKET_CAVEAT}`,
           'Provide a location (city name) or teryt (county code). Example: get_rental_yield(location="Warszawa").',
         );
       }
-      const { data, creditInfo } = await getRentalYield(
+      const { data, creditInfo } = await withLocationErrors("get_rental_yield", { location: params.location }, () => getRentalYield(
         { location: params.location, teryt: params.teryt, areaBucket: params.areaBucket },
         apiKey,
-      );
+      ));
       return textResponse(formatRentalYield(data) + formatCreditFooter(creditInfo));
     }),
 );
@@ -1517,13 +1815,11 @@ The transaction-price denominator uses the market median. ${MARKET_CAVEAT}`,
 
 server.tool(
   "list_rental_yield_locations",
-  `EXPERIMENTAL (beta): this tool may change or be withdrawn without notice; do not build critical workflows on it.
-List the cities/counties for which get_rental_yield can return data (asking-rent coverage). Use this to discover valid location/teryt values for get_rental_yield instead of guessing names.
-Each entry is coverage signal only (offer sample size + confidence) — it does not compute the yield; call get_rental_yield(location|teryt) for the actual yield.
-Optional search filters by city name (diacritic-insensitive substring, min 2 chars). Results are sorted by rent_sample_n descending. Free (0 credits).`,
+  `EXPERIMENTAL (beta): may change or be withdrawn; no critical workflows on it.
+List the cities/counties get_rental_yield can answer for (asking-rent coverage), to find valid location/teryt values instead of guessing names. Each entry is a coverage signal only (offer sample size + confidence); call get_rental_yield for the yield. Optional search: city-name substring (diacritic-insensitive, min 2 chars); sorted by rent_sample_n descending. Free.`,
   {
     search: z.string().min(2, "search must be at least 2 characters").optional().describe(
-      "Filter by city name (diacritic-insensitive substring, min 2 chars). E.g. 'gda' → Gdańsk. Omit to list the full catalog.",
+      "City name filter (diacritic-insensitive substring, min 2 chars), e.g. 'gda' → Gdańsk. Omit for the full catalog.",
     ),
   },
   { readOnlyHint: true, destructiveHint: false, title: "[Beta] List Rental Yield Locations" },
@@ -1542,27 +1838,24 @@ Optional search filters by city name (diacritic-insensitive substring, min 2 cha
 
 server.tool(
   "get_price_spread",
-  `EXPERIMENTAL (beta): this tool may change or be withdrawn without notice; do not build critical workflows on it.
-Measure the asking-vs-transaction price spread for a Polish city or county: how far the median asking price per m² of apartments for sale sits above (or below) the median apartment transaction price per m² from the RCN registry. spread_pct = (asking − transaction) / transaction × 100.
-The spread can be NEGATIVE (asking below transaction) in premium-secondary cities — that is a valid answer, not an error.
-Address by location (city name → resolves to a county) OR teryt (4-digit county code; 6-digit = dzielnica where available, today Warszawa's 18 districts, otherwise truncated to the county; teryt wins when both are given). Both sides need at least 5 samples or the result is suppressed.
-For marketType='all' (the default), sale offers are a mix of primary and secondary market, so the transaction denominator covers the whole market. With marketType='secondary' or 'primary', both the asking and transaction sides are narrowed to that single market segment.
-Not comparable across cities with different as_of dates (RCN publication lag varies by county). Asking and transaction prices come from different sources, so the spread is an approximation.
-Coverage is county-level only (miasta na prawach powiatu) plus Warszawa's 18 districts, and further limited to cities with asking-sale data. A town inside a larger powiat (e.g. Sandomierz, Pruszków), a non-Warszawa city district, or an osiedle does NOT resolve and returns a 404 — do not pass such names. Unless the location is a major city you already know is covered, call list_price_spread_locations FIRST to get valid names, or pass a 4-digit county TERYT.
-Optional areaBucket restricts both sides to an apartment area range in m2 (e.g. '40-50'). Area ranges are NOT additive — a bucket does not sum back to 'all'.
-The transaction-price denominator uses the market median. ${MARKET_CAVEAT}`,
+  `EXPERIMENTAL (beta): may change or be withdrawn; no critical workflows on it.
+Asking-vs-transaction price spread for a Polish city or county: how far the median asking price per m² of apartments for sale sits above (or below) the median apartment transaction price per m² (RCN). spread_pct = (asking − transaction) / transaction × 100; it can be NEGATIVE in premium-secondary cities (a valid answer). Different sources, so an approximation; not comparable across cities with different as_of dates.
+Address by location (city name → a county) OR teryt (teryt wins). Both sides need at least 5 samples or the result is suppressed.
+marketType 'all' (default) = whole market; 'secondary' or 'primary' narrows both sides to that segment.
+Coverage: counties (miasta na prawach powiatu) plus Warszawa's 18 districts, only cities with asking-sale data. A gmina name resolves to its county (shown in the answer); a name shared by gminas in several counties returns candidates.
+Optional areaBucket restricts both sides to an apartment area range. ${MARKET_NOTE}`,
   {
     location: z.string().optional().describe(
-      "County-level city name — a miasto na prawach powiatu or a catalog entry from list_price_spread_locations (e.g. 'Warszawa', 'Kraków', 'Gdańsk'). A Warszawa district name (e.g. 'Mokotów') narrows to that district; another city's delegatura (e.g. 'Kraków-Podgórze') resolves to its parent county. A town within a larger powiat or an osiedle will 404 — check the catalog or use teryt first. Use this OR teryt.",
+      "County-level city name (a miasto na prawach powiatu or a catalog entry, e.g. 'Warszawa', 'Gdańsk'); a Warszawa district ('Mokotów') narrows to it, 'Kraków-Podgórze' resolves to its parent county. A gmina name resolves to its county (candidates if shared by gminas in several counties); an osiedle 404s - use teryt. This OR teryt.",
     ),
     teryt: z.string().optional().describe(
-      "TERYT code. 4 digits = county (e.g. 1465 = Warszawa). 6 digits = dzielnica where available (today: Warszawa's 18 districts, e.g. 146510 = Śródmieście) → spread for that district. Other longer codes (gmina/precinct) are truncated to the county. Wins over location when both are provided.",
+      "TERYT: 4 digits = county (1465 = Warszawa); 6 digits = a Warszawa district (146510 = Śródmieście); other longer codes truncate to the county. Wins over location.",
     ),
     marketType: z.enum(["primary", "secondary", "all"]).optional().describe(
-      "Transaction denominator segment: 'all' (default, composition-matched to mixed sale offers), 'secondary', or 'primary'.",
+      "Transaction-side segment: 'all' (default, matched to mixed sale offers), 'secondary' or 'primary'.",
     ),
     areaBucket: z.enum(["all", "0-30", "30-40", "40-50", "50-60", "60-80", "80+"]).optional().describe(
-      "Apartment area range in m2: all (default, whole stock), 0-30, 30-40, 40-50, 50-60, 60-80, 80+. Bucket values are not additive.",
+      "Apartment area range in m² (all = whole stock, default). Buckets are not additive.",
     ),
   },
   { readOnlyHint: true, destructiveHint: false, title: "[Beta] Asking vs Transaction Price Spread" },
@@ -1574,10 +1867,10 @@ The transaction-price denominator uses the market median. ${MARKET_CAVEAT}`,
           'Provide a location (city name) or teryt (county code). Example: get_price_spread(location="Warszawa").',
         );
       }
-      const { data, creditInfo } = await getPriceSpread(
+      const { data, creditInfo } = await withLocationErrors("get_price_spread", { location: params.location }, () => getPriceSpread(
         { location: params.location, teryt: params.teryt, marketType: params.marketType, areaBucket: params.areaBucket },
         apiKey,
-      );
+      ));
       return textResponse(formatPriceSpread(data) + formatCreditFooter(creditInfo));
     }),
 );
@@ -1586,13 +1879,11 @@ The transaction-price denominator uses the market median. ${MARKET_CAVEAT}`,
 
 server.tool(
   "list_price_spread_locations",
-  `EXPERIMENTAL (beta): this tool may change or be withdrawn without notice; do not build critical workflows on it.
-List the cities/counties for which get_price_spread can return data (asking-sale coverage). Use this to discover valid location/teryt values for get_price_spread instead of guessing names.
-Each entry is coverage signal only (sale offer sample size + confidence) — it does not compute the spread; call get_price_spread(location|teryt) for the actual spread.
-Optional search filters by city name (diacritic-insensitive substring, min 2 chars). Results are sorted by asking_sample_n descending. Free (0 credits).`,
+  `EXPERIMENTAL (beta): may change or be withdrawn; no critical workflows on it.
+List the cities/counties get_price_spread can answer for (asking-sale coverage), to find valid location/teryt values instead of guessing names. Each entry is a coverage signal only (sale offer sample size + confidence); call get_price_spread for the spread. Optional search: city-name substring (diacritic-insensitive, min 2 chars); sorted by asking_sample_n descending. Free.`,
   {
     search: z.string().min(2, "search must be at least 2 characters").optional().describe(
-      "Filter by city name (diacritic-insensitive substring, min 2 chars). E.g. 'gda' → Gdańsk. Omit to list the full catalog.",
+      "City name filter (diacritic-insensitive substring, min 2 chars), e.g. 'gda' → Gdańsk. Omit for the full catalog.",
     ),
   },
   { readOnlyHint: true, destructiveHint: false, title: "[Beta] List Price Spread Locations" },
@@ -1611,17 +1902,16 @@ Optional search filters by city name (diacritic-insensitive substring, min 2 cha
 
 server.tool(
   "get_flood_risk",
-  `EXPERIMENTAL (beta): this tool may change or be withdrawn without notice; do not build critical workflows on it.
-Report what share of a Polish county's real-estate transactions sit on land in a mapped flood-hazard zone, broken down by severity, from the RCN registry.
-Severity bands are return periods: high = most frequent flooding (~1-in-10-year), medium (~1-in-100-year), low = rarest (~1-in-500-year). Counts land in a mapped hazard zone only; absence of a zone is never asserted as 'safe' (an area may be unmapped).
-Address by location (city/county name → resolves to a county) OR teryt (4-digit county code; longer codes truncate to the county; a district code resolves to its county — exposure is reported at county level; teryt wins when both are given).
-Aggregated over the whole transaction history (all-time, no date window). Suppressed below 5 assessed transactions. Coverage is county-level. Unless the location is a major city you already know is covered, call list_flood_risk_locations FIRST to get valid names, or pass a 4-digit county TERYT.`,
+  `EXPERIMENTAL (beta): may change or be withdrawn; no critical workflows on it.
+What share of a Polish county's real-estate transactions sit on land in a mapped flood-hazard zone, by severity, from the RCN registry. Bands are return periods: high = most frequent (~1-in-10-year), medium ~1-in-100, low = rarest (~1-in-500). Counts land in a mapped zone only; absence of a zone is never asserted as 'safe' (an area may be unmapped).
+Address by location (city/county name → its county; a gmina name is answered at county level, with a note) OR teryt (4-digit county; longer codes truncate to the county; wins when both are given). All-time, no date window; suppressed below 5 assessed transactions.
+Coverage is county-level. Unless the location is a major city you know is covered, call list_flood_risk_locations FIRST or pass a 4-digit county TERYT.`,
   {
     location: z.string().optional().describe(
-      "County-level city/county name (e.g. 'Warszawa', 'Kraków', 'Gdańsk'). District names are accepted (a Warszawa district or another city's delegatura, e.g. 'Kraków-Podgórze'), but coverage is county-level, so the answer is the parent county with a note. A town within a larger powiat or an osiedle may 404 — check the catalog or use teryt first. Use this OR teryt.",
+      "City or county name (e.g. 'Warszawa', 'Gdańsk'). District and gmina names are accepted ('Kraków-Podgórze', 'Wieliczka') but coverage is county-level, so the answer is the parent county with a note. A gmina name shared by counties returns candidates. A town within a larger powiat or an osiedle may 404 - check the catalog or use teryt. This OR teryt.",
     ),
     teryt: z.string().optional().describe(
-      "TERYT code. 4 digits = county (e.g. 1465 = Warszawa). Longer codes (gmina/precinct/district) are truncated/resolved to the county. Wins over location when both are provided.",
+      "TERYT code. 4 digits = county (e.g. 1465 = Warszawa). Longer codes (gmina/precinct/district) resolve to the county. Wins over location.",
     ),
   },
   { readOnlyHint: true, destructiveHint: false, title: "[Beta] Flood-Hazard Exposure Share" },
@@ -1633,10 +1923,10 @@ Aggregated over the whole transaction history (all-time, no date window). Suppre
           'Provide a location (city/county name) or teryt (county code). Example: get_flood_risk(location="Warszawa").',
         );
       }
-      const { data, creditInfo } = await getFloodRisk(
+      const { data, creditInfo } = await withLocationErrors("get_flood_risk", { location: params.location }, () => getFloodRisk(
         { location: params.location, teryt: params.teryt },
         apiKey,
-      );
+      ));
       return textResponse(formatFloodRisk(data) + formatCreditFooter(creditInfo));
     }),
 );
@@ -1645,13 +1935,11 @@ Aggregated over the whole transaction history (all-time, no date window). Suppre
 
 server.tool(
   "list_flood_risk_locations",
-  `EXPERIMENTAL (beta): this tool may change or be withdrawn without notice; do not build critical workflows on it.
-List the counties for which get_flood_risk can return data (i.e. where transactions have a completed flood assessment). Use this to discover valid location/teryt values for get_flood_risk instead of guessing names.
-Each entry is coverage signal only (assessed sample size + confidence) — it does not compute the share; call get_flood_risk(location|teryt) for the actual exposure.
-Optional search filters by county name (diacritic-insensitive substring, min 2 chars). Results are sorted by assessed_sample_n descending. Free (0 credits).`,
+  `EXPERIMENTAL (beta): may change or be withdrawn; no critical workflows on it.
+List the counties get_flood_risk can answer for (transactions with a completed flood assessment), to find valid location/teryt values instead of guessing names. Each entry is a coverage signal only (assessed sample size + confidence); call get_flood_risk for the exposure. Optional search: county-name substring (diacritic-insensitive, min 2 chars); sorted by assessed_sample_n descending. Free.`,
   {
     search: z.string().min(2, "search must be at least 2 characters").optional().describe(
-      "Filter by county name (diacritic-insensitive substring, min 2 chars). E.g. 'gda' → Gdańsk. Omit to list the full catalog.",
+      "County name filter (diacritic-insensitive substring, min 2 chars), e.g. 'gda' → Gdańsk. Omit for the full catalog.",
     ),
   },
   { readOnlyHint: true, destructiveHint: false, title: "[Beta] List Flood-Risk Locations" },
@@ -1672,22 +1960,19 @@ Optional search filters by county name (diacritic-insensitive substring, min 2 c
 
 server.tool(
   "get_building_breakdown",
-  `Get the building-by-building breakdown for one transaction: footprint area, number of storeys, and estimated total floor area (footprint × storeys) for each building on the property.
-search_transactions / search_by_area / search_by_polygon return per-transaction building SUMS inline; this tool splits them into individual buildings. Use it after a search when a result has building data and you need the detail (e.g. a developed-land deed covering several buildings).
-Each building also carries a construction-age estimate derived from building-permit records. It is an ESTIMATE with an interval, never a registry construction date, and the records only start in 2016 — so for most buildings the honest answer is "construction year not established", which is stated explicitly rather than left out.
-The transaction_id is the id shown on a search result that has building data. Cost: 4 tokens. Returns nothing for a transaction with no buildings.`,
-  {
-    transaction_id: z.string().regex(UUID_RE, "transaction_id must be a UUID — copy the id from a search_transactions result that has building data").describe(
-      "Transaction id (UUID) from a search_transactions / search_by_area / search_by_polygon result that carries building data.",
-    ),
-  },
+  `Building-by-building breakdown for one transaction: footprint area, storeys and estimated total floor area (footprint × storeys) of each building on the property. Use it after a search whose result has building data (searches return per-transaction building SUMS inline) - e.g. a developed-land deed covering several buildings.
+Each building carries a construction-age ESTIMATE with an interval, derived from building-permit records: never a registry construction date, and the records only start in 2016, so "construction year not established" is the usual honest answer.
+Cost: 4 tokens. Returns nothing for a transaction with no buildings.`,
+  txIdShape(" that carries building data"),
   { readOnlyHint: true, destructiveHint: false, title: "Building-by-Building Breakdown" },
   async (params) =>
     withErrorHandling("get_building_breakdown", apiKey, async () => {
       requireApiKey(apiKey);
+      const txId = resolveTxId(params);
+      if (typeof txId !== "string") return txId;
       // `res` is the whole response body ({ data, truncated }); `res.data` is the building array.
       // Destructure as `res` (not `data`) to keep that distinction explicit.
-      const { data: res, creditInfo } = await getBuildingBreakdown(params.transaction_id, apiKey);
+      const { data: res, creditInfo } = await getBuildingBreakdown(txId, apiKey);
       return textResponse(formatBuildingBreakdown(res) + formatCreditFooter(creditInfo));
     }),
 );
@@ -1696,20 +1981,18 @@ The transaction_id is the id shown on a search result that has building data. Co
 
 server.tool(
   "get_transaction_flood",
-  `Get the parcel-by-parcel flood-hazard breakdown for one transaction: for each linked plot that sits in a mapped flood zone — the worst hazard category (high/medium/low, i.e. ~1-in-10-year to ~1-in-500-year), the hazard type (river/coastal/infrastructure), the share of the plot inside the zone, and the full per-scenario list (each with its return period).
-search_transactions (and search_by_area) surface a per-transaction worst-case flood_risk inline; this tool splits that into the individual parcels and scenarios behind it. Use it after a search when a result shows flood_risk. (search_by_polygon does not include flood inline.)
-TWO-STATE: a transaction whose land is in no mapped zone returns nothing — absence of a zone is never asserted as "safe". Cost: 4 tokens (refunded when there is no flood data).`,
-  {
-    transaction_id: z.string().regex(UUID_RE, "transaction_id must be a UUID — copy the id from a search_transactions result").describe(
-      "Transaction id (UUID) from a search_transactions / search_by_area / search_by_polygon result.",
-    ),
-  },
+  `Parcel-by-parcel flood-hazard breakdown for one transaction: per linked plot in a mapped flood zone - the worst hazard category (high/medium/low, ~1-in-10-year to ~1-in-500-year), hazard type (river/coastal/infrastructure), the share of the plot inside the zone and the per-scenario list with return periods.
+Use it after a search whose result shows flood_risk (search_transactions and search_by_area surface it inline; search_by_polygon does not). For a parcel with no transaction, get_parcel_report lists the same scenarios.
+Land in no mapped zone returns nothing - absence of a zone is never asserted as "safe". Cost: 4 tokens (refunded when there is no flood data).`,
+  txIdShape(),
   { readOnlyHint: true, destructiveHint: false, title: "Transaction Flood-Hazard Breakdown" },
   async (params) =>
     withErrorHandling("get_transaction_flood", apiKey, async () => {
       requireApiKey(apiKey);
+      const txId = resolveTxId(params);
+      if (typeof txId !== "string") return txId;
       // `res` is the whole response body ({ data, truncated }); `res.data` is the parcel array.
-      const { data: res, creditInfo } = await getTransactionFlood(params.transaction_id, apiKey);
+      const { data: res, creditInfo } = await getTransactionFlood(txId, apiKey);
       return textResponse(formatFloodBreakdown(res) + formatCreditFooter(creditInfo));
     }),
 );
@@ -1718,20 +2001,18 @@ TWO-STATE: a transaction whose land is in no mapped zone returns nothing — abs
 
 server.tool(
   "get_transaction_heritage",
-  `Get the parcel-by-parcel heritage-listing breakdown for one transaction: for each linked plot with a detected heritage listing — the status (listed = a protected monument on/at the plot; zone = the plot lies within a protected urban layout or the designated surroundings of a monument), the share of the plot inside the protected area (when measurable), and the individual entries (category, name, function, period, entry date).
-search_transactions (and search_by_area) surface a per-transaction heritage_status inline; this tool splits that into the individual parcels and entries behind it. Use it after a search when a result shows a heritage listing. (search_by_polygon does not include heritage inline.)
-TWO-STATE: a transaction with no detected listing returns nothing — absence of a detection is never asserted as "not listed". Indicative data — the regional heritage conservator makes the final, binding determination. Cost: 4 tokens (refunded when there is no heritage data).`,
-  {
-    transaction_id: z.string().regex(UUID_RE, "transaction_id must be a UUID — copy the id from a search_transactions result").describe(
-      "Transaction id (UUID) from a search_transactions / search_by_area / search_by_polygon result.",
-    ),
-  },
+  `Parcel-by-parcel heritage-listing breakdown for one transaction: per linked plot with a detected listing - the status (listed = a protected monument on/at the plot; zone = within a protected urban layout or the designated surroundings of a monument), the share of the plot inside the protected area (when measurable) and the entries (category, name, function, period, entry date).
+Use it after a search whose result shows a heritage listing (search_transactions and search_by_area surface heritage_status inline; search_by_polygon does not). For a parcel with no transaction, get_parcel_report lists the same entries.
+No detected listing returns nothing - absence of a detection is never "not listed". Indicative data: the regional heritage conservator makes the binding determination. Cost: 4 tokens (refunded when there is no heritage data).`,
+  txIdShape(),
   { readOnlyHint: true, destructiveHint: false, title: "Transaction Heritage-Listing Breakdown" },
   async (params) =>
     withErrorHandling("get_transaction_heritage", apiKey, async () => {
       requireApiKey(apiKey);
+      const txId = resolveTxId(params);
+      if (typeof txId !== "string") return txId;
       // `res` is the whole response body ({ data, truncated }); `res.data` is the parcel array.
-      const { data: res, creditInfo } = await getTransactionHeritage(params.transaction_id, apiKey);
+      const { data: res, creditInfo } = await getTransactionHeritage(txId, apiKey);
       return textResponse(formatHeritageBreakdown(res) + formatCreditFooter(creditInfo));
     }),
 );
@@ -1740,21 +2021,18 @@ TWO-STATE: a transaction with no detected listing returns nothing — absence of
 
 server.tool(
   "get_transaction_landslide",
-  `Get the parcel-by-parcel landslide-hazard breakdown for one transaction, based on official landslide-hazard maps (1:10,000 scale): for each linked plot that intersects a mapped hazard area — the worst category ('landslide' = a mapped landslide area, 'threatened' = an area threatened by mass movements), the share of the plot inside the mapped zones, and the per-zone list (each with its source_version_date — the source-record version date, not a survey/observation date).
-An intersection at this scale means the parcel overlaps a mapped hazard area, not that the parcel itself is a landslide.
-search_transactions (and search_by_area) surface a per-transaction worst-case landslide_risk inline; this tool splits that into the individual parcels and zones behind it. Use it after a search when a result shows a landslide risk. (search_by_polygon does not include landslide inline.)
-TWO-STATE: a transaction whose land is in no mapped zone returns nothing — absence of data is never an assertion of safety. Cost: 4 tokens (refunded when there is no landslide data).`,
-  {
-    transaction_id: z.string().regex(UUID_RE, "transaction_id must be a UUID — copy the id from a search_transactions result").describe(
-      "Transaction id (UUID) from a search_transactions / search_by_area / search_by_polygon result.",
-    ),
-  },
+  `Parcel-by-parcel landslide-hazard breakdown for one transaction, from official landslide-hazard maps (1:10,000): per linked plot intersecting a mapped hazard area - the worst category ('landslide' = a mapped landslide area, 'threatened' = an area threatened by mass movements), the share of the plot inside the zones, and the per-zone list (with source_version_date, the source-record version date, not an observation date). At this scale an intersection means overlap with a mapped area, not that the parcel itself is a landslide.
+Use it after a search whose result shows landslide_risk (inline in search_transactions and search_by_area, not search_by_polygon). For a parcel with no transaction, get_parcel_report gives the share and zone kinds.
+Land in no mapped zone returns nothing - absence of data is never an assertion of safety. Cost: 4 tokens (refunded when there is no landslide data).`,
+  txIdShape(),
   { readOnlyHint: true, destructiveHint: false, title: "Transaction Landslide-Hazard Breakdown" },
   async (params) =>
     withErrorHandling("get_transaction_landslide", apiKey, async () => {
       requireApiKey(apiKey);
+      const txId = resolveTxId(params);
+      if (typeof txId !== "string") return txId;
       // `res` is the whole response body ({ data, truncated }); `res.data` is the parcel array.
-      const { data: res, creditInfo } = await getTransactionLandslide(params.transaction_id, apiKey);
+      const { data: res, creditInfo } = await getTransactionLandslide(txId, apiKey);
       return textResponse(formatLandslideBreakdown(res) + formatCreditFooter(creditInfo));
     }),
 );
@@ -1763,21 +2041,18 @@ TWO-STATE: a transaction whose land is in no mapped zone returns nothing — abs
 
 server.tool(
   "get_transaction_subsurface",
-  `Get the parcel-by-parcel subsurface breakdown for one transaction across two dimensions: mining terrains and major groundwater reservoirs. For each linked plot that overlaps either — the mining-terrain status ('active' | 'former') with its mineral class ('subsidence' = extraction with surface deformation, the actual mining-damage risk; 'surface' = open-pit working, mostly local impact; 'fluid' = borehole extraction; 'other'), the groundwater-reservoir status ('documented' | 'undocumented'), the share of the plot inside each, and the per-object lists (mining terrain: name, oversight authority, validity dates; reservoir: number, name, documentation).
-A mining terrain is a legally defined zone of anticipated mining influence; its mapped location is approximate — an intersection is an advisory signal to verify with the competent mining-supervision authority, not a legal determination. A groundwater reservoir's extent alone imposes NO restriction; a restriction would come only from an established protection zone, which is not published here.
-Use it for a specific transaction to see whether its land overlaps a mining terrain or a major groundwater reservoir, and the per-object detail. get_parcel_report includes a one-line subsurface summary per parcel.
-TWO-STATE: a transaction whose land overlaps neither layer returns nothing — absence of data is never an assertion of safety. Cost: 4 tokens (refunded when there is no subsurface data).`,
-  {
-    transaction_id: z.string().regex(UUID_RE, "transaction_id must be a UUID — copy the id from a search_transactions result").describe(
-      "Transaction id (UUID) from a search_transactions / search_by_area / search_by_polygon result.",
-    ),
-  },
+  `Use it to see whether one transaction's land overlaps a mining terrain or a major groundwater reservoir: per linked plot overlapping either - the mining-terrain status ('active' | 'former') with mineral class ('subsidence' = extraction with surface deformation, the actual mining-damage risk; 'surface' = open-pit, mostly local impact; 'fluid' = borehole extraction; 'other'), the reservoir status ('documented' | 'undocumented'), the share of the plot inside each, and per-object details.
+A mining terrain is a legally defined zone of anticipated mining influence with an approximate mapped location: an intersection is an advisory signal to verify with the competent mining-supervision authority, not a legal determination. A reservoir's extent alone imposes NO restriction; one would come only from a protection zone, which is not published here.
+For a parcel with no transaction, get_parcel_report lists the same objects. Land overlapping neither layer returns nothing - absence of data is never an assertion of safety. Cost: 4 tokens (refunded when there is no subsurface data).`,
+  txIdShape(),
   { readOnlyHint: true, destructiveHint: false, title: "Transaction Subsurface Breakdown" },
   async (params) =>
     withErrorHandling("get_transaction_subsurface", apiKey, async () => {
       requireApiKey(apiKey);
+      const txId = resolveTxId(params);
+      if (typeof txId !== "string") return txId;
       // `res` is the whole response body ({ data, truncated }); `res.data` is the parcel array.
-      const { data: res, creditInfo } = await getTransactionSubsurface(params.transaction_id, apiKey);
+      const { data: res, creditInfo } = await getTransactionSubsurface(txId, apiKey);
       return textResponse(formatSubsurfaceBreakdown(res) + formatCreditFooter(creditInfo));
     }),
 );
@@ -1786,22 +2061,18 @@ TWO-STATE: a transaction whose land overlaps neither layer returns nothing — a
 
 server.tool(
   "get_transaction_roads",
-  `Get the plot-by-plot road-access evidence for one transaction: for each linked plot, the distance in meters to the nearest public road, to the nearest road of any kind, and to the nearest motorway/expressway/dual-carriageway — plus, for the nearest public road, the estimated distance to the EDGE of its carriageway, its management category ('national' | 'voivodeship' | 'county' | 'municipal'), its functional class ('motorway' | 'expressway' | 'main_accelerated' | 'main' | 'collector' | 'local' | 'access' | 'other') and whether it runs at ground level (false = it crosses on a viaduct or in a tunnel, so it passes the plot over or under it). Each plot also carries access_indicator ('likely' | 'uncertain' | 'unlikely') and the version of the rule that produced it.
-access_indicator is GEOMETRIC EVIDENCE measured from carriageway centrelines in reference road-network data. It does NOT determine legal access and says nothing about easements or rights of way, which are recorded in the land register and are not published here — treat it as a lead to verify, never as a conclusion. That is why it has three states and is never a yes/no.
-Each measurement has a fixed radius: public road 500 m, road of any kind 500 m, motorway/expressway/dual-carriageway 3 km (that last one is a traffic-nuisance proxy, not an access signal). public_road_edge_distance_m is null when the source carries no carriageway width — no median is substituted.
-Use it for a specific transaction to judge how its land sits relative to the road network. get_parcel_report includes a one-line road-access summary per parcel.
-TWO-STATE: a null/absent distance means no such road within the search radius in the reference data — it is NEVER a guarantee that none exists. assessed=false means the plot has not been evaluated yet (no statement either way). Cost: 4 tokens (refunded when there is no informative data — no linked plots, or none evaluated yet).`,
-  {
-    transaction_id: z.string().regex(UUID_RE, "transaction_id must be a UUID — copy the id from a search_transactions result").describe(
-      "Transaction id (UUID) from a search_transactions / search_by_area / search_by_polygon result.",
-    ),
-  },
+  `Plot-by-plot road-access evidence for one transaction, to judge how its land sits relative to the road network: per linked plot, the distance in meters to the nearest public road (500 m), the nearest road of any kind (500 m) and the nearest motorway/expressway/dual-carriageway (3 km; a traffic-nuisance proxy, not access) - plus, for the nearest public road, the estimated distance to its carriageway EDGE (null when the source has no width), its management category and functional class, and whether it runs at ground level (false = viaduct or tunnel). Each plot carries access_indicator (likely / uncertain / unlikely) and its rule version.
+access_indicator is GEOMETRIC EVIDENCE from carriageway centrelines in reference road data. It does NOT determine legal access or say anything about easements and rights of way (land register, not published here) - a lead to verify, never a conclusion.
+A null distance means no such road within the radius in the reference data - NEVER a guarantee none exists; assessed=false = not evaluated yet. For a parcel with no transaction, get_parcel_report has a one-line road-access summary. Cost: 4 tokens (refunded when there is no informative data).`,
+  txIdShape(),
   { readOnlyHint: true, destructiveHint: false, title: "Transaction Road Access" },
   async (params) =>
     withErrorHandling("get_transaction_roads", apiKey, async () => {
       requireApiKey(apiKey);
+      const txId = resolveTxId(params);
+      if (typeof txId !== "string") return txId;
       // `res` is the whole response body ({ data, truncated }); `res.data` is the plot array.
-      const { data: res, creditInfo } = await getTransactionRoads(params.transaction_id, apiKey);
+      const { data: res, creditInfo } = await getTransactionRoads(txId, apiKey);
       return textResponse(formatRoads(res) + formatCreditFooter(creditInfo));
     }),
 );
@@ -1810,20 +2081,18 @@ TWO-STATE: a null/absent distance means no such road within the search radius in
 
 server.tool(
   "get_transaction_surroundings",
-  `Get the plot-by-plot surroundings profile for one transaction: for each linked plot, the distance in meters to the nearest cemetery, landfill (waste disposal site), sewage treatment plant, industrial/storage area, large industrial plant, intensive livestock farm, high-voltage overhead power line and extra-high-voltage overhead power line, from reference land-use and environmental-registry data. Useful for due-diligence on nearby nuisances.
-Distances are approximate and measured from the plot boundary; 0 means the plot touches or overlaps such an area. Each category is searched within a fixed radius only: cemetery 1 km, landfill 3 km, sewage treatment 2 km, industrial/storage 1 km, large industrial plant 3 km, intensive livestock farm 3 km, high-voltage overhead power line 1 km, extra-high-voltage overhead power line 1 km. Only overhead high- and extra-high-voltage lines are covered — medium- and low-voltage lines are ubiquitous and carry no signal, and no easement corridor width or substation is published here.
-TWO-STATE: a null/absent distance means no such object within the search radius in the reference data — it is NEVER a guarantee that none exists. assessed=false means the plot has not been evaluated yet (no statement either way). Cost: 4 tokens (refunded when there is no informative data — no linked plots, or none evaluated yet).`,
-  {
-    transaction_id: z.string().regex(UUID_RE, "transaction_id must be a UUID — copy the id from a search_transactions result").describe(
-      "Transaction id (UUID) from a search_transactions / search_by_area / search_by_polygon result.",
-    ),
-  },
+  `Plot-by-plot surroundings profile for one transaction, for due diligence on nearby nuisances: per linked plot, the distance in meters to the nearest cemetery (1 km radius), landfill (3 km), sewage treatment plant (2 km), industrial/storage area (1 km), large industrial plant (3 km), intensive livestock farm (3 km), high-voltage overhead power line (1 km) and extra-high-voltage overhead power line (1 km).
+Distances are approximate, from the plot boundary; 0 = the plot touches or overlaps. Only overhead high- and extra-high-voltage lines are covered (medium and low voltage are ubiquitous). For a parcel with no transaction, get_parcel_report lists the same distances.
+A null distance means no such object within the radius in the reference data - NEVER a guarantee none exists; assessed=false = not evaluated yet. Cost: 4 tokens (refunded when there is no informative data).`,
+  txIdShape(),
   { readOnlyHint: true, destructiveHint: false, title: "Transaction Surroundings Breakdown" },
   async (params) =>
     withErrorHandling("get_transaction_surroundings", apiKey, async () => {
       requireApiKey(apiKey);
+      const txId = resolveTxId(params);
+      if (typeof txId !== "string") return txId;
       // `res` is the whole response body ({ data, truncated }); `res.data` is the plot array.
-      const { data: res, creditInfo } = await getTransactionSurroundings(params.transaction_id, apiKey);
+      const { data: res, creditInfo } = await getTransactionSurroundings(txId, apiKey);
       return textResponse(formatSurroundings(res) + formatCreditFooter(creditInfo));
     }),
 );
@@ -1832,20 +2101,17 @@ TWO-STATE: a null/absent distance means no such object within the search radius 
 
 server.tool(
   "get_transaction_transit",
-  `Get the parcel-by-parcel public transport access breakdown for one transaction: for each linked plot, the nearest public transport stop distances per transaction parcel, by mode (rail/metro/tram/bus), from open GTFS data — plus the nearest stop's name for each mode present.
-A mode is present only when a stop of that mode is within its cap (rail/metro 3000 m, tram 1500 m, bus 1000 m).
-TWO-STATE: a transaction whose land has no stop within cap in any mode returns nothing — absence of a row is never asserted as "no transit access" (open feeds cover cities and national rail, not every rural area). Cost: 4 tokens (refunded when there is no transit data).`,
-  {
-    transaction_id: z.string().regex(UUID_RE, "transaction_id must be a UUID — copy the id from a search_transactions result").describe(
-      "Transaction id (UUID) from a search_transactions / search_by_area / search_by_polygon result.",
-    ),
-  },
+  `Use it to check public-transport access to one transaction's land: for each linked plot, the nearest stop distance by mode (rail/metro within 3000 m, tram 1500 m, bus 1000 m) from open GTFS data, plus the nearest stop's name per mode present.
+No stop within its cap in any mode returns nothing - absence of a row is never "no transit access" (open feeds cover cities and national rail, not every rural area). Cost: 4 tokens (refunded when there is no transit data).`,
+  txIdShape(),
   { readOnlyHint: true, destructiveHint: false, title: "Transaction Public Transport Access Breakdown" },
   async (params) =>
     withErrorHandling("get_transaction_transit", apiKey, async () => {
       requireApiKey(apiKey);
+      const txId = resolveTxId(params);
+      if (typeof txId !== "string") return txId;
       // `res` is the whole response body ({ data, truncated }); `res.data` is the parcel array.
-      const { data: res, creditInfo } = await getTransactionTransit(params.transaction_id, apiKey);
+      const { data: res, creditInfo } = await getTransactionTransit(txId, apiKey);
       return textResponse(formatTransitBreakdown(res) + formatCreditFooter(creditInfo));
     }),
 );
@@ -1854,21 +2120,119 @@ TWO-STATE: a transaction whose land has no stop within cap in any mode returns n
 
 server.tool(
   "get_transaction_permits",
-  `Get the building-permit history for one transaction's parcels, from the official national registry of building permits and works notifications (records since 2016): for each case — its kind (permit / notification), the building intent and works type, the statutory object category, the deciding authority, the decision or intake date, the investment address, and the volume.
-Use it after a search to screen what has been built or approved on the transaction's land — a leading indicator of development activity. Match is by the parcel's current identifier, so splits/merges break the link. Permits are held once a decision has been issued; the outcome of that decision, granted or refused, is not part of the data held here. Notifications are held only where they were accepted without objection. Cases still pending are not held at all.
-TWO-STATE: a transaction whose parcels have no registered case returns nothing — an empty result is never a confirmation that nothing was ever planned. Cost: 4 tokens (refunded when there is no record).`,
-  {
-    transaction_id: z.string().regex(UUID_RE, "transaction_id must be a UUID — copy the id from a search_transactions result").describe(
-      "Transaction id (UUID) from a search_transactions / search_by_area / search_by_polygon result.",
-    ),
-  },
+  `Building-permit history for one transaction's parcels, from the national registry of building permits and works notifications (records since 2016): per case - kind (permit / notification), works type, object category, authority, date, address, volume. Use it after a search to screen what was built or approved on the land.
+Match is by the parcel's current identifier, so splits/merges break the link. Permits are held once a decision is issued (its outcome, granted or refused, is not held); notifications only where accepted without objection; pending cases not at all.
+For a parcel with no transaction, get_parcel_report lists the cases in its building-activity section. For what is being built around a point, use get_permits_in_area.
+Three coverage states: covered (at least one registered case), covered_no_data (the transaction exists, its parcels have no case), not_covered (no transaction with this id). An empty result never confirms that nothing was planned. Cost: 4 tokens (refunded when there is no record or no such transaction).`,
+  txIdShape(),
   { readOnlyHint: true, destructiveHint: false, title: "Transaction Building-Permit History" },
   async (params) =>
     withErrorHandling("get_transaction_permits", apiKey, async () => {
       requireApiKey(apiKey);
+      const txId = resolveTxId(params);
+      if (typeof txId !== "string") return txId;
       // `res` is the whole response body ({ data, truncated, note }); `res.data` is the record array.
-      const { data: res, creditInfo } = await getTransactionPermits(params.transaction_id, apiKey);
+      const { data: res, creditInfo } = await getTransactionPermits(txId, apiKey);
       return textResponse(formatPermitsBreakdown(res) + formatCreditFooter(creditInfo));
+    }),
+);
+
+// ── Tool: get_permits_in_area ───────────────────────────────────────
+// Collection over a circle. The route can be unavailable, so the description says so and the
+// handler degrades a 503 carrying a feature-off mode into a plain message (as estimate_land_value does).
+
+// Composed here instead of echoing the 503 body.
+const AREA_PERMITS_DISABLED_MESSAGE =
+  "Building permits within a radius are temporarily unavailable — this feature is briefly switched off. No credit was charged; please try again later.";
+
+const PERMITS_RADIUS_MESSAGE =
+  "radiusKm must be between 0.1 and 2 km. For a wider area, make several calls with neighbouring centre points; for what is closest to the point, use a smaller radius.";
+
+// Statutory object categories (annex to the Construction Law), the closed set the service accepts.
+const PERMIT_OBJECT_CATEGORIES = [
+  "I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X", "XI", "XII", "XIII", "XIV", "XV",
+  "XVI", "XVII", "XVIII", "XIX", "XX", "XXI", "XXII", "XXIII", "XXIV", "XXV", "XXVI", "XXVII", "XXVIII", "XXIX", "XXX",
+] as const;
+
+server.tool(
+  "get_permits_in_area",
+  `List the building permits and works notifications registered since 2016 within a radius of a point - issued decisions only, matched through the parcel geometry we hold, which is near-complete but not the whole cadastre - to see what is being built nearby.
+Returns cases newest first, NOT nearest first (a permit and a notification for one investment are two cases), plus an aggregate by year and statutory object category over ALL matched cases (do not add it up across pages) with the permit/notification split and building volume. truncated = more cases than the limit: pass the returned cursor back as cursor with the same filters.
+Examples: apartment blocks → categories=[XIII]; drop utility-network noise (XXVI can be most of a list) → excludeCategories=[XXVI]; utility works as a sign that land is being serviced for development → categories=[XXVI]. For "how many / how much" pass aggregateOnly=true (same price). The list is ordered by date: for what is closest use a smaller radiusKm (e.g. 0.3) instead of paging; radiusKm is 0.1–2 (default 2), for a wider area make several calls for neighbouring centres.
+Reading it: decision outcomes (granted or refused) are not held; notifications only where accepted without objection; pending cases not at all. Matching uses the parcel's current identifier and geometry, so cases filed before a split or merge may be missed, parcels without geometry are not searched and a parcel number with a sheet segment may be matched less exactly. The answer states how many parcels we hold in the circle (0 = no data for the area) and the date of the last refresh: loaded periodically, not live. A volume marked suspect stays in the sums. A short or empty list is never a statement that nothing is being built. A query over the time limit returns an error asking for a smaller radius.
+Coordinates: for a parcel take them from resolve_parcel (or search_parcels); for a street use list_parcels_in_area(location, street) and the centre point of a returned row; otherwise from the user - never guess them.
+Cost: 5 API tokens per call, also for an empty list; each page is a separate call. It can be switched off for maintenance (a plain "temporarily unavailable" reply).`,
+  {
+    // Bounds are the Poland bbox, same as estimate_value: the data is Polish, and a point outside it only buys a round-trip.
+    lat: z.number().min(49).max(55).describe(
+      "Circle centre latitude (WGS84, Poland), from resolve_parcel / list_parcels_in_area or the user; never guessed.",
+    ),
+    lng: z.number().min(14).max(25).describe(
+      "Circle centre longitude (WGS84, Poland), from resolve_parcel / list_parcels_in_area or the user; never guessed.",
+    ),
+    // Custom messages: the default zod text would not tell the caller what to do instead.
+    radiusKm: z.number().min(0.1, PERMITS_RADIUS_MESSAGE).max(2, PERMITS_RADIUS_MESSAGE).optional().describe(
+      "Radius in km, 0.1–2 (default 2).",
+    ),
+    dateFrom: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "dateFrom must be YYYY-MM-DD").optional().describe(
+      "Window start, YYYY-MM-DD (decision date; intake date for notifications). Default two years back; earlier than 2016-01-01 counts as 2016-01-01.",
+    ),
+    dateTo: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "dateTo must be YYYY-MM-DD").optional().describe(
+      "Window end, YYYY-MM-DD, inclusive, not before dateFrom. When older than two years, pass dateFrom as well.",
+    ),
+    intent: z.enum(["multi_family", "single_family", "all"]).optional().describe(
+      "multi_family = categories [XIII], single_family = [I] (incl. semi-detached and terraced), all = no filter (default). Not with categories.",
+    ),
+    categories: z.array(z.enum(PERMIT_OBJECT_CATEGORIES)).min(1).max(PERMIT_OBJECT_CATEGORIES.length).optional().describe(
+      "Keep only these object categories (Roman numerals I–XXX). Not with intent other than all; must not overlap excludeCategories.",
+    ),
+    excludeCategories: z.array(z.enum(PERMIT_OBJECT_CATEGORIES)).min(1).max(PERMIT_OBJECT_CATEGORIES.length).optional().describe(
+      "Drop these object categories (cases without a category stay). Must not overlap categories.",
+    ),
+    worksType: z.enum(["new_construction", "all"]).optional().describe(
+      "new_construction (default) or all (adds extensions, demolitions and other works).",
+    ),
+    limit: z.number().int().min(1).max(200).optional().describe(
+      "Cases in the list, 1–200 (default 50). The aggregate counts all matched cases.",
+    ),
+    cursor: z.string().min(1).max(300).optional().describe(
+      "Cursor from the previous answer, for the next page; pass it back unchanged with the same filters. Not with aggregateOnly.",
+    ),
+    aggregateOnly: z.boolean().optional().describe(
+      "true = only the aggregate (year × category counts, split, volumes), no case list. Same price; not with cursor.",
+    ),
+  },
+  { readOnlyHint: true, destructiveHint: false, title: "Building Permits Within a Radius" },
+  async (params) =>
+    withErrorHandling("get_permits_in_area", apiKey, async () => {
+      requireApiKey(apiKey);
+      try {
+        const { data, creditInfo } = await getPermitsInArea(
+          {
+            lat: params.lat,
+            lng: params.lng,
+            radiusKm: params.radiusKm,
+            dateFrom: params.dateFrom,
+            dateTo: params.dateTo,
+            intent: params.intent,
+            categories: params.categories,
+            excludeCategories: params.excludeCategories,
+            worksType: params.worksType,
+            limit: params.limit,
+            cursor: params.cursor,
+            aggregateOnly: params.aggregateOnly,
+          },
+          apiKey,
+        );
+        return textResponse(formatPermitsInArea(data, { continued: Boolean(params.cursor) }) + formatCreditFooter(creditInfo));
+      } catch (error) {
+        // A 503 with the feature-off mode degrades into a plain message and is not reported to
+        // error tracking. Other 503s are rethrown onto the normal path.
+        if (error instanceof ApiHttpError && error.status === 503 && error.mode === "area-disabled") {
+          return { content: [{ type: "text" as const, text: AREA_PERMITS_DISABLED_MESSAGE }], isError: true };
+        }
+        throw error;
+      }
     }),
 );
 
@@ -1876,20 +2240,17 @@ TWO-STATE: a transaction whose parcels have no registered case returns nothing �
 
 server.tool(
   "get_transaction_planning",
-  `Get the general-plan (plan ogólny, POG) zoning for one transaction's land: for each linked plot, the planning zones that cover it — zone symbol and name, the share of the plot each zone covers, and the building parameters the plan sets (max building height, max development intensity, max built-up coverage, min biologically active area) — plus any overlay areas (infill development area / obszar uzupełnienia zabudowy, central development area) that sit on top.
-Coverage is honest and THREE-STATE: 'covered' returns zone data; 'covered_no_data' means the municipality has an adopted general plan but no zone data covers these plots in the data yet; 'not_covered' means no published general-plan data for this municipality yet — this is NEVER a claim that the municipality has no plan. General plans are still being adopted across Poland, so coverage grows over time.
-Use it for feasibility and permitted-use questions on a plot. Cost: 4 tokens (refunded when there is no zone data for the transaction — 'covered_no_data' or 'not_covered').`,
-  {
-    transaction_id: z.string().regex(UUID_RE, "transaction_id must be a UUID — copy the id from a search_transactions result").describe(
-      "Transaction id (UUID) from a search_transactions / search_by_area / search_by_polygon result.",
-    ),
-  },
+  `General-plan (plan ogólny, POG) zoning for one transaction's land: per linked plot, the zones covering it - symbol, name, share of the plot, the building parameters the plan sets (max height, max development intensity, max built-up coverage, min biologically active area) - plus overlay areas (infill development area / obszar uzupełnienia zabudowy, central development area). Use it for feasibility and permitted-use questions on a plot.
+Coverage is THREE-STATE: 'covered' returns zone data; 'covered_no_data' = the municipality has an adopted general plan but no zone data covers these plots yet; 'not_covered' = no published general-plan data for the municipality yet - NEVER a claim that it has no plan (general plans are still being adopted). Cost: 4 tokens (refunded for covered_no_data and not_covered).`,
+  txIdShape(),
   { readOnlyHint: true, destructiveHint: false, title: "Transaction General-Plan Zoning" },
   async (params) =>
     withErrorHandling("get_transaction_planning", apiKey, async () => {
       requireApiKey(apiKey);
+      const txId = resolveTxId(params);
+      if (typeof txId !== "string") return txId;
       // `res` is the whole response body ({ data, truncated, coverage, ... }); `res.data` is the zone/overlay array.
-      const { data: res, creditInfo } = await getTransactionPlanning(params.transaction_id, apiKey);
+      const { data: res, creditInfo } = await getTransactionPlanning(txId, apiKey);
       return textResponse(formatPlanningBreakdown(res) + formatCreditFooter(creditInfo));
     }),
 );
@@ -1898,19 +2259,17 @@ Use it for feasibility and permitted-use questions on a plot. Cost: 4 tokens (re
 
 server.tool(
   "get_transaction_farmland",
-  `Get the parcel-by-parcel agricultural land-eligibility breakdown for one transaction, from official nationwide agricultural land-eligibility data (updated weekly): for each linked parcel with a matched eligible agricultural area — the eligible area in square metres, its share of the parcel (when the parcel's measured area is known), and how many source features compose it. The response also reports how many of the transaction's linked parcels carry a match and the source snapshot date. Useful for due-diligence on land that is actually eligible/maintained as agricultural (beyond what a registry classification says on paper).
-TWO-STATE: a parcel with no matched eligible area returns nothing — absence of a match is NEVER a statement that the property is non-agricultural (small plots that are not actively farmed are simply absent, the reference layer has its own update cadence, and older transactions can reference renumbered parcels). Cost: 4 tokens (refunded when there is no eligible agricultural area for the linked parcels).`,
-  {
-    transaction_id: z.string().regex(UUID_RE, "transaction_id must be a UUID — copy the id from a search_transactions result").describe(
-      "Transaction id (UUID) from a search_transactions / search_by_area / search_by_polygon result.",
-    ),
-  },
+  `Parcel-by-parcel agricultural land-eligibility breakdown for one transaction, from official nationwide eligibility data (updated weekly): per linked parcel with a matched eligible area - the area in m², its share of the parcel (when the measured area is known) and the number of source features; also how many linked parcels carry a match and the snapshot date. Useful for due diligence on land actually eligible/maintained as agricultural, beyond the paper classification.
+A parcel with no match returns nothing - absence is NEVER a statement that the property is non-agricultural (small plots not actively farmed are absent, the layer has its own update cadence, older transactions can reference renumbered parcels). Cost: 4 tokens (refunded when there is no eligible area).`,
+  txIdShape(),
   { readOnlyHint: true, destructiveHint: false, title: "Transaction Agricultural Land-Eligibility Breakdown" },
   async (params) =>
     withErrorHandling("get_transaction_farmland", apiKey, async () => {
       requireApiKey(apiKey);
+      const txId = resolveTxId(params);
+      if (typeof txId !== "string") return txId;
       // `res` is the whole response body ({ data, truncated, parcels_total, parcels_with_data, as_of }).
-      const { data: res, creditInfo } = await getTransactionFarmland(params.transaction_id, apiKey);
+      const { data: res, creditInfo } = await getTransactionFarmland(txId, apiKey);
       return textResponse(formatFarmland(res) + formatCreditFooter(creditInfo));
     }),
 );
@@ -1919,22 +2278,19 @@ TWO-STATE: a parcel with no matched eligible area returns nothing — absence of
 
 server.tool(
   "get_transaction_nature",
-  `Get the parcel-by-parcel nature breakdown for one transaction: for each linked plot with a nature signal — the nearest forest within 2 km (forest_distance_m in metres, 0 = the plot overlaps forest, with its overlap share) and any overlapping protected natural areas: the sharpest form (protection_rank 1 = national park, 2 = nature reserve, 3 = Natura 2000, 4 = landscape park, 5 = protected landscape, 6 = other), building_restriction ('statutory_ban' = a build ban that follows directly from the Nature Protection Act for national parks and reserves, 'conditional' = restrictions depend on the act that established the area), the share of the plot under protection, and the named areas.
-This describes the SOURCE of a restriction (statute vs the establishing act), never the outcome of a specific permitting case, and is not legal advice. Forest is an amenity signal (proximity), protected areas a due-diligence one (build limits).
-Search results do not carry a nature signal, so call this tool directly on a transaction id whenever forest proximity or protected-area build limits matter. Use it after a search on land plots.
-An empty result is NEVER a statement that building is allowed — this layer does not cover local zoning plans, planning-permission decisions or areas under designation. A buffer zone around a park or reserve IS reported, as form 'buffer_zone' at rank 6, and never as a statutory ban. An empty result also says which kind of empty it is: either the plots were checked and carry no signal, or no nature reference data is held for them yet and nothing was checked — the second is never a finding that there is no forest or protected area. Cost: 4 tokens (refunded on any empty result).`,
-  {
-    transaction_id: z.string().regex(UUID_RE, "transaction_id must be a UUID — copy the id from a search_transactions result").describe(
-      "Transaction id (UUID) from a search_transactions / search_by_area / search_by_polygon result.",
-    ),
-  },
+  `Parcel-by-parcel nature breakdown for one transaction: per linked plot with a nature signal - the nearest forest within 2 km (forest_distance_m, 0 = the plot overlaps forest, with the overlap share) and any overlapping protected areas: the sharpest form (protection_rank 1 = national park, 2 = nature reserve, 3 = Natura 2000, 4 = landscape park, 5 = protected landscape, 6 = other), building_restriction ('statutory_ban' = a ban following from the Nature Protection Act for parks and reserves, 'conditional' = depends on the establishing act), the share of the plot under protection and names.
+Search results carry no nature signal: call this directly on a transaction id when forest proximity or protected-area build limits matter. For a parcel with no transaction, get_parcel_report names the protected areas. It describes the SOURCE of a restriction, not a permitting outcome; not legal advice.
+An empty result is NEVER a statement that building is allowed (local plans and permit decisions are not covered). A buffer zone around a park or reserve is reported as 'buffer_zone' at rank 6, never as a statutory ban. An empty result says which kind it is: plots checked with no signal, or no nature data held yet - the second is never a finding of no forest or protected area. Cost: 4 tokens (refunded on any empty result).`,
+  txIdShape(),
   { readOnlyHint: true, destructiveHint: false, title: "Transaction Nature (Forest & Protected Areas) Breakdown" },
   async (params) =>
     withErrorHandling("get_transaction_nature", apiKey, async () => {
       requireApiKey(apiKey);
+      const txId = resolveTxId(params);
+      if (typeof txId !== "string") return txId;
       // `res` is the whole response body ({ data, truncated, coverage }); `res.data` is the parcel array.
       // The formatter needs the envelope, not just the rows: `coverage` is what an empty result means.
-      const { data: res, creditInfo } = await getTransactionNature(params.transaction_id, apiKey);
+      const { data: res, creditInfo } = await getTransactionNature(txId, apiKey);
       return textResponse(formatNatureBreakdown(res) + formatCreditFooter(creditInfo));
     }),
 );

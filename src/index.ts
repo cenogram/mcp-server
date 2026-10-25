@@ -11,6 +11,7 @@ import { dispatchAuth, sanitizeForLog } from "./auth-dispatch.js";
 import { requestContext } from "./request-context.js";
 import { signupUrl } from "./error-messages.js";
 import { channelSrc, isHttpMode } from "./transport-mode.js";
+import { FAVICON_ICO, FAVICON_SVG } from "./favicon.js";
 
 function logAuth(payload: Record<string, unknown>, level: "info" | "warn" | "error"): void {
   process.stderr.write(JSON.stringify({ level, ...payload }) + "\n");
@@ -45,50 +46,40 @@ try {
  */
 export function serverInstructions(): string {
   return [
-    "Cenogram MCP Server - 8M+ verified real estate transactions from Poland's official RCN registry (Rejestr Cen Nieruchomości). Transaction prices from notarial deeds - NOT asking/listing prices. Data from 2003 to present, 380 counties, refreshed every ~2 weeks.",
+    "Cenogram MCP Server - 8M+ verified real estate transactions from Poland's official RCN registry (Rejestr Cen Nieruchomości). Prices from notarial deeds - NOT asking/listing prices. Data from 2003 to present, 380 counties, refreshed every ~2 weeks.",
     "",
     "CRITICAL - Addressing a place (resolve the name to a code first):",
-    "- To point at a place, resolve its name to a code: list_locations(search=\"name\") returns a TERYT code for every match; pass that as search_transactions(teryt=code) for filtering that carries no name ambiguity.",
-    "- The name is a parallel path, not a fallback. A match the result flags as an RCN district (and any match that has no TERYT code) also accepts its name directly as search_transactions(location=name). Use location= only for a name a result handed you, never one you guessed.",
-    "- Warsaw: 'Warszawa' auto-includes all 18 districts. Or use specific: Mokotów, Wola, Śródmieście",
-    "- Kraków/Łódź: 'Kraków'/'Łódź' auto-include all sub-districts. Or use specific: Kraków-Podgórze, etc.",
-    "- Most cities (Gdańsk, Gdynia, Sopot, Poznań, Wrocław): just the city name, no sub-districts",
-    "- Neighborhoods/osiedla (Nowy Dwór, Oliwa, Jeżyce) are usually NOT TERYT districts - three cases: (a) if the name is an administrative unit or cadastral precinct, list_locations(search=name) returns its teryt, use that; (b) for a precinct name PLUS a parcel number, resolve_parcel(q=\"name number\") turns the pair into one parcel; (c) for a true neighbourhood outside TERYT, get coordinates FROM THE USER and pass them to search_by_area (radiusKm 0.5-1.0), then refine with search_by_polygon - never invent coordinates. resolve_parcel does not resolve a bare neighbourhood name; it needs a name and a parcel number.",
-    "- TERYT hierarchy: For precise administrative filtering (avoids name ambiguity), use list_locations(parent) to browse TERYT codes, then search_transactions(teryt=code).",
-    "- Use 'location' for quick city searches, 'teryt' when you need exact administrative boundaries.",
+    "- list_locations(search=\"name\") returns a TERYT code for every match; pass it as search_transactions(teryt=code) - no name ambiguity. To browse instead, use list_locations(parent=code).",
+    "- A match the result flags as an RCN district (and any match with no TERYT code) also accepts its name as search_transactions(location=name). Use location= only for a name a result handed you, never one you guessed.",
+    "- 'Warszawa' auto-includes all 18 districts, 'Kraków'/'Łódź' all sub-districts (or name one: Mokotów, Kraków-Podgórze); most other cities need just the city name.",
+    "- Neighborhoods/osiedla (Nowy Dwór, Oliwa, Jeżyce) are usually NOT TERYT districts: (a) an administrative unit or cadastral precinct → list_locations(search=name) returns its teryt; (b) a precinct name PLUS a parcel number → resolve_parcel(q=\"name number\") - it does not resolve a bare neighbourhood name; (c) a true neighbourhood outside TERYT → coordinates FROM THE USER (never invent them) → search_by_area (radiusKm 0.5-1.0), then refine with search_by_polygon.",
+    "- Use location for quick city searches, teryt when exact administrative boundaries matter. A name that is unknown or shared by several units returns an error listing candidate units with their codes - pick one and pass it as teryt.",
     "",
     "Workflows:",
     "- Market analysis: get_market_overview → get_price_statistics(location) → search_transactions",
     // Only documented when those tools are actually registered.
     ...(experimentalToolsEnabled()
       ? [
-          "- Rental yield: (experimental - may change/withdraw) list_rental_yield_locations (catalog of covered cities) → get_rental_yield(location|teryt) - indicative gross yield from asking rent vs RCN transaction prices. County level only (miasta na prawach powiatu), or Warszawa district via 6-digit teryt. For any name that is not a major city you know is covered, call the catalog FIRST or pass a county teryt - towns inside a larger powiat and non-Warszawa districts 404.",
-          "- Price spread: (experimental - may change/withdraw) list_price_spread_locations (catalog of covered cities) → get_price_spread(location|teryt) - asking-vs-transaction price spread %, marketType all|secondary|primary. County level only (miasta na prawach powiatu), or Warszawa district via 6-digit teryt. For any name that is not a major city you know is covered, call the catalog FIRST or pass a county teryt - towns inside a larger powiat and non-Warszawa districts 404.",
-          "- Flood-hazard exposure: (experimental - may change/withdraw) list_flood_risk_locations (catalog of covered counties) → get_flood_risk(location|teryt) - share of a county's transactions on land in a mapped flood-hazard zone, by severity (return periods). County level, all-time. Counts a mapped zone only; absence is never asserted as 'safe'. For any name that is not a major city you know is covered, call the catalog FIRST or pass a county teryt.",
+          "- Rental yield: (experimental) list_rental_yield_locations → get_rental_yield(location|teryt) - gross yield from asking rent vs RCN prices. County level or a Warszawa district (6-digit teryt); a gmina name resolves to its county (shown in the answer), a name shared by gminas in several counties returns candidates.",
+          "- Price spread: (experimental) list_price_spread_locations → get_price_spread(location|teryt) - asking-vs-transaction spread %; same coverage and name rule.",
+          "- Flood exposure: (experimental) list_flood_risk_locations → get_flood_risk(location|teryt) - share of a county's transactions in a mapped flood zone, by severity. Absence of a zone is never 'safe'. Catalog first, or a county teryt.",
         ]
       : []),
-    "- Compare locations: list_locations → compare_locations (2-5 districts, requires at least one filter e.g. propertyType). Add includeDemographics=true for a GUS BDL block per district.",
-    "- Demographics & local stats: get_demographics(location|teryt) — GUS BDL indicators (population, economy, housing, planning, safety, education, prices). A city name resolves to county level; pass a 6/7-digit teryt for gmina-level detail.",
-    "- Parcel lookup: search_parcels(q, min 3 chars) → get_parcel_report(parcelId) for everything on the parcel, or search_transactions(parcelId) for its sale history.",
-    "- Find parcels in an area: list_parcels_in_area (name it with teryt, location, bbox or a circle) filtered by street, buildingNumber, minArea, maxArea → get_parcel_land_class for the soil class of one you pick, or get_parcel_report for everything on it.",
-    "- Parcel resolve: resolve_parcel(parcelId | q | lat+lng) — turn a full parcel id, a UUID, a 'locality name + parcel number', or a coordinate into a concrete parcel; feed the returned id to search_transactions(parcelId) for its sale history.",
-    "- Per-building detail: search_transactions → get_building_breakdown(transaction_id) — footprint, storeys, est. total floor area per building (searches return per-transaction sums inline)",
-    "- Surroundings (nearby nuisances): search_transactions → get_transaction_surroundings(transaction_id) — per-plot distance to the nearest cemetery, landfill, sewage treatment plant, industrial/storage area, large industrial plant, intensive livestock farm, and overhead high-voltage and extra-high-voltage power line. A null distance = nothing within the search radius in reference data, never a guarantee.",
-    "- Road access: search_transactions → get_transaction_roads(transaction_id) — per-plot distance to the nearest public road (with its category, class and the estimated distance to the carriageway edge), to the nearest road of any kind, and to the nearest motorway/expressway/dual-carriageway, plus a three-state access_indicator. It is geometric evidence from carriageway centrelines, NOT a determination of legal access - easements and rights of way live in the land register and are not published here.",
-    "- Address search: search_transactions(location, street, buildingNumber)",
-    "- Radius search: search_by_area(lat, lng, radiusKm) - for geographic proximity",
-    "- Polygon search: search_by_polygon - coordinates are [longitude, latitude], first=last point, max 500 vertices",
-    "- TERYT drill-down: list_locations() → list_locations(parent=voivodeshipCode) → list_locations(parent=countyCode) → search_transactions(teryt=municipalityCode)",
+    "- Compare locations: list_locations → compare_locations (2-5 districts, needs at least one filter e.g. propertyType); includeDemographics=true adds a GUS BDL block per district.",
+    "- Local stats: get_demographics(location|teryt) - GUS BDL indicators (county level for city/county names, gmina level for gmina names or a 6/7-digit teryt).",
+    "- Parcels: search_parcels(q, min 3 chars) / resolve_parcel(parcelId | q | lat+lng) / list_parcels_in_area (area: teryt, location, bbox, circle or polygon; street narrows it) → get_parcel_report(parcelId) for everything on the parcel, get_parcel_land_class for its soil class, or search_transactions(parcelId) for its sale history.",
+    "- Value estimate: estimate_value (apartment) / estimate_land_value (building plot or farmland) at a point (lat+lng or parcelId) - an orientation estimate, not a certified appraisal.",
+    "- Developer neighbourhood: resolve a point (resolve_parcel / search_parcels, or coordinates from the user, never guessed) → get_permits_in_area(lat, lng, radiusKm up to 2); issued decisions only, so a short or empty list is never proof that nothing is being built.",
+    "- Per-transaction detail: search_transactions → get_building_breakdown or any get_transaction_* layer tool, with the transaction_id. Empty or null = nothing found in the reference data, never a guarantee.",
+    "- Address search: search_transactions(location, street, buildingNumber). Radius: search_by_area. Polygon: search_by_polygon.",
     "",
     "Data notes:",
-    "- Median/average prices are market-based: fractional ownership shares (share_basis=\"fraction\") and non-market deeds (public tenders, foreclosures, privileged/subsidized sales) are excluded from price aggregates. Transaction counts and coverage stay full. search_transactions/search_by_area flag fractional-share rows so you can spot which comparables are partial.",
-    "- price_per_m2 only meaningful for apartments (propertyType=\"unit\")",
-    "- Field provenance (search_transactions/search_by_area/search_by_polygon): per-record values are from the notarial deed (RCN) by default and carry no marker. Values we computed (parcel area summed across plots or converted from hectares; an inferred or reclassified property type) and approximated streets are flagged inline with a neutral [...] note — mirroring the \"Z RCN / Obliczone / Uzupełnione\" tiers on cenogram.pl. A field being absent from a result does NOT mean the deed omitted it: the county may simply not report that field.",
-    "- Rooms (izby) filter: search_transactions/search_by_area/search_by_polygon/compare_locations accept `rooms` (array, e.g. [\"2\",\"3\"]; \"8plus\" = 8 or more). Units only (propertyType=\"unit\"); rows with no room count are excluded. NOTE: RCN counts izby (chambers - a kitchen counts as one izba), so values run higher than portal \"pokoje\" listings.",
-    "- Floor (piętro) filter: the same tools accept `floor` (array, e.g. [\"0\",\"1\",\"2\"]; \"0\" = ground/parter, negatives = basement, \"10plus\" = 10 or more, \"0plus\" = ground and above, \"unknown\" = no floor recorded). Units only; this is the unit's floor, NOT the number of building storeys. Rows with no floor are excluded unless \"unknown\" is included.",
-    "- Results paginated (default 10-20). Use page parameter for more.",
-    `- For §79-compliant export table or interactive map - direct user to https://cenogram.pl/ceny-transakcyjne?src=${channelSrc()}`,
-    `- Deep link / permalink to the map: from a transaction's \`id\` and its \`Location: <A>°N, <B>°E\` line, build https://cenogram.pl/ceny-transakcyjne?src=${channelSrc()}#v=1&lat=<A>&lng=<B>&z=16&tx=<id> (drop the °N/°E; lat = the °N number, lng = the °E number) — opens that exact transaction on the map. Omit &tx=<id> for a link centered on the area without a specific row open.`,
+    "- Price aggregates are market-based: fractional shares (share_basis=\"fraction\") and non-market deeds (tenders, foreclosures, privileged/subsidized sales) are excluded; counts and coverage stay full. Search results flag fractional-share rows.",
+    "- price_per_m2 is only meaningful for apartments (propertyType=\"unit\").",
+    "- Field provenance (search tools): values are from the notarial deed (RCN) unless an inline [...] note flags a computed value or approximated street. A field absent from a result does NOT mean the deed omitted it: the county may not report it.",
+    "- `rooms` counts RCN izby (a kitchen is one), so it runs higher than portal \"pokoje\"; `floor` is the unit's floor, NOT building storeys. Both: units only.",
+    "- Rate limit: requests are limited per API key per minute, so parallel agents sharing one key share the same limit. On a \"Too many requests\" response, wait the number of seconds it gives and retry sequentially.",
+    `- For a §79-compliant export table or interactive map, direct the user to https://cenogram.pl/ceny-transakcyjne?src=${channelSrc()}. Deep link to one transaction: the Permalink recipe in the search tool descriptions.`,
   ].join("\n");
 }
 
@@ -233,6 +224,10 @@ export async function handleHttpRequest(req: import("node:http").IncomingMessage
           apiUrl,
         }),
       );
+    } else if (pathname === "/favicon.ico") {
+      res.writeHead(200, { "Content-Type": "image/x-icon", "Cache-Control": "public, max-age=86400" }).end(FAVICON_ICO);
+    } else if (pathname === "/favicon.svg") {
+      res.writeHead(200, { "Content-Type": "image/svg+xml", "Cache-Control": "public, max-age=86400" }).end(FAVICON_SVG);
     } else if (pathname === "/robots.txt") {
       res.writeHead(200, { "Content-Type": "text/plain", "Cache-Control": "public, max-age=86400" }).end(
         "User-agent: *\nDisallow: /\n",

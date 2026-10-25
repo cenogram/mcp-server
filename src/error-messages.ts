@@ -1,3 +1,4 @@
+import { freeToolNames } from "./free-tools.js";
 import { channelSrc } from "./transport-mode.js";
 
 // SOH char (\x01) - must match OAUTH_CTX_PREFIX in api-client.ts
@@ -22,11 +23,15 @@ export function signupUrl(): string {
 
 export interface ErrorBody {
   error?: string;
-  message?: string;  // Fastify AJV validation errors: { statusCode, error: "Bad Request", message: "..." }
+  message?: string;  // validation errors: { statusCode, error: "Bad Request", message: "..." }
   currentBalance?: number;
   creditsRequired?: number;
+  tokensReturnAt?: string; // 402: ISO time at which the balance is restored
   upgrade?: string;   // 402 trial_expired: where the caller's owner can lift the block
   successor?: string; // 410: path that replaced the retired one
+  mode?: string;      // 503: which feature is switched off
+  hint?: string;      // 400: what the caller should change, sent next to `error`
+  candidates?: unknown; // 400/404 of a failed location=: units whose name resembles the one asked for
 }
 
 /**
@@ -36,12 +41,12 @@ export interface ErrorBody {
  * `message` wins and `error` is the fallback. Three body shapes reach us:
  *   1. Custom reply.send: { error: "Maximum 5 districts allowed" } - only `error`
  *   2. Thrown plain obj via the global handler: { statusCode, message: "..." } - only `message`
- *   3. Fastify AJV: { statusCode, error: "FastifyError", message: "body/x ..." } - `error` is a class name
+ *   3. Validation: { statusCode, error: "<ErrorClassName>", message: "body/x ..." } - `error` is a class name
  * Anything longer than 500 chars is dropped rather than truncated - a half-sentence misleads.
  * Empty string means "the API said nothing usable", which every branch below treats as its cue
  * to fall back to its own text.
  */
-function specificMessage(body: ErrorBody): string {
+export function specificMessage(body: ErrorBody): string {
   const rawError = typeof body.error === "string" ? body.error.trim() : "";
   const rawMessage = typeof body.message === "string" ? body.message.trim() : "";
   const candidate = rawMessage || rawError;
@@ -53,8 +58,21 @@ function sentence(text: string): string {
   return /[.!?]$/.test(text) ? text : `${text}.`;
 }
 
+// An absent or non-numeric figure is unknown, never 0: "balance: 0" would tell the caller the account is empty.
+function tokenCount(value: unknown): string {
+  return typeof value === "number" && Number.isFinite(value) ? String(value) : "unknown";
+}
+
+/** "YYYY-MM-DD HH:MM UTC" for a parsable date, "" otherwise (the caller then drops the line). */
+function formatReturnAt(value: unknown): string {
+  if (typeof value !== "string") return "";
+  const ms = Date.parse(value);
+  if (Number.isNaN(ms)) return "";
+  return `${new Date(ms).toISOString().slice(0, 16).replace("T", " ")} UTC`;
+}
+
 /** Same guard as above for the auxiliary URL/path fields. */
-function specificField(value: unknown): string {
+export function specificField(value: unknown): string {
   if (typeof value !== "string") return "";
   const trimmed = value.trim();
   return trimmed.length > 0 && trimmed.length <= 500 ? trimmed : "";
@@ -79,42 +97,42 @@ export function authErrorMessage(status: number, mode: AuthMode, body: ErrorBody
       return "API key rejected. Check https://cenogram.pl/ustawienia#api-keys if it's still active.";
 
     case 402: {
-      // The trial gate freezes an account rather than emptying it, so "insufficient credits"
-      // (balance vs cost) describes the wrong problem - a balance of 300 with a cost of 1 still
-      // fails. The API states that case itself; relay it instead of doing arithmetic on it.
-      // Only `message` will do here: `specific` falls back to `error`, which in this branch is
-      // the bare code "trial_expired" - relaying that would be worse than the wrong template.
-      // Relay the API's own sentence whenever there IS one, not only for trial_expired. The free
-      // tier grants a recurring token allowance, so a 402 there means "the current allowance is
-      // used up and the next one arrives on <date>" - information the local template cannot
-      // reconstruct and which the reader needs more than the arithmetic. Gating the relay on one
-      // error code meant every future 402 shape silently lost its explanation.
-      const explanation = specificField(body.message);
-      if (explanation) {
+      // The trial gate freezes an account instead of emptying it (balance 300 vs cost 1 still fails),
+      // so balance-vs-cost would mislead: relay the API's sentence. Only `message` will do, `error`
+      // is the bare code "trial_expired".
+      // Collapsed to one line so a relayed newline cannot pose as a further message line (e.g. a fake footer).
+      const explanation = specificField(body.message).replace(/\s+/g, " ").trim();
+      const trialExpired = body.error === "trial_expired";
+      if (trialExpired && explanation) {
         const upgrade = specificField(body.upgrade);
         return upgrade && !explanation.includes(upgrade) ? `${sentence(explanation)} (${upgrade})` : explanation;
       }
-      // Reached only when the API sent no message at all. `?? 0` is a last-resort default, not a
-      // claim about the account - an absent balance is unknown, not zero.
-      const balance = body.currentBalance ?? 0;
-      const required = body.creditsRequired ?? "?";
-      if (mode === "oauth") {
-        return `Insufficient credits (balance: ${balance}, query cost: ${required}). Top up: https://cenogram.pl/api?src=${channelSrc()}#cennik`;
+      const lines = [
+        `Insufficient API tokens (balance: ${tokenCount(body.currentBalance)}, this call costs: ${tokenCount(body.creditsRequired)}).`,
+      ];
+      // Only an emptied balance advertises the free tools.
+      if (!trialExpired) {
+        lines.push(`Free tools that still work: ${freeToolNames().join(", ")}.`);
+        const returnAt = formatReturnAt(body.tokensReturnAt);
+        if (returnAt) lines.push(`Balance restores from ${returnAt} (on the first call after that time).`);
       }
-      return `Insufficient credits for key's account (balance: ${balance}, query cost: ${required}). Top up: https://cenogram.pl/api?src=${channelSrc()}#cennik`;
+      // The API's own sentence is relayed as well; its date repeats ours on purpose.
+      if (explanation) lines.push(explanation);
+      lines.push(`Top up: https://cenogram.pl/api?src=${channelSrc()}#cennik`);
+      return lines.join("\n");
     }
 
     case 403:
       if (body.error === "email_not_verified") {
         return "Account email not verified. Check your inbox, click the activation link, then retry.";
       }
-      // 403 covers unrelated causes - a rate-limit ban, the demo cap, a plan restriction - and
+      // 403 covers unrelated causes - a rate-limit ban, a plan restriction - and
       // each of them ships its own explanation. Swallowing them left the caller guessing.
       return specific ? `Access denied: ${specific}` : "Access denied (HTTP 403).";
 
     case 503: {
-      // Not always maintenance: also a disabled feature, a read-only failover, an unavailable
-      // dataset. Keep the English frame (the API's own text may be Polish) but relay the reason.
+      // Not always maintenance: also a disabled feature or an unavailable dataset. Keep the English
+      // frame (the API's own text may be Polish) but relay the reason.
       if (!specific) return "Cenogram temporarily unavailable. Try again shortly.";
       // Several of these bodies already end with their own "try again in a few minutes", in
       // Polish or English. Adding ours on top would put two retry hints in one sentence.
@@ -139,7 +157,13 @@ export function authErrorMessage(status: number, mode: AuthMode, body: ErrorBody
       // input, e.g. "Unknown location: X".
       return specific || "Not found (HTTP 404). Check the location name or TERYT code.";
 
-    case 400:
+    case 400: {
+      // The API's hint tells the model how to fix the call, e.g. to pass a paging cursor back unchanged.
+      const hint = specificField(body.hint);
+      if (specific && hint && !specific.includes(hint)) return `Invalid request: ${sentence(specific)} ${hint}`;
+      return specific ? `Invalid request: ${specific}` : `Invalid request (HTTP ${status}). Check parameters.`;
+    }
+
     case 422:
       return specific ? `Invalid request: ${specific}` : `Invalid request (HTTP ${status}). Check parameters.`;
 
