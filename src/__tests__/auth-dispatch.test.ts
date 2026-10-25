@@ -119,6 +119,7 @@ describe("dispatchAuth", () => {
     expect(r.kind).toBe("401");
     if (r.kind !== "401") return;
     expect(r.body.error).toBe("missing_token");
+    expect(r.body.error_description).toContain("https://cenogram.pl/api");
     expect(r.headers["WWW-Authenticate"]).toMatch(/^Bearer realm="cenogram", resource_metadata="https:\/\//);
     expect(r.headers["WWW-Authenticate"]).not.toMatch(/error=/);
     expect(r.log).toMatchObject({ evt: "auth.rejected", reason: "missing" });
@@ -131,6 +132,7 @@ describe("dispatchAuth", () => {
     expect(r.kind).toBe("401");
     if (r.kind !== "401") return;
     expect(r.body.error).toBe("missing_token");
+    expect(r.body.error_description).toContain("https://cenogram.pl/api");
   });
 
   it("returns 401 missing_token for `Bearer\\t \\t` (whitespace only)", async () => {
@@ -151,6 +153,7 @@ describe("dispatchAuth", () => {
     expect(r.kind).toBe("401");
     if (r.kind !== "401") return;
     expect(r.body.error).toBe("invalid_token");
+    expect(r.body.error_description).toContain("https://cenogram.pl/api");
     expect(r.headers["WWW-Authenticate"]).toContain('error="invalid_token"');
     expect(r.headers["WWW-Authenticate"]).toContain('error_description="Token format not recognized"');
     expect(r.log).toMatchObject({ evt: "auth.rejected", reason: "invalid_format" });
@@ -209,7 +212,8 @@ describe("dispatchAuth", () => {
     // Will fail invalid_format (not JWT shape, not cngrm_), NOT oversized
     expect(r.kind).toBe("401");
     if (r.kind !== "401") return;
-    expect(r.body.error_description).toBe("Expected OAuth JWT or Cenogram API key (cngrm_...)");
+    expect(r.body.error_description).toContain("Expected OAuth JWT or Cenogram API key (cngrm_...)");
+    expect(r.body.error_description).toContain("https://cenogram.pl/api");
   });
 
   it("does not crash on undefined authHeader (size check guards)", async () => {

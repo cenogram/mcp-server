@@ -51,6 +51,20 @@ describe("api-client", () => {
     expect(url).toContain("sort=date");
   });
 
+  it("getTransactions passes page, and the summary call does not carry it", async () => {
+    const ok = { ok: true, json: () => Promise.resolve({ data: [], pagination: {}, summary: null }) };
+    mockFetch.mockResolvedValueOnce(ok).mockResolvedValueOnce(ok);
+
+    const { getTransactions, getTransactionsSummary } = await import("../api-client.js");
+    await getTransactions({ bbox: "20,50,21,51", limit: 50, page: 2, sort: "date", order: "desc" });
+    await getTransactionsSummary({ bbox: "20,50,21,51", limit: 50, page: 2 });
+
+    const rowsUrl = mockFetch.mock.calls[0]![0] as string;
+    expect(rowsUrl).toContain("page=2");
+    expect(rowsUrl).toContain("limit=50");
+    expect(mockFetch.mock.calls[1]![0] as string).not.toContain("page=");
+  });
+
   it("getTransactions passes street, buildingNumber, parcelId", async () => {
     mockFetch.mockResolvedValueOnce({
       ok: true,
@@ -245,6 +259,67 @@ describe("api-client", () => {
     expect(url).toContain("/api/v1/transactions/11111111-2222-3333-4444-555555555555/permits");
   });
 
+  it("getPermitsInArea hits the area endpoint with only the params that were given", async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve({ locked: false, data: [], truncated: false }),
+    });
+
+    const { getPermitsInArea } = await import("../api-client.js");
+    await getPermitsInArea({ lat: 52.0928, lng: 21.0225, radiusKm: 1.5, intent: "multi_family", limit: 20 });
+
+    const url = new URL(mockFetch.mock.calls[0]![0] as string);
+    expect(url.pathname).toBe("/api/v1/permits/area");
+    expect(Object.fromEntries(url.searchParams)).toEqual({
+      lat: "52.0928", lng: "21.0225", radiusKm: "1.5", intent: "multi_family", limit: "20",
+    });
+  });
+
+  it("getPermitsInArea sends category arrays as CSV and passes cursor, dateTo and aggregateOnly", async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve({ locked: false, data: [], truncated: false }),
+    });
+
+    const { getPermitsInArea } = await import("../api-client.js");
+    await getPermitsInArea({
+      lat: 52.0928, lng: 21.0225, dateFrom: "2020-01-01", dateTo: "2024-12-31",
+      categories: ["XIII", "I"], excludeCategories: ["XXVI"], cursor: "abc_DEF-123", aggregateOnly: true,
+    });
+
+    const url = new URL(mockFetch.mock.calls[0]![0] as string);
+    expect(Object.fromEntries(url.searchParams)).toEqual({
+      lat: "52.0928", lng: "21.0225", dateFrom: "2020-01-01", dateTo: "2024-12-31",
+      category: "XIII,I", excludeCategory: "XXVI", cursor: "abc_DEF-123", aggregateOnly: "true",
+    });
+  });
+
+  it("getPermitsInArea omits aggregateOnly=false and empty category arrays", async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve({ locked: false, data: [], truncated: false }),
+    });
+
+    const { getPermitsInArea } = await import("../api-client.js");
+    await getPermitsInArea({ lat: 52.0928, lng: 21.0225, categories: [], excludeCategories: [], aggregateOnly: false });
+
+    const url = new URL(mockFetch.mock.calls[0]![0] as string);
+    expect(Object.fromEntries(url.searchParams)).toEqual({ lat: "52.0928", lng: "21.0225" });
+  });
+
+  it("getPermitsInArea: a 503 body keeps its feature-off mode on the error", async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: false,
+      status: 503,
+      json: () => Promise.resolve({ error: "Service Unavailable", message: "off", mode: "feature-disabled" }),
+    });
+
+    const { getPermitsInArea, ApiHttpError } = await import("../api-client.js");
+    const err = await getPermitsInArea({ lat: 52.1, lng: 21.0 }, `cngrm_${"a".repeat(32)}`).catch((e: Error) => e);
+    expect(err).toBeInstanceOf(ApiHttpError);
+    expect((err as InstanceType<typeof ApiHttpError>).mode).toBe("feature-disabled");
+  });
+
   it("getTransactionPlanning hits the per-transaction planning endpoint and passes the three-state body through", async () => {
     const body = {
       data: [{
@@ -334,7 +409,7 @@ describe("api-client", () => {
     });
 
     const { fetchApi } = await import("../api-client.js");
-    await expect(fetchApi("/api/stats")).rejects.toThrow("Insufficient credits");
+    await expect(fetchApi("/api/stats")).rejects.toThrow("Insufficient API tokens");
   });
 
   it("402 error includes balance and required credits", async () => {
@@ -347,7 +422,30 @@ describe("api-client", () => {
     const { fetchApi } = await import("../api-client.js");
     const error = await fetchApi("/api/stats").catch((e: Error) => e);
     expect((error as Error).message).toContain("balance: 0");
-    expect((error as Error).message).toContain("query cost: 5");
+    expect((error as Error).message).toContain("this call costs: 5");
+  });
+
+  it("402 error carries the free-tier body through to the message: cost, balance, free tools, renewal time", async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: false,
+      status: 402,
+      json: () => Promise.resolve({
+        error: "insufficient_credits",
+        creditsRequired: 45,
+        currentBalance: 12,
+        tokensReturnAt: "2026-10-30T14:05:33.000Z",
+        message: "The current balance is used up; it goes back to 50 from 2026-10-30.",
+        upgrade: "https://cenogram.pl/api#cennik",
+      }),
+    });
+
+    const { fetchApi } = await import("../api-client.js");
+    const error = await fetchApi("/api/stats").catch((e: Error) => e);
+    const message = (error as Error).message;
+    expect(message).toContain("balance: 12, this call costs: 45");
+    expect(message).toContain("Free tools that still work: list_locations");
+    expect(message).toContain("Balance restores from 2026-10-30 14:05 UTC");
+    expect(message).toContain("The current balance is used up; it goes back to 50 from 2026-10-30.");
   });
 
   it("402 error handles missing json body gracefully", async () => {
@@ -358,7 +456,9 @@ describe("api-client", () => {
     });
 
     const { fetchApi } = await import("../api-client.js");
-    await expect(fetchApi("/api/stats")).rejects.toThrow("Insufficient credits");
+    const error = await fetchApi("/api/stats").catch((e: Error) => e);
+    expect((error as Error).message).toContain("Insufficient API tokens");
+    expect((error as Error).message).toContain("balance: unknown");
   });
 
   it("throws on 429 (IP rate limit)", async () => {
@@ -458,6 +558,22 @@ describe("api-client", () => {
     expect(url).toContain("/api/v1/price-per-m2");
   });
 
+  it("getPricePerM2 forwards dateFrom/dateTo and sends none by default", async () => {
+    mockFetch.mockResolvedValue({ ok: true, json: () => Promise.resolve([]) });
+
+    const { getPricePerM2 } = await import("../api-client.js");
+    await getPricePerM2();
+    await getPricePerM2(undefined, { dateFrom: "2024-10-23", dateTo: "2026-10-23" });
+    await getPricePerM2(undefined, { dateTo: "2026-10-23" });
+
+    const urls = mockFetch.mock.calls.map((c) => new URL(c[0] as string));
+    expect(urls[0]!.search).toBe("");
+    expect(urls[1]!.searchParams.get("dateFrom")).toBe("2024-10-23");
+    expect(urls[1]!.searchParams.get("dateTo")).toBe("2026-10-23");
+    expect(urls[2]!.searchParams.has("dateFrom")).toBe(false);
+    expect(urls[2]!.searchParams.get("dateTo")).toBe("2026-10-23");
+  });
+
   it("getDistricts calls correct endpoint", async () => {
     mockFetch.mockResolvedValueOnce({
       ok: true,
@@ -470,6 +586,21 @@ describe("api-client", () => {
     expect(result.data).toEqual(["Mokotów", "Śródmieście"]);
     const url = mockFetch.mock.calls[0]![0] as string;
     expect(url).toContain("/api/v1/districts");
+  });
+
+  it("getDistrictCoverage sends the names as one comma-separated query param", async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve({ data: [{ name: "Testville", transactions: 2 }], meta: { total: 1 } }),
+    });
+
+    const { getDistrictCoverage } = await import("../api-client.js");
+    const result = await getDistrictCoverage(["Testville", "Wola"]);
+
+    const url = new URL(mockFetch.mock.calls[0]![0] as string);
+    expect(url.pathname).toBe("/api/v1/districts/coverage");
+    expect(url.searchParams.get("names")).toBe("Testville,Wola");
+    expect(result.data.data[0]!.transactions).toBe(2);
   });
 
   it("getRentalYield passes location to the rental-yield endpoint", async () => {
@@ -730,7 +861,7 @@ describe("api-client", () => {
     });
 
     const { fetchApiPost } = await import("../api-client.js");
-    await expect(fetchApiPost("/api/test", {})).rejects.toThrow("Insufficient credits");
+    await expect(fetchApiPost("/api/test", {})).rejects.toThrow("Insufficient API tokens");
   });
 
   it("fetchApiPost returns creditInfo from headers", async () => {
@@ -854,7 +985,7 @@ describe("api-client", () => {
     expect(body.maxFootprintArea).toBe(200);
   });
 
-  it("402 + OAuth ctx: 'na koncie' wording (no 'kluczem')", async () => {
+  it("402 + OAuth ctx: wording does not mention an API key", async () => {
     mockFetch.mockResolvedValueOnce({
       ok: false,
       status: 402,
@@ -863,7 +994,7 @@ describe("api-client", () => {
     const { getStats, encodeOAuthCtx } = await import("../api-client.js");
     const oauthKey = encodeOAuthCtx("u1", "g1");
     const err = await getStats(oauthKey).catch((e: Error) => e);
-    expect((err as Error).message).toContain("Insufficient credits");
+    expect((err as Error).message).toContain("Insufficient API tokens");
     expect((err as Error).message).toContain("balance: 3");
     expect((err as Error).message).not.toContain("key's account");
   });
@@ -877,7 +1008,7 @@ describe("api-client", () => {
     expect((err as Error).message).toContain("disconnect and reconnect");
   });
 
-  it("401 + API key: prompts ustawienia check", async () => {
+  it("401 + API key: prompts to check the API key in account settings", async () => {
     mockFetch.mockResolvedValueOnce({ ok: false, status: 401, json: () => Promise.resolve({}) });
     const { getStats } = await import("../api-client.js");
     const err = await getStats(`cngrm_${"a".repeat(32)}`).catch((e: Error) => e);
@@ -906,6 +1037,41 @@ describe("api-client", () => {
     expect((err as Error).message).toContain("Try again");
   });
 
+  // 503 body ({error, message, mode}): `mode` is carried on the error so a handler can tell a
+  // switched-off feature apart from other 503s (additive field).
+  it("503: carries body.mode on the ApiHttpError", async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: false,
+      status: 503,
+      json: () => Promise.resolve({ error: "service_unavailable", message: "feature disabled", mode: "feature-disabled" }),
+    });
+    const { getStats, ApiHttpError } = await import("../api-client.js");
+    const err = await getStats(`cngrm_${"a".repeat(32)}`).catch((e: Error) => e);
+    expect(err).toBeInstanceOf(ApiHttpError);
+    expect((err as InstanceType<typeof ApiHttpError>).status).toBe(503);
+    expect((err as InstanceType<typeof ApiHttpError>).mode).toBe("feature-disabled");
+  });
+
+  it("503: carries Retry-After seconds on the ApiHttpError", async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: false,
+      status: 503,
+      headers: { get: (h: string) => (h === "Retry-After" ? "30" : null) },
+      json: () => Promise.resolve({}),
+    });
+    const { getStats } = await import("../api-client.js");
+    const err = await getStats(`cngrm_${"a".repeat(32)}`).catch((e: Error) => e);
+    expect((err as { retryAfterSeconds?: number }).retryAfterSeconds).toBe(30);
+  });
+
+  it("503 without mode leaves mode undefined", async () => {
+    mockFetch.mockResolvedValueOnce({ ok: false, status: 503, json: () => Promise.resolve({}) });
+    const { getStats, ApiHttpError } = await import("../api-client.js");
+    const err = await getStats(`cngrm_${"a".repeat(32)}`).catch((e: Error) => e);
+    expect(err).toBeInstanceOf(ApiHttpError);
+    expect((err as InstanceType<typeof ApiHttpError>).mode).toBeUndefined();
+  });
+
   it("400 surfaces specific body.error from custom reply.send", async () => {
     mockFetch.mockResolvedValueOnce({
       ok: false,
@@ -917,13 +1083,13 @@ describe("api-client", () => {
     expect((err as Error).message).toBe("Invalid request: Maximum 5 districts allowed");
   });
 
-  it("400 surfaces body.message from Fastify AJV (error=FastifyError, prod shape)", async () => {
+  it("400 surfaces body.message from a validation error (error is a class name)", async () => {
     mockFetch.mockResolvedValueOnce({
       ok: false,
       status: 400,
       json: () => Promise.resolve({
         statusCode: 400,
-        error: "FastifyError",
+        error: "ValidationError",
         message: "body/districts must NOT have fewer than 1 characters",
       }),
     });
@@ -931,7 +1097,7 @@ describe("api-client", () => {
     const err = await getStats(`cngrm_${"a".repeat(32)}`).catch((e: Error) => e);
     expect((err as Error).message).toContain("Invalid request:");
     expect((err as Error).message).toContain("body/districts");
-    expect((err as Error).message).not.toContain("FastifyError");
+    expect((err as Error).message).not.toContain("ValidationError");
   });
 
   it("400 surfaces body.message from thrown plain obj (no error field, polygon shape)", async () => {
@@ -960,7 +1126,7 @@ describe("api-client", () => {
     expect((err as Error).message).toBe("Invalid request (HTTP 400). Check parameters.");
   });
 
-  it("422 surfaces body.message from Fastify (generic body.error)", async () => {
+  it("422 surfaces body.message from the server (generic body.error)", async () => {
     mockFetch.mockResolvedValueOnce({
       ok: false,
       status: 422,
@@ -1015,5 +1181,68 @@ describe("api-client", () => {
 
     const url = mockFetch.mock.calls[0]![0] as string;
     expect(url).toMatch(/ownershipType=2(%2C|,)8/);
+  });
+  describe("location error body", () => {
+    const body404 = {
+      error: "Unknown location: Krowodrza. Look up the code with /api/locations?search=<fragment> (free, returns a TERYT code to pass as teryt=), or pass a 4-digit county TERYT directly.",
+      candidates: [
+        { code: "126101", name: "Kraków-Krowodrza", typeName: "delegatura", level: "municipality", parent_name: "Kraków" },
+        { code: "126101_9.0001", name: "Krowodrza", typeName: null, level: "precinct", parent_name: "Kraków-Krowodrza" },
+      ],
+      hint: "Pass the code of the unit you mean as teryt= (for a precinct, the first 6 digits of its code).",
+    };
+
+    it("carries hint, parsed candidates (typeName included) and the API's own sentence on the error", async () => {
+      mockFetch.mockResolvedValueOnce({ ok: false, status: 404, json: () => Promise.resolve(body404) });
+
+      const { getDemographics, ApiHttpError } = await import("../api-client.js");
+      const err = await getDemographics({ location: "Krowodrza" }, `cngrm_${"a".repeat(32)}`).catch((e: Error) => e);
+      expect(err).toBeInstanceOf(ApiHttpError);
+      const e = err as InstanceType<typeof ApiHttpError>;
+      expect(e.message).toBe(body404.error);
+      expect(e.detail).toBe(body404.error);
+      expect(e.hint).toBe(body404.hint);
+      expect(e.candidates?.[0]).toEqual({ code: "126101", name: "Kraków-Krowodrza", typeName: "delegatura", level: "municipality", parent_name: "Kraków" });
+      expect(e.candidates?.[1]?.typeName).toBeNull();
+    });
+
+    it("flows from the response body through ApiHttpError into formatLocationError", async () => {
+      mockFetch.mockResolvedValueOnce({ ok: false, status: 404, json: () => Promise.resolve(body404) });
+
+      const { getDemographics } = await import("../api-client.js");
+      const { formatLocationError } = await import("../location-errors.js");
+      const err = await getDemographics({ location: "Krowodrza" }, `cngrm_${"a".repeat(32)}`).catch((e: Error) => e);
+      const text = formatLocationError("get_demographics", { location: "Krowodrza" }, err as never)!;
+      expect(text).toContain("126101 - Kraków-Krowodrza (delegatura), Kraków");
+      expect(text).toContain('get_demographics(teryt="126101")');
+      expect(text).not.toContain("/api/");
+    });
+
+    it("keeps an older body without the new fields working", async () => {
+      mockFetch.mockResolvedValueOnce({ ok: false, status: 404, json: () => Promise.resolve({ error: body404.error }) });
+
+      const { getDemographics } = await import("../api-client.js");
+      const { formatLocationError } = await import("../location-errors.js");
+      const err = (await getDemographics({ location: "Krowodrza" }, `cngrm_${"a".repeat(32)}`).catch((e: Error) => e)) as InstanceType<typeof import("../api-client.js").ApiHttpError>;
+      expect(err.candidates).toBeUndefined();
+      expect(err.hint).toBeUndefined();
+      const text = formatLocationError("get_demographics", { location: "Krowodrza" }, err)!;
+      expect(text).toContain('list_locations(search="Krowodrza")');
+      expect(text).not.toContain("/api/");
+    });
+
+    it("relays a 400 hint on the error for the tool layer to reword", async () => {
+      mockFetch.mockResolvedValueOnce({
+        ok: false,
+        status: 400,
+        json: () => Promise.resolve({ error: "Provide a parcel number", hint: "look it up with GET /api/parcels?location=<locality>&street=<street>" }),
+      });
+
+      const { resolveParcel } = await import("../api-client.js");
+      const err = await resolveParcel({ q: "Armii Krajowej 10 Ełk" }, `cngrm_${"a".repeat(32)}`).catch((e: Error) => e) as Error & { hint?: string; detail?: string };
+      expect(err.detail).toBe("Provide a parcel number");
+      expect(err.hint).toContain("GET /api/parcels?location=");
+      expect(err.message).toContain("Invalid request: Provide a parcel number");
+    });
   });
 });

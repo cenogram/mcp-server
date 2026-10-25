@@ -1,6 +1,6 @@
 import { fetch, type Response } from "undici";
 import { getClientId } from "./client-id.js";
-import { authErrorMessage, getAuthMode, type AuthMode, type ErrorBody } from "./error-messages.js";
+import { authErrorMessage, getAuthMode, specificField, specificMessage, type AuthMode, type ErrorBody } from "./error-messages.js";
 import { requestContext } from "./request-context.js";
 
 const BASE_URL = process.env.CENOGRAM_API_URL || "https://cenogram.pl";
@@ -32,7 +32,10 @@ export interface Transaction {
   id: string;
   transaction_date: string;
   property_type: number;
-  market_type: number;
+  // Transaction procedure code (TRANSACTION_TYPES) — free market, auction, foreclosure, etc.
+  transaction_type?: number | null;
+  // market_type is frequently NULL (not recorded in the deed), so it is nullable, not 0.
+  market_type: number | null;
   price_gross: number;
   usable_area_m2: number | null;
   price_per_m2: number | null;
@@ -55,15 +58,26 @@ export interface Transaction {
   area_basis?: "unit" | "building" | null;
   parcel_id: string | null;
   parcel_number: string | null;
+  // mpzp_designation = main parcel; mpzp_designations = union over all parcels of the
+  // transaction, i.e. what the mpzpDesignation filter matches on. Either may be absent/null.
+  mpzp_designation?: string | null;
+  mpzp_designations?: string[] | null;
   county_name: string | null;
   voivodeship_name: string | null;
   // Share basis: 'fraction' = price reflects a fractional ownership share,
   // excluded from market median. Surfaced per-row so users see which comparables are fractional.
   share_basis?: "full" | "fraction" | "ambiguous" | null;
-  // ── Provenance signals — drive the "Z RCN / Obliczone" markers. ──
+  // Clean-land render fields. All OPTIONAL — an older API omits them, so the renderer must never
+  // assume presence. transaction_number groups rows of one deed (list only); price_per_m2_exact =
+  // 2-decimal price/m² for sub-100 land; parcel_area_cadastral = precise parcel area for an
+  // ha-rounded single-parcel row. NUMERIC over the wire → string, coerce with Number().
+  transaction_number?: string | null;
+  price_per_m2_exact?: number | string | null;
+  parcel_area_cadastral?: number | string | null;
+  // ── Provenance signals — drive the provenance markers in clients. ──
   // parcel_count >= 2 → parcel_area is a SUM of plots (computed). area_is_ha_converted → parcel_area
   // was converted from hectares the county reports in ha (computed). property_type_inferred /
-  // property_type_reclassed → property_type is derived/corrected by us, not the registry's literal code.
+  // property_type_reclassed → property_type is derived or corrected, not the registry's literal code.
   parcel_count?: number | null;
   area_is_ha_converted?: boolean | null;
   property_type_inferred?: boolean | null;
@@ -80,7 +94,7 @@ export interface Transaction {
   land_use?: string | null;
   unit_price?: number | string | null;
   vat?: number | string | null;
-  // Building attrs — per-transaction aggregates. Neutral names (no source register).
+  // Building attrs — per-transaction aggregates.
   // Gate on building_count first (NULL = no buildings, not 0). SUM fields are NULL unless every
   // linked building is complete. NUMERIC arrives as string over the wire (Intl.format coerces).
   building_count?: number | null;
@@ -115,6 +129,8 @@ export interface Transaction {
 export interface TransactionsResponse {
   data: Transaction[];
   pagination: { page: number; limit: number; total: number; pages: number; estimated?: boolean };
+  // Close district names, present only on an empty page for a location= filter. Optional: older API omits it.
+  suggestions?: string[];
 }
 
 export interface TransactionsSummary {
@@ -123,6 +139,14 @@ export interface TransactionsSummary {
   min_date: string | null;
   max_date: string | null;
   total: number;
+  // Trailing-window median (set only when medianWindowMonths was requested). NUMERIC → string;
+  // median_price_m2_window is null when the window has too few rows (n<5), median_window still carries
+  // the bounds + n. Both OPTIONAL so an older API without them renders the all-time median unchanged.
+  median_price_m2_window?: number | string | null;
+  // months = requested window length; the footer uses it instead of a hardcoded "24".
+  median_window?: { from: string | null; to: string | null; n: number | null; months?: number };
+  // Close district names, present only when total=0 for a location= filter.
+  suggestions?: string[];
 }
 
 export interface PricePerM2Row {
@@ -130,6 +154,9 @@ export interface PricePerM2Row {
   avg_price_m2: number;
   median_price_m2: number;
   count: number;
+  // Present only when the request carried dateFrom/dateTo (actual span of the counted deeds).
+  min_date?: string;
+  max_date?: string;
 }
 
 export interface HistogramBin {
@@ -307,7 +334,7 @@ export interface DemographicsResponse {
     location_type: "city" | "county" | "municipality" | "voivodeship";
     teryt: string;
     level: string;
-    // Parent administrative units; absent in demo mode. Possible keys: powiat, podregion, wojewodztwo.
+    // Parent administrative units; optional. Possible keys: powiat, podregion, wojewodztwo.
     hierarchy?: Record<string, { teryt: string | null; name: string }>;
   };
   coverage: "full" | "no_data";
@@ -500,10 +527,27 @@ export class ApiHttpError extends Error {
   readonly code: string | undefined;
   readonly authMode: AuthMode;
   readonly retryAfterSeconds: number | undefined;
+  // 503 `mode` field from the body: lets a handler tell a feature that is switched off apart from
+  // other 503s and degrade it on its own terms.
+  readonly mode: string | undefined;
+  // The API's own sentence, without the "Invalid request:" framing, plus the optional guidance and
+  // units it sent along: what a handler needs to rewrite the message for its own channel.
+  readonly detail: string | undefined;
+  readonly hint: string | undefined;
+  readonly candidates: LocationItem[] | undefined;
 
   constructor(
     message: string,
-    opts: { status: number; code?: string | undefined; authMode: AuthMode; retryAfterSeconds?: number | undefined },
+    opts: {
+      status: number;
+      code?: string | undefined;
+      authMode: AuthMode;
+      retryAfterSeconds?: number | undefined;
+      mode?: string | undefined;
+      detail?: string | undefined;
+      hint?: string | undefined;
+      candidates?: LocationItem[] | undefined;
+    },
   ) {
     super(message);
     this.name = "ApiHttpError";
@@ -511,7 +555,38 @@ export class ApiHttpError extends Error {
     this.code = opts.code;
     this.authMode = opts.authMode;
     this.retryAfterSeconds = opts.retryAfterSeconds;
+    this.mode = opts.mode;
+    this.detail = opts.detail;
+    this.hint = opts.hint;
+    this.candidates = opts.candidates;
   }
+}
+
+const MAX_ERROR_CANDIDATES = 5;
+const LOCATION_LEVELS: readonly string[] = ["voivodeship", "county", "municipality", "precinct"];
+// Codes land inside ready-made tool calls, so anything that does not look like a TERYT code is dropped.
+const TERYT_LIKE_CODE = /^\d{2,7}(_\d\.\d{1,5})?$/;
+
+/** Candidate units of a failed location=, tolerant of an older or odd API: bad rows are skipped, not fatal. */
+export function parseLocationCandidates(raw: unknown): LocationItem[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const out: LocationItem[] = [];
+  for (const row of raw) {
+    if (out.length >= MAX_ERROR_CANDIDATES) break;
+    if (typeof row !== "object" || row === null) continue;
+    const r = row as Record<string, unknown>;
+    if (typeof r.code !== "string" || !TERYT_LIKE_CODE.test(r.code)) continue;
+    if (typeof r.name !== "string" || r.name === "") continue;
+    if (typeof r.level !== "string" || !LOCATION_LEVELS.includes(r.level)) continue;
+    out.push({
+      code: r.code,
+      name: r.name,
+      typeName: typeof r.typeName === "string" ? r.typeName : null,
+      level: r.level as LocationItem["level"],
+      parent_name: typeof r.parent_name === "string" ? r.parent_name : null,
+    });
+  }
+  return out.length > 0 ? out : undefined;
 }
 
 /**
@@ -564,10 +639,17 @@ async function handleErrorResponse(res: Response, apiKey?: string): Promise<neve
     );
   }
   const body = (await res.json().catch(() => ({}))) as ErrorBody;
+  // A 503 may carry Retry-After (data being prepared); keep it on the error, message unchanged.
+  const retryAfter = res.status === 503 ? parseRetryAfterSeconds(res.headers?.get?.("Retry-After")) : null;
   throw new ApiHttpError(authErrorMessage(res.status, mode, body), {
     status: res.status,
+    retryAfterSeconds: retryAfter ?? undefined,
     code: typeof body.error === "string" ? body.error : undefined,
     authMode: mode,
+    mode: typeof body.mode === "string" ? body.mode : undefined,
+    detail: specificMessage(body) || undefined,
+    hint: specificField(body.hint) || undefined,
+    candidates: parseLocationCandidates(body.candidates),
   });
 }
 
@@ -670,6 +752,10 @@ export interface TransactionParams {
   // Building footprint (ground-plan) area bounds in m² — distinct from minArea/maxArea (usable/land area).
   minFootprintArea?: number;
   maxFootprintArea?: number;
+  // Opt-in: drop fractional-ownership-share rows (clean land prices). Sent as "true" query string.
+  excludeFractionalShares?: boolean;
+  // Summary-only: trailing-window median horizon in months (1-120). Ignored by the rows endpoint.
+  medianWindowMonths?: number;
   limit?: number;
   page?: number;
   sort?: string;
@@ -706,6 +792,7 @@ export function getTransactions(p: TransactionParams, apiKey?: string): Promise<
     minArea: p.minArea,
     maxArea: p.maxArea,
     bbox: p.bbox,
+    excludeFractionalShares: p.excludeFractionalShares ? "true" : undefined,
     limit: p.limit,
     page: p.page,
     sort: p.sort,
@@ -745,11 +832,20 @@ export function getTransactionsSummary(p: TransactionParams, apiKey?: string): P
     minArea: p.minArea,
     maxArea: p.maxArea,
     bbox: p.bbox,
+    excludeFractionalShares: p.excludeFractionalShares ? "true" : undefined,
+    medianWindowMonths: p.medianWindowMonths,
   }), apiKey);
 }
 
-export function getPricePerM2(apiKey?: string): Promise<ApiResponse<PricePerM2Row[]>> {
-  return fetchApi("/api/v1/price-per-m2", undefined, apiKey);
+export function getPricePerM2(
+  apiKey?: string,
+  range?: { dateFrom?: string; dateTo?: string },
+): Promise<ApiResponse<PricePerM2Row[]>> {
+  return fetchApi(
+    "/api/v1/price-per-m2",
+    range ? toQueryParams({ dateFrom: range.dateFrom, dateTo: range.dateTo }) : undefined,
+    apiKey,
+  );
 }
 
 export function getDistricts(apiKey?: string): Promise<ApiResponse<string[]>> {
@@ -873,7 +969,7 @@ export interface ValuationComparable {
 }
 
 // Envelope from GET /api/valuations (comparable-sales apartment estimate). coverage: "covered" = an
-// estimate was produced; "no_data" = too few comparables near the point (credit refunded); "not_covered"
+// estimate was produced; "no_data" = too few comparables near the point; "not_covered"
 // is reserved for property types the estimate does not serve. Monetary fields are PLN. as_of = transaction-data
 // freshness anchor (lags by county). All estimate fields are null on no_data.
 export interface ValuationResponse {
@@ -906,8 +1002,7 @@ export interface ValuationResponse {
 }
 
 // GET /api/valuations — apartment value estimate from comparable registered transactions near a point.
-// Address by lat+lng OR parcelId (the parcel centroid is used); area (m²) is required. Costs 5 credits,
-// refunded on coverage:"no_data".
+// Address by lat+lng OR parcelId (the parcel centroid is used); area (m²) is required.
 export function getValuation(
   params: { lat?: number; lng?: number; parcelId?: string; area: number; rooms?: number; market?: "primary" | "secondary"; includeComps?: boolean },
   apiKey?: string,
@@ -926,6 +1021,77 @@ export function getValuation(
   }), apiKey);
 }
 
+// ── Land valuation (comparable-sales undeveloped-land estimate) ─────
+
+// One comparable transaction echoed by /valuations/land when includeComps is set. Mirrors the REST
+// envelope (inputs.comparables[]); land comps carry raw mpzp_designations tokens, no label dictionary.
+export interface LandValuationComparable {
+  distance_m: number;
+  transaction_date: string;
+  area_m2: number;
+  price_per_m2: number;
+  mpzp_designations: string[] | null;
+  district: string | null;
+}
+
+// Envelope from GET /api/valuations/land (comparable-sales undeveloped-land estimate). coverage:
+// "covered" = an estimate was produced; "no_data" = too few comparables near the point or the area
+// could not be determined. locked:true = no estimate is returned. result carries BOTH price_per_m2
+// and price_per_ha. All estimate fields are null on no_data.
+export interface LandValuationResponse {
+  locked: boolean;
+  location: { country_code: string; lat: number | null; lng: number | null; county_code: string | null };
+  metric: string;
+  currency: string;
+  segment: {
+    property_type: string;
+    land_type: "plot" | "agricultural";
+    area_m2: number | null;
+    area_source: "cadastre" | "caller" | null;
+    mpzp_designation: string[] | null;
+  };
+  result: {
+    estimated_value: number | null;
+    price_per_m2: number | null;
+    price_per_ha: number | null;
+    value_range_likely: { low: number | null; high: number | null };
+    value_range_wide: { low: number | null; high: number | null };
+    confidence: number | null;
+    confidence_band: "high" | "medium" | "low" | null;
+  };
+  inputs: {
+    comps_total: number;
+    radius_m: number | null;
+    window_months: number;
+    comparables: LandValuationComparable[] | null;
+  };
+  quality: {
+    coverage: "covered" | "no_data";
+    as_of: string | null;
+    ess: number | null;
+    note: string;
+  };
+}
+
+// GET /api/valuations/land — undeveloped-land value estimate from comparable registered transactions
+// near a point. Address by lat+lng OR parcelId (the parcel centroid is used); area (m²) is required on
+// the lat/lng path and read from the cadastre on the parcelId path when omitted.
+export function getLandValuation(
+  params: { lat?: number; lng?: number; parcelId?: string; area?: number; landType?: "plot" | "agricultural"; mpzpDesignation?: string; includeComps?: boolean },
+  apiKey?: string,
+): Promise<ApiResponse<LandValuationResponse>> {
+  return fetchApi("/api/v1/valuations/land", toQueryParams({
+    lat: params.lat,
+    lng: params.lng,
+    parcelId: params.parcelId,
+    area: params.area,
+    landType: params.landType,
+    mpzpDesignation: params.mpzpDesignation,
+    // Same tri-state collapse as getValuation: pass true to include comps; anything else is omitted.
+    includeComps: params.includeComps ? "true" : undefined,
+  }), apiKey);
+}
+
 export interface LocationItem {
   code: string;
   name: string;
@@ -937,8 +1103,10 @@ export interface LocationItem {
 
 // Name-search mode of GET /api/locations. rcn_district is true iff the name is a valid value for
 // search_transactions(location=) — the tool layer uses it to decide which follow-up calls to print.
+// match is how the query sits in the name; absent on an API that predates it.
 export interface LocationSearchItem extends LocationItem {
   rcn_district?: boolean;
+  match?: "exact" | "prefix" | "infix";
 }
 
 export function getLocations(parent?: string, apiKey?: string): Promise<ApiResponse<LocationItem[]>> {
@@ -949,6 +1117,34 @@ export function getLocations(parent?: string, apiKey?: string): Promise<ApiRespo
 // unchanged for existing callers; this one carries rcn_district in its result rows.
 export function searchLocations(q: string, apiKey?: string): Promise<ApiResponse<LocationSearchItem[]>> {
   return fetchApi("/api/v1/locations", { search: q }, apiKey);
+}
+
+// GET /api/districts/coverage — how much data sits behind each RCN district label. Every field is
+// optional so a response from an older or partial API still type-checks; gmina is set only when the
+// label maps to exactly one gmina (then transactions is the whole gmina's count).
+export interface DistrictCoverageGmina {
+  teryt: string;
+  name: string;
+  transactions: number;
+}
+
+export interface DistrictCoverageItem {
+  name: string;
+  rcn_district?: boolean;
+  transactions?: number;
+  price_samples?: number;
+  date_from?: string | null;
+  date_to?: string | null;
+  gmina?: DistrictCoverageGmina | null;
+}
+
+export interface DistrictCoverageResponse {
+  data: DistrictCoverageItem[];
+  meta: { total: number };
+}
+
+export function getDistrictCoverage(names: string[], apiKey?: string): Promise<ApiResponse<DistrictCoverageResponse>> {
+  return fetchApi("/api/v1/districts/coverage", { names: names.join(",") }, apiKey);
 }
 
 export function getPriceHistogram(
@@ -990,8 +1186,8 @@ export function searchParcels(
 // centroid, district — and deliberately neither the outline nor the surface: the outline is what the
 // geometric collections return, and the registered surface is a field of the single-parcel endpoint.
 //
-// parcel_id / parcel_key are gated identity: the server sends them as null (never omits them) when
-// the account may not see them, so a renderer has to handle null rather than test for absence.
+// parcel_id / parcel_key are withheld for some accounts: the server sends them as null (never omits
+// them) when the account may not see them, so a renderer has to handle null rather than test for absence.
 // lat/lng are null for a parcel whose outline we do not hold — those rows are reachable through the
 // administrative filters but not through the spatial ones.
 export interface ParcelListRow {
@@ -1178,11 +1374,16 @@ export interface ParcelResolveMatch {
   area_m2: number | null;
   has_geometry: boolean;
   centroid: { lat: number; lng: number } | null;
+  // Optional: absent from older servers. road_parcel is true (roads only), false (another use on
+  // record) or null (no land-use record, which is not "not a road").
+  precinct_code?: string | null;
+  precinct_name?: string | null;
+  road_parcel?: boolean | null;
 }
 
-// Envelope from /parcels/resolve. coverage: covered = ≥1 match; not_covered = no confirmed parcel (the
-// credit is refunded); not_computed = the lookup could not be completed, so nothing is claimed either way
-// (also refunded — a live confirmation that failed, or a name search too broad to finish). The three are
+// Envelope from /parcels/resolve. coverage: covered = ≥1 match; not_covered = no confirmed parcel;
+// not_computed = the lookup could not be completed, so nothing is claimed either way
+// (a live confirmation that failed, or a name search too broad to finish). The three are
 // not interchangeable: not_covered asserts an absence, not_computed asserts nothing.
 // as_of = freshness of our cadastral copy (a global value; matches may span areas).
 export interface ParcelResolveResponse {
@@ -1219,21 +1420,43 @@ export function resolveParcel(
 // One price level (county or locality) inside market_context. coverage is the STATISTICAL canon
 // (full/low_sample/suppressed/no_data), NOT the four-state — a context section, not a per-parcel one.
 // median_price_per_m2 is null when suppressed (too few sales) or no_data. n = the sample size behind it.
+// by_property_type is optional: a service that predates the per-type split does not send it.
 export interface ReportMarketLevel {
   coverage: string;
   median_price_per_m2: number | null;
   n: number;
   county_code?: string | null;
   district?: string | null;
+  gmina_teryt?: string | null;
+  by_property_type?: ReportMarketByType;
 }
 
-// Local price context: 12-month median zł/m² at the county and locality grain. coverage rolls up the
-// two levels (statistical canon). as_of is null here (aggregates carry no per-location freshness marker).
+// Median for one property type at one level (same statistical canon as the level itself).
+export interface ReportMarketTypeLevel {
+  property_type?: string;
+  coverage: string;
+  median_price_per_m2: number | null;
+  n: number;
+}
+
+// Per-type medians keyed by snake_case type name. Each key may be absent on a partial response.
+export interface ReportMarketByType {
+  land?: ReportMarketTypeLevel;
+  developed_land?: ReportMarketTypeLevel;
+  building?: ReportMarketTypeLevel;
+  unit?: ReportMarketTypeLevel;
+}
+
+// Local price context: 12-month median zł/m² at the county and locality (gmina) grain, per property type.
+// coverage rolls up the levels (statistical canon). as_of is null here (aggregates carry no per-location
+// freshness marker). period and calculation are optional: an older service does not send them.
 export interface ReportMarketContext {
   coverage: string;
   as_of: string | null;
   county: ReportMarketLevel;
   locality: ReportMarketLevel;
+  period?: { from: string; to: string };
+  calculation?: Record<string, unknown>;
   note?: string | null;
 }
 
@@ -1256,6 +1479,62 @@ export interface ReportInfraSection {
   tenders: { window_months: number; by_category: Record<string, number>; recent: InfraTender[]; truncated: boolean };
   kposk: { in_agglomeration: boolean; agglomerations: Array<{ name: string; rlm: number | null }>; truncated: boolean };
   capex: { by_year: Record<string, unknown> };
+  note?: string | null;
+}
+
+// Nearby designation signal: the distribution of plan designations recorded in RCN deed data for nearby
+// land transactions. A neighbourhood signal, never a determination for the parcel. coverage is
+// full / low_sample / no_data (statistical canon); `reason` says why a state carries no dominant value.
+export interface ReportDesignationContext {
+  coverage: string;
+  as_of: string | null;
+  reason: string | null;
+  dominant: { designation: string; n: number; share: number } | null;
+  confidence: "high" | "medium" | "low" | null;
+  distribution: Array<{ designation: string; n: number }>;
+  n_transactions: number;
+  n_informative: number;
+  n_no_plan_recorded: number;
+  date_from: string | null;
+  date_to: string | null;
+  radius_m: number | null;
+  window_years: number;
+  property_types: number[];
+  query_truncated: boolean;
+  distribution_truncated: boolean;
+  note?: string | null;
+}
+
+// Parcel outline geometry (shape): size, compactness, bounding rectangle, inscribed circle, boundary-inset
+// figures and a shape class, all from the cadastral outline only. coverage is full / no_data (statistical canon).
+export interface ReportShapeInset {
+  distance_m: number;
+  area_m2: number;
+  part_count: number;
+  largest_part_mbr_width_m: number | null;
+  largest_part_mbr_length_m: number | null;
+  mic_diameter_m: number | null;
+}
+
+export interface ReportShape {
+  coverage: string;
+  as_of: string | null;
+  reason: string | null;
+  area_m2_geom: number | null;
+  perimeter_m: number | null;
+  compactness_polsby_popper: number | null;
+  mbr_width_m: number | null;
+  mbr_length_m: number | null;
+  elongation: number | null;
+  rectangularity: number | null;
+  long_axis_azimuth_deg: number | null;
+  part_count: number | null;
+  max_inscribed_circle_diameter_m: number | null;
+  // Present only when the inscribed-circle diameter is null.
+  mic_status?: "unavailable";
+  shape_class: "rectangular" | "near_rectangular" | "elongated" | "irregular" | null;
+  outline_sides_m: number[] | null;
+  boundary_inset: ReportShapeInset[];
   note?: string | null;
 }
 
@@ -1321,6 +1600,10 @@ export interface ParcelReportResponse {
     roads: ReportSection;
     market_context: ReportMarketContext;
     location_context: ReportLocationContext;
+    // Optional: an older server does not send it, and the formatter then omits the block.
+    designation_context?: ReportDesignationContext;
+    // Optional: an older server does not send it, and the formatter then omits the block.
+    shape?: ReportShape;
   };
   billing: { charged: number; refunded: number; rule: string };
   note?: string | null;
@@ -1328,8 +1611,8 @@ export interface ParcelReportResponse {
 
 // GET /api/parcels/:key/report — the whole parcel dossier in one call. The path key must be the URL-safe
 // dash form (a '/' in the number segment becomes '-'); we normalise a raw-slash id here so callers can pass
-// the natural '142907_2.0014.342/5' form. A UUID passes through unchanged. Costs 45 API tokens, refunded in
-// full or in part by outcome (see billing.rule on the response).
+// the natural '142907_2.0014.342/5' form. A UUID passes through unchanged. The billing outcome is on the
+// response (billing.rule).
 export function getParcelReport(
   parcelKey: string,
   apiKey?: string,
@@ -1357,8 +1640,7 @@ export interface ParcelLandClassResponse {
 
 // GET /api/parcels/:key/land-class — the classification and its re-designation consequences for one
 // parcel. Key handling matches getParcelReport: the path takes the URL-safe dash form, so a raw '/' in the
-// number segment is normalised here and a UUID passes through. Costs 4 API tokens, refunded when the
-// county publishes no classification or the lookup could not be completed.
+// number segment is normalised here and a UUID passes through.
 export function getParcelLandClass(
   parcelKey: string,
   apiKey?: string,
@@ -1392,6 +1674,8 @@ export interface SpatialSearchParams {
   buildingStoreys?: string;
   minFootprintArea?: number;
   maxFootprintArea?: number;
+  // Opt-in: drop fractional-ownership-share rows (clean land prices). Sent as a body boolean.
+  excludeFractionalShares?: boolean;
   limit?: number;
 }
 
@@ -1400,9 +1684,13 @@ export interface SpatialFeatureProperties {
   price_gross: number;
   transaction_date: string;
   property_type: number;
-  market_type: number;
+  transaction_type?: number | null;
+  // Nullable: market_type is frequently missing (not recorded in the deed).
+  market_type: number | null;
   usable_area_m2: number | null;
   price_per_m2: number | null;
+  // Exact zł/m² for cheap land (price_per_m2 is rounded to 1 zł); null otherwise. /spatial returns it.
+  price_per_m2_exact?: number | string | null;
   rooms: number | null;
   floor: number | null;
   street: string | null;
@@ -1413,7 +1701,11 @@ export interface SpatialFeatureProperties {
   city: string | null;
   district: string | null;
   parcel_area: number | null;
+  parcel_id: string | null;
   parcel_number: string | null;
+  // See Transaction — main parcel vs union over all parcels (the filter matches the union).
+  mpzp_designation?: string | null;
+  mpzp_designations?: string[] | null;
   share_basis?: "full" | "fraction" | "ambiguous" | null;
   // Garage provenance — see Transaction.is_garage / area_basis.
   is_garage?: boolean | null;
@@ -1477,6 +1769,7 @@ export function searchByPolygon(
   if (p.buildingStoreys) body.buildingStoreys = p.buildingStoreys;
   if (p.minFootprintArea != null) body.minFootprintArea = p.minFootprintArea;
   if (p.maxFootprintArea != null) body.maxFootprintArea = p.maxFootprintArea;
+  if (p.excludeFractionalShares) body.excludeFractionalShares = true;
   if (p.limit != null) body.limit = p.limit;
   return fetchApiPost("/api/v1/transactions/spatial", body, apiKey);
 }
@@ -1558,14 +1851,13 @@ export function compareLocations(
 // ── Building breakdown (per-transaction, per-building) ──────────────
 
 // One building linked to a transaction. Mirrors the /api/transactions/:id/buildings row contract.
-// NUMERIC columns arrive as strings over the wire (Intl.format coerces). Field names are neutral —
-// no source register is named. footprint_area_alt_m2 / footprint_divergent are NULL unless a
+// NUMERIC columns arrive as strings over the wire (Intl.format coerces).
+// footprint_area_alt_m2 / footprint_divergent are NULL unless a
 // second independent footprint measurement exists; est_total_area_m2 is NULL without footprint+storeys.
 // Construction-age estimate for one building. ALWAYS carries a `status`, and a refusal is a real
 // answer: `older_than_register` means "we cannot date this building", not "unknown, maybe new".
-// `year_from` is a legal lower bound (works may not start before the decision is final); `year_to` and
-// `year_point` add a completion offset and are estimates. `year_point` is null when the building's
-// class has no stable calibration — the interval alone is then the correct answer.
+// `year_from` is a lower bound; `year_to` and `year_point` are estimates. `year_point` may be null —
+// the interval alone is then the correct answer.
 export interface BuildingAgeEstimate {
   status:
     | "estimated"
@@ -1664,7 +1956,7 @@ export function getTransactionFlood(
 // One heritage entry carried inside a parcel row's `sites` array (capped server-side). Neutral EN
 // labels mapped server-side; category is a bounded vocabulary (building, urban_layout, surroundings,
 // cemetery, park, ensemble, landscape, other) — typed open (string) for forward compatibility, with
-// 'other' as the server's fallback. name may be absent (field-level gating server-side).
+// 'other' as the server's fallback. name may be absent.
 export interface HeritageSite {
   category: string;
   name?: string | null;
@@ -1779,16 +2071,9 @@ export interface TransitBreakdownResponse {
 
 // ── Building-permit breakdown (per-transaction, per-parcel) ──────────
 
-// One closed case (permit with an issued decision, or notification accepted without objection)
-// registered against one of the transaction's parcels. Mirrors the
-// /api/v1/transactions/:id/permits row contract. TWO-STATE:
-// a row exists ONLY for a registered case — an empty list is never asserted as "nothing was
-// ever planned". The response carries NO parcel identity and NO source-registry number by
-// design (identity-stripped). record_kind: permit = building-permit decision, notification = works
-// notification. intent_type / works_type / status are neutral English codes (unknown source
-// values map to "other"); object_category is the statutory Roman-numeral class; authority /
-// address / volume are administrative facts. Dates are YYYY-MM-DD strings; notifications have
-// no decision_date.
+// One closed case (permit with an issued decision, or notification accepted without objection).
+// Identity-stripped: carries no parcel identity. Codes are neutral English; dates are
+// YYYY-MM-DD; notifications have no decision_date.
 export interface PermitRecord {
   record_kind: "permit" | "notification";
   intent_type: string | null;
@@ -1807,7 +2092,68 @@ export interface PermitRecord {
 export interface PermitsResponse {
   data: PermitRecord[];
   truncated: boolean;
-  // Two-state disclaimer, shipped on every response (including empty).
+  // Absent on an older service and on a locked response: callers fall back to the
+  // neutral empty message. not_covered = no such transaction; covered_no_data = it exists but its
+  // parcels have no registered case; covered = at least one case.
+  coverage?: "covered" | "covered_no_data" | "not_covered";
+  // Disclaimer, shipped on every response (including empty).
+  note?: string;
+}
+
+// ── Building permits within a radius (collection) ─────────────────────
+
+export interface PermitsAreaCategoryCount {
+  object_category: string | null;
+  // The fields below are absent on an older service.
+  category_label?: string | null;
+  case_count: number;
+  permit_count?: number;
+  notification_count?: number;
+  // Sum over the cases with a filled volume only; volume_m3_known says how many those are.
+  volume_m3_sum: number | null;
+  volume_m3_known: number;
+}
+
+// One listed case. The extra fields are absent on an older service: distance_m is metres from the
+// circle's centre to the parcel covered by the case (not to the building), rounded to 10 m.
+export interface PermitsAreaRecord extends PermitRecord {
+  category_label?: string | null;
+  volume_suspect?: boolean;
+  distance_m?: number | null;
+}
+
+// Envelope from GET /api/v1/permits/area. locked:true = no cases and no aggregate are
+// returned; the aggregate, denominator and freshness are null then. The aggregate
+// counts ALL matched cases, not only the returned list. parcels_in_radius is the denominator: 0 means
+// we hold no matchable parcel there (missing data), not that nothing is being built.
+export interface PermitsAreaResponse {
+  locked: boolean;
+  query: {
+    lat: number;
+    lng: number;
+    radius_km: number;
+    date_from: string;
+    date_to?: string | null;
+    intent: string;
+    works_type: string;
+    // Effective filters after the intent alias is expanded; null = not filtered.
+    categories?: string[] | null;
+    exclude_categories?: string[] | null;
+    aggregate_only?: boolean;
+  };
+  data: PermitsAreaRecord[];
+  truncated: boolean;
+  pagination?: { limit: number; has_more: boolean; next_cursor?: string };
+  aggregate: {
+    case_count: number;
+    permit_count?: number;
+    notification_count?: number;
+    volume_m3_suspect?: number;
+    by_year: Array<{ year: number; by_category: PermitsAreaCategoryCount[] }>;
+  } | null;
+  parcels_in_radius: number | null;
+  corpus_coverage?: CorpusCoverage | null;
+  freshness: { as_of: string | null; latest_decision_date: string | null } | null;
   note?: string;
 }
 
@@ -1838,9 +2184,9 @@ export function getTransactionNature(
 
 // ── Subsurface breakdown (per-transaction, per-parcel) ──────────────
 
-// One mapped mining terrain touching a linked parcel. Public-safe fields only: the source register's
-// internal id is never present. status is the two-state (active = current, former = former); mineral_class
-// is the deformation-risk classification. overlap_pct is NUMERIC → string over the wire (formatters coerce).
+// One mapped mining terrain touching a linked parcel. status is the two-state (active = current,
+// former = former); mineral_class is the deformation-risk classification. overlap_pct is NUMERIC →
+// string over the wire (formatters coerce).
 export interface SubsurfaceMiningTerrain {
   name: string | null;
   status: "active" | "former" | string | null;
@@ -1866,7 +2212,7 @@ export interface SubsurfaceGroundwaterBody {
 
 // One linked parcel that overlaps a mining terrain OR a major groundwater reservoir. Mirrors the
 // /api/transactions/:id/subsurface row contract. TWO-STATE: a row exists ONLY for an in-zone parcel —
-// absence of rows is never asserted as "safe". Carries NO parcel identity and no source-register id.
+// absence of rows is never asserted as "safe". Carries NO parcel identity.
 export interface SubsurfaceBreakdownRow {
   mining_status: "active" | "former" | string | null;
   mineral_class: "subsidence" | "surface" | "fluid" | "other" | string | null;
@@ -1985,6 +2331,30 @@ export function getTransactionPermits(
   apiKey?: string,
 ): Promise<ApiResponse<PermitsResponse>> {
   return fetchApi(`/api/v1/transactions/${transactionId}/permits`, undefined, apiKey);
+}
+
+// GET /api/v1/permits/area. Omitted params fall back to the service defaults; category arrays go out as CSV.
+export function getPermitsInArea(
+  params: {
+    lat: number; lng: number; radiusKm?: number; dateFrom?: string; dateTo?: string; intent?: string; worksType?: string;
+    categories?: string[]; excludeCategories?: string[]; limit?: number; cursor?: string; aggregateOnly?: boolean;
+  },
+  apiKey?: string,
+): Promise<ApiResponse<PermitsAreaResponse>> {
+  return fetchApi("/api/v1/permits/area", toQueryParams({
+    lat: params.lat,
+    lng: params.lng,
+    radiusKm: params.radiusKm,
+    dateFrom: params.dateFrom,
+    dateTo: params.dateTo,
+    intent: params.intent,
+    worksType: params.worksType,
+    category: params.categories?.join(","),
+    excludeCategory: params.excludeCategories?.join(","),
+    limit: params.limit,
+    cursor: params.cursor,
+    aggregateOnly: params.aggregateOnly ? "true" : undefined,
+  }), apiKey);
 }
 
 // ── General-plan (POG) planning-zone breakdown (per-transaction) ────

@@ -319,6 +319,16 @@ function recordTools(): RecordedTool[] {
   return tools;
 }
 
+describe("get_parcel_report rate limit guidance", () => {
+  it("tells agents that a shared key shares the limit and to retry sequentially", () => {
+    const report = recordTools().find((t) => t.name === "get_parcel_report");
+    expect(report, "get_parcel_report is not registered").toBeDefined();
+    expect(report!.description).toContain("rate-limited per API key");
+    expect(report!.description).toContain("Too many requests");
+    expect(report!.description).toContain("retry sequentially");
+  });
+});
+
 function landClassTool(): RecordedTool {
   const found = recordTools().find((t) => t.name === "get_parcel_land_class");
   expect(found, "get_parcel_land_class is not registered").toBeDefined();

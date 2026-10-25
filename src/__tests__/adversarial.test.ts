@@ -5,6 +5,9 @@ import {
   stripDiacritics,
   CITY_SUBDISTRICTS,
   filterByLocation,
+  rankByLocation,
+  capRcnSection,
+  RCN_SECTION_CAP,
   tryResolveCityKey,
 } from "../mappings.js";
 
@@ -364,6 +367,37 @@ describe("filterByLocation — adversarial (merged RCN sub-branch)", () => {
   it("a Cyrillic homoglyph needle does NOT match its Latin lookalike", () => {
     // Cyrillic 'о' (U+043E) in the fragment must not match Latin 'o' in the district names.
     expect(filterByLocation("Мокотów", DISTRICTS)).toEqual([]);
+  });
+});
+
+describe("rankByLocation / capRcnSection — RCN section ranking", () => {
+  const DISTRICTS = ["Zawola", "Wolica", "Wola", "Mokotów", "Wolarnia", "Podwola"];
+
+  it("orders exact → prefix → infix, keeping source order inside a tier", () => {
+    expect(rankByLocation("wola", DISTRICTS)).toEqual({
+      names: ["Wola", "Wolarnia", "Zawola", "Podwola"],
+      hasExact: true,
+    });
+  });
+
+  it("matches diacritics-insensitively and reports no exact hit when none is equal", () => {
+    const res = rankByLocation("belchatow", ["Bełchatów-Wschód", "Bełchatów II"]);
+    expect(res.names).toEqual(["Bełchatów-Wschód", "Bełchatów II"]);
+    expect(res.hasExact).toBe(false);
+    expect(rankByLocation("belchatow", ["BEŁCHATÓW"]).hasExact).toBe(true);
+  });
+
+  it("returns exactly the filterByLocation set, only reordered", () => {
+    for (const q of ["wol", "ola", "o", "%", "", "zzz"]) {
+      expect([...rankByLocation(q, DISTRICTS).names].sort()).toEqual([...filterByLocation(q, DISTRICTS)].sort());
+    }
+  });
+
+  it("caps only when an exact hit exists, and reports how many names were hidden", () => {
+    const names = Array.from({ length: RCN_SECTION_CAP + 3 }, (_, i) => `n${i}`);
+    expect(capRcnSection(names, false)).toEqual({ shown: names, hidden: 0 });
+    expect(capRcnSection(names, true)).toEqual({ shown: names.slice(0, RCN_SECTION_CAP), hidden: 3 });
+    expect(capRcnSection(names.slice(0, RCN_SECTION_CAP), true)).toEqual({ shown: names.slice(0, RCN_SECTION_CAP), hidden: 0 });
   });
 });
 

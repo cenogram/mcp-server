@@ -313,6 +313,22 @@ describe.skipIf(!hasDistBuild)("HTTP mode auth dispatch (E2E spawn)", () => {
     expect(await res.text()).toBe("ok");
   });
 
+  it("/favicon.ico returns 200 image/x-icon", async () => {
+    const res = await fetch(`http://127.0.0.1:${port}/favicon.ico`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("image/x-icon");
+    const buf = Buffer.from(await res.arrayBuffer());
+    expect(buf.length).toBeGreaterThan(0);
+    expect(buf.subarray(0, 4)).toEqual(Buffer.from([0x00, 0x00, 0x01, 0x00])); // ICO magic
+  });
+
+  it("/favicon.svg returns 200 image/svg+xml", async () => {
+    const res = await fetch(`http://127.0.0.1:${port}/favicon.svg`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("image/svg+xml");
+    expect(await res.text()).toContain("<svg");
+  });
+
   it("POST /mcp without auth returns 401 with RFC 6750-compliant WWW-Authenticate", async () => {
     const res = await fetch(`http://127.0.0.1:${port}/mcp`, { method: "POST" });
     expect(res.status).toBe(401);
@@ -477,7 +493,7 @@ describe.skipIf(!hasDistBuild)("HTTP mode E2E (JWT + stub upstream)", () => {
         byBearerToken: { "cngrm_test_402": { status: 402, body: { error: "insufficient_credits", currentBalance: 0, creditsRequired: 10 } } },
       }),
       auth: "Bearer cngrm_test_402",
-      expectInText: ["Insufficient credits", "balance: 0", "query cost: 10", "key's account"],
+      expectInText: ["Insufficient API tokens", "balance: 0", "this call costs: 10", "Free tools that still work"],
     },
     {
       name: "401 api_key: key rejected EN",
@@ -605,5 +621,14 @@ describe.skipIf(!hasDistBuild)("HTTP mode E2E (JWT + stub upstream)", () => {
     // String-level check: U+0085 char must not appear unsanitized (byte-level
     // Buffer.includes(0x85) had false-positive risk on continuation bytes of unrelated codepoints).
     expect(newLogs.includes("\x85")).toBe(false);
+  });
+});
+
+describe("rate limit guidance", () => {
+  it("instructions mention the per-key limit and sequential retry", () => {
+    const instructions = serverInstructions();
+    expect(instructions).toContain("limited per API key");
+    expect(instructions).toContain("Too many requests");
+    expect(instructions).toContain("retry sequentially");
   });
 });

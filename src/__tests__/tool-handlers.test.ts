@@ -20,9 +20,12 @@ import type {
   ApiResponse,
   LocationItem,
   ValuationResponse,
+  LandValuationResponse,
+  PermitsAreaResponse,
 } from "../api-client.js";
 import { encodeOAuthCtx, ApiHttpError } from "../api-client.js";
 import { formatStreetList } from "../formatters.js";
+import { summaryWindowMonths } from "../tools.js";
 
 // ── Mock api-client (replaces entire module, including module-level API_KEY) ──
 
@@ -31,6 +34,7 @@ const mockGetTransactionsSummary = vi.fn();
 const mockGetStats = vi.fn();
 const mockGetPricePerM2 = vi.fn();
 const mockGetDistricts = vi.fn();
+const mockGetDistrictCoverage = vi.fn();
 const mockGetLocations = vi.fn();
 const mockSearchLocations = vi.fn();
 const mockGetPriceHistogram = vi.fn();
@@ -46,6 +50,8 @@ const mockGetRentalYieldLocations = vi.fn();
 const mockGetPriceSpread = vi.fn();
 const mockGetPriceSpreadLocations = vi.fn();
 const mockGetValuation = vi.fn();
+const mockGetLandValuation = vi.fn();
+const mockGetPermitsInArea = vi.fn();
 const mockGetBuildingBreakdown = vi.fn();
 const mockGetTransactionFlood = vi.fn();
 const mockGetTransactionHeritage = vi.fn();
@@ -55,6 +61,9 @@ const mockGetTransactionSurroundings = vi.fn();
 const mockGetTransactionRoads = vi.fn();
 const mockGetTransactionTransit = vi.fn();
 const mockGetTransactionFarmland = vi.fn();
+const mockGetTransactionSubsurface = vi.fn();
+const mockGetTransactionPermits = vi.fn();
+const mockGetTransactionPlanning = vi.fn();
 const mockGetDemographics = vi.fn();
 const mockGetInfrastructureSignals = vi.fn();
 const mockGetParcelLandClass = vi.fn();
@@ -76,6 +85,7 @@ vi.mock("../api-client.js", async () => {
   getStats: (...args: unknown[]) => mockGetStats(...args),
   getPricePerM2: (...args: unknown[]) => mockGetPricePerM2(...args),
   getDistricts: (...args: unknown[]) => mockGetDistricts(...args),
+  getDistrictCoverage: (...args: unknown[]) => mockGetDistrictCoverage(...args),
   getLocations: (...args: unknown[]) => mockGetLocations(...args),
   searchLocations: (...args: unknown[]) => mockSearchLocations(...args),
   getPriceHistogram: (...args: unknown[]) => mockGetPriceHistogram(...args),
@@ -91,6 +101,8 @@ vi.mock("../api-client.js", async () => {
   getPriceSpread: (...args: unknown[]) => mockGetPriceSpread(...args),
   getPriceSpreadLocations: (...args: unknown[]) => mockGetPriceSpreadLocations(...args),
   getValuation: (...args: unknown[]) => mockGetValuation(...args),
+  getLandValuation: (...args: unknown[]) => mockGetLandValuation(...args),
+  getPermitsInArea: (...args: unknown[]) => mockGetPermitsInArea(...args),
   getBuildingBreakdown: (...args: unknown[]) => mockGetBuildingBreakdown(...args),
   getTransactionFlood: (...args: unknown[]) => mockGetTransactionFlood(...args),
   getTransactionHeritage: (...args: unknown[]) => mockGetTransactionHeritage(...args),
@@ -100,6 +112,9 @@ vi.mock("../api-client.js", async () => {
   getTransactionRoads: (...args: unknown[]) => mockGetTransactionRoads(...args),
   getTransactionTransit: (...args: unknown[]) => mockGetTransactionTransit(...args),
   getTransactionFarmland: (...args: unknown[]) => mockGetTransactionFarmland(...args),
+  getTransactionSubsurface: (...args: unknown[]) => mockGetTransactionSubsurface(...args),
+  getTransactionPermits: (...args: unknown[]) => mockGetTransactionPermits(...args),
+  getTransactionPlanning: (...args: unknown[]) => mockGetTransactionPlanning(...args),
   getDemographics: (...args: unknown[]) => mockGetDemographics(...args),
   getInfrastructureSignals: (...args: unknown[]) => mockGetInfrastructureSignals(...args),
   getParcelLandClass: (...args: unknown[]) => mockGetParcelLandClass(...args),
@@ -128,6 +143,15 @@ const creditInfo: CreditInfo = { balance: 48, cost: 2 };
 
 function withCredits<T>(data: T): ApiResponse<T> {
   return { data, creditInfo };
+}
+
+function withInfo<T>(data: T, info: CreditInfo | null): ApiResponse<T> {
+  return { data, creditInfo: info };
+}
+
+// Resolves after a delay so a test can pick which of two parallel calls finishes last.
+function resolvesAfter<T>(ms: number, value: T): Promise<T> {
+  return new Promise((resolve) => setTimeout(() => resolve(value), ms));
 }
 
 const sampleTransaction = {
@@ -228,6 +252,7 @@ const sampleSpatialResponse: SpatialSearchResponse = {
       city: "Warszawa",
       district: "Mokotów",
       parcel_area: null,
+      parcel_id: null,
       parcel_number: null,
     },
   }],
@@ -258,6 +283,8 @@ beforeEach(() => {
   // list_locations(search) reads two sources on every call; default the TERYT side to an empty,
   // zero-cost result (the search route is free) so tests exercising only the RCN side don't stub it.
   mockSearchLocations.mockResolvedValue({ data: [], creditInfo: { balance: 48, cost: 0 } });
+  // Coverage is an extra lookup on RCN labels; default to "nothing known" so existing expectations hold.
+  mockGetDistrictCoverage.mockResolvedValue({ data: { data: [], meta: { total: 0 } }, creditInfo: { balance: 48, cost: 0 } });
 });
 
 // ── Helper ─────────────────────────────────────────────────────────
@@ -278,6 +305,7 @@ describe("tool discovery", () => {
     const { tools } = await client.listTools();
     expect(tools.map((t) => t.name).sort()).toEqual([
       "compare_locations",
+      "estimate_land_value",
       "estimate_value",
       "get_building_breakdown",
       "get_demographics",
@@ -285,6 +313,7 @@ describe("tool discovery", () => {
       "get_market_overview",
       "get_parcel_land_class",
       "get_parcel_report",
+      "get_permits_in_area",
       "get_price_distribution",
       "get_price_statistics",
       "get_transaction_farmland",
@@ -316,9 +345,8 @@ describe("tool discovery", () => {
   });
 
   it("all tools have title + destructiveHint:false annotations", async () => {
-    // Anthropic Connectors Directory (Software Directory Policy) requires applicable
-    // annotations — in particular title and destructiveHint. Missing annotations are a
-    // leading rejection cause. Guards the submission requirement against regressions.
+    // Directory listings require title and destructiveHint annotations; a missing one is a leading
+    // rejection cause, so guard against regressions.
     const { tools } = await client.listTools();
     for (const tool of tools) {
       expect(
@@ -329,13 +357,12 @@ describe("tool discovery", () => {
     }
   });
 
-  it("no tool description leaks the rent-data source brand", async () => {
-    // Formatters scrub the brand from data output; tool descriptions (sent to the LLM/clients)
-    // must stay clean too. Guards against a data-source brand leaking into a tool description.
+  it("no tool description contains a guarded term", async () => {
+    // Tool descriptions (sent to the LLM/clients) must use the same neutral vocabulary as the
+    // formatters.
     const { tools } = await client.listTools();
     for (const tool of tools) {
       const desc = (tool.description ?? "").toLowerCase();
-      // A description states what the caller gets back, never which register it came from.
       expect(findGuardToken(desc), `${tool.name} description leaks a guarded term`).toBeNull();
     }
   });
@@ -403,6 +430,12 @@ describe("tool discovery", () => {
     expect(desc, "does not point at the street-address tool").toContain("list_parcels_in_area");
   });
 
+  it("tells resolve_parcel callers that a gmina name plus a number works for multi-precinct gminas", async () => {
+    const { tools } = await client.listTools();
+    const desc = tools.find((t) => t.name === "resolve_parcel")?.description ?? "";
+    expect(desc, "does not mention gminas made of several precincts").toMatch(/gmina made of several precincts/i);
+  });
+
   it("warns that RCN building numbers are often compound, so an exact number misses", async () => {
     // buildingNumber matches exactly, but RCN records split numbers like '84/92'; a caller passing
     // '84' gets a silent empty answer. The description must warn about the compound form.
@@ -423,11 +456,48 @@ describe("tool discovery", () => {
     }
   });
 
+  it("get_permits_in_area states its coverage qualifier in the FIRST sentence and the 2 km cap", async () => {
+    const { tools } = await client.listTools();
+    const desc = tools.find((t) => t.name === "get_permits_in_area")?.description ?? "";
+    const first = desc.split(/(?<=\.)\s/)[0] ?? "";
+    expect(first, "first sentence lacks the since-2016 qualifier").toContain("since 2016");
+    expect(first, "first sentence lacks the issued-decisions qualifier").toContain("issued decisions only");
+    expect(first, "first sentence lacks the partial-geometry qualifier").toContain("not the whole cadastre");
+    expect(desc).toContain("0.1–2");
+    expect(desc).toContain("temporarily unavailable");
+    expect(desc).toContain("never guess");
+  });
+
+  it("get_permits_in_area tells the model where coordinates come from, what the filters are for and that the list is by date", async () => {
+    const { tools } = await client.listTools();
+    const desc = tools.find((t) => t.name === "get_permits_in_area")?.description ?? "";
+    expect(desc).toContain("resolve_parcel");
+    expect(desc).toContain("list_parcels_in_area(location, street)");
+    expect(desc).toContain("NOT nearest first");
+    expect(desc).toContain("smaller radiusKm");
+    expect(desc).toContain("categories=[XIII]");
+    expect(desc).toContain("excludeCategories=[XXVI]");
+    expect(desc).toContain("categories=[XXVI]");
+    expect(desc).toContain("aggregateOnly=true");
+    expect(desc).toContain("cursor");
+    expect(desc).toContain("several calls");
+    expect(desc).not.toContain("multi-family buildings only");
+  });
+
+  it("get_transaction_permits describes three coverage states, not two", async () => {
+    const { tools } = await client.listTools();
+    const desc = tools.find((t) => t.name === "get_transaction_permits")?.description ?? "";
+    expect(desc).not.toContain("TWO-STATE");
+    for (const state of ["covered", "covered_no_data", "not_covered"]) expect(desc).toContain(state);
+    expect(desc).toContain("get_permits_in_area");
+  });
+
   it("has all expected tool names (default set, no optional tools)", async () => {
     const { tools } = await client.listTools();
     const names = tools.map((t) => t.name).sort();
     expect(names).toEqual([
       "compare_locations",
+      "estimate_land_value",
       "estimate_value",
       "get_building_breakdown",
       "get_demographics",
@@ -435,6 +505,7 @@ describe("tool discovery", () => {
       "get_market_overview",
       "get_parcel_land_class",
       "get_parcel_report",
+      "get_permits_in_area",
       "get_price_distribution",
       "get_price_statistics",
       "get_transaction_farmland",
@@ -540,7 +611,7 @@ describe("search_transactions", () => {
     );
   });
 
-  it("handles summary failure gracefully (still returns transactions)", async () => {
+  it("handles summary failure gracefully (still returns transactions) and says so", async () => {
     mockGetTransactions.mockResolvedValueOnce(withCredits(sampleTransactionsResponse));
     mockGetTransactionsSummary.mockRejectedValueOnce(new Error("timeout"));
 
@@ -550,6 +621,57 @@ describe("search_transactions", () => {
     // Should still show transactions even if summary fails
     expect(text).toContain("Puławska");
     expect(text).not.toContain("Error:");
+    expect(result.isError).toBeFalsy();
+    expect(text).toContain(
+      "Summary statistics unavailable for this query (temporary error); transaction results below follow the requested limit and pagination.",
+    );
+  });
+
+  it("keeps the summary-failure note honest when the total exceeds the page", async () => {
+    // total (1234) > rows shown: the note must promise limit/pagination only, never completeness.
+    mockGetTransactions.mockResolvedValueOnce(withCredits(sampleTransactionsResponse));
+    mockGetTransactionsSummary.mockRejectedValueOnce(new Error("timeout"));
+
+    const text = getTextContent(await client.callTool({ name: "search_transactions", arguments: { limit: 1 } }));
+
+    expect(text).toContain("Found 1234 transactions (showing 1)");
+    expect(text).toContain("follow the requested limit and pagination.");
+    expect(text).not.toMatch(/all (the )?(matching )?transactions|complete/i);
+    expect(text).not.toContain("Summary:");
+  });
+
+  it("adds no summary note when the summary succeeds", async () => {
+    mockGetTransactions.mockResolvedValueOnce(withCredits(sampleTransactionsResponse));
+    mockGetTransactionsSummary.mockResolvedValueOnce(withCredits(sampleSummary));
+
+    const text = getTextContent(await client.callTool({ name: "search_transactions", arguments: {} }));
+
+    expect(text).not.toContain("Summary statistics unavailable");
+  });
+
+  it("reports an unexpected summary failure to Sentry, but not an expected one (same note)", async () => {
+    mockGetTransactions.mockResolvedValueOnce(withCredits(sampleTransactionsResponse));
+    mockGetTransactionsSummary.mockRejectedValueOnce(new ApiHttpError("Internal error", { status: 500, authMode: "api_key" }));
+    const unexpected = getTextContent(await client.callTool({ name: "search_transactions", arguments: {} }));
+    expect(unexpected).toContain("Summary statistics unavailable");
+    expect(mockSentryCaptureException).toHaveBeenCalledTimes(1);
+
+    mockSentryCaptureException.mockClear();
+    mockGetTransactions.mockResolvedValueOnce(withCredits(sampleTransactionsResponse));
+    mockGetTransactionsSummary.mockRejectedValueOnce(new ApiHttpError("Too many requests.", { status: 429, authMode: "api_key" }));
+    const expected = getTextContent(await client.callTool({ name: "search_transactions", arguments: {} }));
+    expect(expected).toContain("Summary statistics unavailable");
+    expect(mockSentryCaptureException).not.toHaveBeenCalled();
+  });
+
+  it("reports one failure, not two, when the rows and the summary both fail", async () => {
+    mockGetTransactions.mockRejectedValueOnce(new ApiHttpError("Internal error", { status: 500, authMode: "api_key" }));
+    mockGetTransactionsSummary.mockRejectedValueOnce(new ApiHttpError("Internal error", { status: 500, authMode: "api_key" }));
+
+    const result = await client.callTool({ name: "search_transactions", arguments: {} });
+
+    expect(result.isError).toBe(true);
+    expect(mockSentryCaptureException).toHaveBeenCalledTimes(1);
   });
 
   it("passes valid floor buckets through to api-client as CSV", async () => {
@@ -656,6 +778,58 @@ describe("search_transactions", () => {
     expect(getTextContent(result)).toContain("Invalid buildingStoreys token");
     expect(mockGetTransactions).not.toHaveBeenCalled();
   });
+
+  it("forwards excludeFractionalShares to both rows and summary when set", async () => {
+    mockGetTransactions.mockResolvedValueOnce(withCredits(sampleTransactionsResponse));
+    mockGetTransactionsSummary.mockResolvedValueOnce(withCredits(sampleSummary));
+
+    await client.callTool({
+      name: "search_transactions",
+      arguments: { location: "Gdańsk", propertyType: "land", excludeFractionalShares: true },
+    });
+
+    expect(mockGetTransactions).toHaveBeenCalledWith(
+      expect.objectContaining({ excludeFractionalShares: true }),
+      "test-api-key",
+    );
+    expect(mockGetTransactionsSummary).toHaveBeenCalledWith(
+      expect.objectContaining({ excludeFractionalShares: true }),
+      "test-api-key",
+    );
+  });
+
+  it("sends medianWindowMonths=24 to summary when the caller gives no dateFrom", async () => {
+    mockGetTransactions.mockResolvedValueOnce(withCredits(sampleTransactionsResponse));
+    mockGetTransactionsSummary.mockResolvedValueOnce(withCredits(sampleSummary));
+
+    await client.callTool({ name: "search_transactions", arguments: { location: "Gdańsk" } });
+
+    expect(mockGetTransactionsSummary).toHaveBeenCalledWith(
+      expect.objectContaining({ medianWindowMonths: 24 }),
+      "test-api-key",
+    );
+  });
+
+  it("omits medianWindowMonths once the caller sets dateFrom (their window governs)", async () => {
+    mockGetTransactions.mockResolvedValueOnce(withCredits(sampleTransactionsResponse));
+    mockGetTransactionsSummary.mockResolvedValueOnce(withCredits(sampleSummary));
+
+    await client.callTool({ name: "search_transactions", arguments: { location: "Gdańsk", dateFrom: "2020-01-01" } });
+
+    const params = mockGetTransactionsSummary.mock.calls[0]?.[0] as Record<string, unknown> | undefined;
+    expect(params?.medianWindowMonths).toBeUndefined();
+  });
+
+  it("nudges to add a landUse filter for a land search without one", async () => {
+    mockGetTransactions.mockResolvedValueOnce(withCredits(sampleTransactionsResponse));
+    mockGetTransactionsSummary.mockResolvedValueOnce(withCredits(sampleSummary));
+
+    const result = await client.callTool({
+      name: "search_transactions",
+      arguments: { location: "Gdańsk", propertyType: "land" },
+    });
+    expect(getTextContent(result)).toContain("landUse");
+  });
 });
 
 // ── Tests: get_price_statistics ────────────────────────────────────
@@ -671,6 +845,19 @@ describe("get_price_statistics", () => {
     expect(text).toContain("Kraków-Podgórze");
     expect(text).toContain("Wola");
     expect(text).toContain("residential");
+  });
+
+  it("503 with Retry-After asks to repeat the same call, without reporting", async () => {
+    mockGetPricePerM2.mockRejectedValueOnce(
+      new ApiHttpError("Cenogram temporarily unavailable.", { status: 503, authMode: "api_key", retryAfterSeconds: 30 }),
+    );
+
+    const result = await client.callTool({ name: "get_price_statistics", arguments: {} });
+    const text = getTextContent(result);
+
+    expect(text).toContain("being prepared");
+    expect(text).toContain("about 30 s");
+    expect(mockSentryCaptureException).not.toHaveBeenCalled();
   });
 
   it("filters by location (case-insensitive)", async () => {
@@ -749,6 +936,110 @@ describe("get_price_statistics", () => {
 
     expect(mockGetDistricts).toHaveBeenCalledTimes(1);
   });
+
+  describe("period", () => {
+    // Only Date is faked: the in-memory MCP transport still needs real timers.
+    afterEach(() => { vi.useRealTimers(); });
+
+    const datedRows: PricePerM2Row[] = [
+      { district: "Mokotów", avg_price_m2: 16000, median_price_m2: 15200, count: 500, min_date: "2024-11-04", max_date: "2026-10-20" },
+      { district: "Wola", avg_price_m2: 14000, median_price_m2: 13500, count: 400, min_date: "2024-10-30", max_date: "2026-10-22" },
+    ];
+
+    it("defaults to the last 24 months and names the period in the response", async () => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(new Date("2026-10-23T12:00:00Z"));
+      mockGetPricePerM2.mockResolvedValueOnce(withCredits(datedRows));
+
+      const result = await client.callTool({ name: "get_price_statistics", arguments: {} });
+
+      expect(mockGetPricePerM2).toHaveBeenCalledWith("test-api-key", { dateFrom: "2024-10-23", dateTo: "2026-10-23" });
+      expect(getTextContent(result)).toContain("Period: 2024-10-23 to 2026-10-23 (last 24 months)");
+    });
+
+    it("clamps the 24-month boundary on 29 Feb to 28 Feb (not 1 Mar)", async () => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(new Date("2028-02-29T10:00:00Z"));
+      mockGetPricePerM2.mockResolvedValueOnce(withCredits(datedRows));
+
+      await client.callTool({ name: "get_price_statistics", arguments: {} });
+
+      expect(mockGetPricePerM2).toHaveBeenCalledWith("test-api-key", { dateFrom: "2026-02-28", dateTo: "2028-02-29" });
+    });
+
+    it("uses the UTC date, not the local one, around midnight", async () => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(new Date("2026-10-23T23:30:00Z"));
+      mockGetPricePerM2.mockResolvedValueOnce(withCredits(datedRows));
+
+      await client.callTool({ name: "get_price_statistics", arguments: {} });
+
+      expect(mockGetPricePerM2).toHaveBeenCalledWith("test-api-key", { dateFrom: "2024-10-23", dateTo: "2026-10-23" });
+    });
+
+    it("period=all sends no dateFrom, bounds dateTo to today and labels the line as full history", async () => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(new Date("2026-10-23T12:00:00Z"));
+      const allRows: PricePerM2Row[] = [
+        { district: "Mokotów", avg_price_m2: 11000, median_price_m2: 10500, count: 9000, min_date: "2003-01-15", max_date: "2026-10-20" },
+        { district: "Wola", avg_price_m2: 10000, median_price_m2: 9500, count: 8000, min_date: "2002-12-02", max_date: "2026-10-22" },
+      ];
+      mockGetPricePerM2.mockResolvedValueOnce(withCredits(allRows));
+
+      const result = await client.callTool({ name: "get_price_statistics", arguments: { period: "all" } });
+
+      expect(mockGetPricePerM2).toHaveBeenCalledWith("test-api-key", { dateFrom: undefined, dateTo: "2026-10-23" });
+      expect(getTextContent(result)).toContain("Period: 2002-12-02 to 2026-10-23 (full history)");
+    });
+
+    it("explicit dates win over period", async () => {
+      mockGetPricePerM2.mockResolvedValueOnce(withCredits(datedRows));
+
+      const result = await client.callTool({
+        name: "get_price_statistics",
+        arguments: { period: "all", dateFrom: "2020-01-01", dateTo: "2021-12-31" },
+      });
+
+      expect(mockGetPricePerM2).toHaveBeenCalledWith("test-api-key", { dateFrom: "2020-01-01", dateTo: "2021-12-31" });
+      expect(getTextContent(result)).toContain("Period: 2020-01-01 to 2021-12-31 (custom range)");
+    });
+
+    it("dateTo alone keeps the start of history open", async () => {
+      mockGetPricePerM2.mockResolvedValueOnce(withCredits(datedRows));
+
+      await client.callTool({ name: "get_price_statistics", arguments: { dateTo: "2019-12-31" } });
+
+      expect(mockGetPricePerM2).toHaveBeenCalledWith("test-api-key", { dateFrom: undefined, dateTo: "2019-12-31" });
+    });
+
+    it("rejects a malformed date before calling the API", async () => {
+      const result = await client.callTool({ name: "get_price_statistics", arguments: { dateFrom: "2020/01/01" } });
+
+      expect(result.isError).toBe(true);
+      expect(mockGetPricePerM2).not.toHaveBeenCalled();
+    });
+
+    it("empty result names the requested period and points to period=\"all\"", async () => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(new Date("2026-10-23T12:00:00Z"));
+      mockGetPricePerM2.mockResolvedValueOnce(withCredits([]));
+      mockGetDistricts.mockResolvedValueOnce(withCredits(["Mokotów"]));
+
+      const result = await client.callTool({ name: "get_price_statistics", arguments: { location: "Atlantyda" } });
+      const text = getTextContent(result);
+
+      expect(text).toContain("Requested period: 2024-10-23 to 2026-10-23 (last 24 months)");
+      expect(text).toContain('period="all"');
+      expect(text).toContain("list_locations");
+    });
+
+    it("tool description states the default window", async () => {
+      const { tools } = await client.listTools();
+      const desc = tools.find((t) => t.name === "get_price_statistics")?.description ?? "";
+      expect(desc).toContain("last 24 months");
+      expect(desc).toContain('period="all"');
+    });
+  });
 });
 
 // ── Tests: get_price_distribution ──────────────────────────────────
@@ -770,6 +1061,42 @@ describe("get_price_distribution", () => {
 
     expect(text).toContain("█");
     expect(text).toContain("Price distribution");
+    // No location passed: the reply opens with the histogram itself, no "not applied" note.
+    expect(text.startsWith("Price distribution")).toBe(true);
+  });
+
+  it("opens with a note when a location is passed, and the histogram is unchanged", async () => {
+    mockGetPriceHistogram.mockResolvedValueOnce(withCredits(sampleHistogramBins));
+    mockGetPriceHistogram.mockResolvedValueOnce(withCredits(sampleHistogramBins));
+
+    const plain = getTextContent(await client.callTool({ name: "get_price_distribution", arguments: {} }));
+    const withLocation = getTextContent(
+      await client.callTool({ name: "get_price_distribution", arguments: { location: "<Kraków>" } }),
+    );
+
+    expect(withLocation.startsWith("Note: this histogram is national (all Poland); location 'Kraków' was not applied.")).toBe(true);
+    expect(withLocation.endsWith(plain)).toBe(true);
+    // The location must not reach the API: the histogram endpoint has no such filter.
+    expect(mockGetPriceHistogram).toHaveBeenLastCalledWith(20, 3000000, "test-api-key");
+  });
+
+  it("names a passed teryt in the note too, and accepts both fields at once", async () => {
+    mockGetPriceHistogram.mockResolvedValueOnce(withCredits(sampleHistogramBins));
+    const teryt = getTextContent(await client.callTool({ name: "get_price_distribution", arguments: { teryt: "1465" } }));
+    expect(teryt).toContain("teryt '1465' was not applied.");
+
+    mockGetPriceHistogram.mockResolvedValueOnce(withCredits(sampleHistogramBins));
+    const both = getTextContent(
+      await client.callTool({ name: "get_price_distribution", arguments: { location: "Kraków", teryt: "1261" } }),
+    );
+    expect(both).toContain("location 'Kraków' and teryt '1261' were not applied.");
+  });
+
+  it("states in the description that the histogram is national", async () => {
+    const { tools } = await client.listTools();
+    const tool = tools.find((t) => t.name === "get_price_distribution");
+    expect(tool?.description).toContain("National histogram (all Poland)");
+    expect(Object.keys(tool?.inputSchema.properties ?? {})).toEqual(expect.arrayContaining(["location", "teryt"]));
   });
 });
 
@@ -875,6 +1202,90 @@ describe("search_by_area", () => {
     expect(result.isError).toBe(true);
   });
 
+  it("says the radius is applied as a bounding box, and the results are unchanged", async () => {
+    mockGetTransactions.mockResolvedValueOnce(withCredits(sampleTransactionsResponse));
+    mockGetTransactionsSummary.mockResolvedValueOnce(withCredits(sampleSummary));
+
+    const result = await client.callTool({
+      name: "search_by_area",
+      arguments: { latitude: 52.23, longitude: 21.01, radiusKm: 2 },
+    });
+    const text = getTextContent(result);
+
+    expect(text).toContain("Area approximated by a bounding box around the radius (corners extend beyond radiusKm).");
+    expect(text).toContain("Puławska");
+    // The note sits before the credit footer, not after it.
+    expect(text.indexOf("Area approximated")).toBeLessThan(text.indexOf("API tokens"));
+    expect(result.isError).toBeFalsy();
+
+    const { tools } = await client.listTools();
+    expect(tools.find((t) => t.name === "search_by_area")?.description).toContain("bounding box around the radius");
+  });
+
+  it("notes an unavailable summary (limit only, no pagination) and still returns rows", async () => {
+    mockGetTransactions.mockResolvedValueOnce(withCredits(sampleTransactionsResponse));
+    mockGetTransactionsSummary.mockRejectedValueOnce(new Error("timeout"));
+
+    const result = await client.callTool({
+      name: "search_by_area",
+      arguments: { latitude: 52.23, longitude: 21.01, radiusKm: 2 },
+    });
+    const text = getTextContent(result);
+
+    expect(result.isError).toBeFalsy();
+    expect(text).toContain(
+      "Summary statistics unavailable for this query (temporary error); transaction results below follow the requested limit.",
+    );
+    expect(text).not.toContain("pagination");
+    expect(text).toContain("Puławska");
+  });
+
+  it("reports an unexpected summary failure to Sentry, but not a spent allowance", async () => {
+    mockGetTransactions.mockResolvedValueOnce(withCredits(sampleTransactionsResponse));
+    mockGetTransactionsSummary.mockRejectedValueOnce(new ApiHttpError("Internal error", { status: 500, authMode: "api_key" }));
+    await client.callTool({ name: "search_by_area", arguments: { latitude: 52.23, longitude: 21.01 } });
+    expect(mockSentryCaptureException).toHaveBeenCalledTimes(1);
+
+    mockSentryCaptureException.mockClear();
+    mockGetTransactions.mockResolvedValueOnce(withCredits(sampleTransactionsResponse));
+    mockGetTransactionsSummary.mockRejectedValueOnce(new ApiHttpError("Out of tokens", { status: 402, authMode: "api_key" }));
+    const text = getTextContent(await client.callTool({ name: "search_by_area", arguments: { latitude: 52.23, longitude: 21.01 } }));
+    expect(text).toContain("Summary statistics unavailable");
+    expect(mockSentryCaptureException).not.toHaveBeenCalled();
+  });
+
+  it("forwards excludeFractionalShares and defaults the 24-month window (no dateFrom)", async () => {
+    mockGetTransactions.mockResolvedValueOnce(withCredits(sampleTransactionsResponse));
+    mockGetTransactionsSummary.mockResolvedValueOnce(withCredits(sampleSummary));
+
+    await client.callTool({
+      name: "search_by_area",
+      arguments: { latitude: 52.23, longitude: 21.01, radiusKm: 2, propertyType: "land", excludeFractionalShares: true },
+    });
+
+    expect(mockGetTransactions).toHaveBeenCalledWith(
+      expect.objectContaining({ excludeFractionalShares: true }),
+      "test-api-key",
+    );
+    expect(mockGetTransactionsSummary).toHaveBeenCalledWith(
+      expect.objectContaining({ excludeFractionalShares: true, medianWindowMonths: 24 }),
+      "test-api-key",
+    );
+  });
+
+  it("omits the default window once the caller sets dateFrom", async () => {
+    mockGetTransactions.mockResolvedValueOnce(withCredits(sampleTransactionsResponse));
+    mockGetTransactionsSummary.mockResolvedValueOnce(withCredits(sampleSummary));
+
+    await client.callTool({
+      name: "search_by_area",
+      arguments: { latitude: 52.23, longitude: 21.01, radiusKm: 2, dateFrom: "2021-01-01" },
+    });
+
+    const params = mockGetTransactionsSummary.mock.calls[0]?.[0] as Record<string, unknown> | undefined;
+    expect(params?.medianWindowMonths).toBeUndefined();
+  });
+
   it("forwards minArea and maxArea to backend", async () => {
     mockGetTransactions.mockResolvedValueOnce(withCredits(sampleTransactionsResponse));
     mockGetTransactionsSummary.mockResolvedValueOnce(withCredits(sampleSummary));
@@ -906,6 +1317,560 @@ describe("search_by_area", () => {
     expect(mockGetTransactions).toHaveBeenCalledWith(expect.objectContaining(expected), "test-api-key");
     // Summary must carry the same filters so the "Found N" count matches the rows.
     expect(mockGetTransactionsSummary).toHaveBeenCalledWith(expect.objectContaining(expected), "test-api-key");
+  });
+});
+
+describe("search_by_area - page", () => {
+  const areaArgs = { latitude: 52.23, longitude: 21.01, radiusKm: 1 };
+  const rows = (n: number) =>
+    Array.from({ length: n }, (_, i) => ({ ...sampleTransaction, id: `tx-${String(i + 1).padStart(3, "0")}` }));
+  const pageOf = (n: number, pagination: TransactionsResponse["pagination"]): TransactionsResponse => ({
+    data: rows(n),
+    pagination,
+  });
+
+  it("asks the API for page 2 with limit 50 (page wins over limit) and numbers rows from 51", async () => {
+    mockGetTransactions.mockResolvedValueOnce(withCredits(pageOf(50, { page: 2, limit: 50, total: 400, pages: 8 })));
+    mockGetTransactionsSummary.mockResolvedValueOnce(withCredits({ ...sampleSummary, total: 400 }));
+
+    const result = await client.callTool({ name: "search_by_area", arguments: { ...areaArgs, page: 2, limit: 5 } });
+    const text = getTextContent(result);
+
+    expect(mockGetTransactions).toHaveBeenCalledWith(expect.objectContaining({ page: 2, limit: 50 }), "test-api-key");
+    expect(text).toContain("Page 2 of 8 (50 per page; total 400). More pages: yes - next: page=3.");
+    expect(text).toContain("Each page is a separate call billed like the first (2 + 1 API tokens).");
+    expect(text).toMatch(/^51\. /m);
+    expect(text).toMatch(/^100\. /m);
+  });
+
+  it("takes the total from the summary count when the rows' estimate disagrees", async () => {
+    mockGetTransactions.mockResolvedValueOnce(withCredits(pageOf(50, { page: 8, limit: 50, total: 100, pages: 2, estimated: true })));
+    mockGetTransactionsSummary.mockResolvedValueOnce(withCredits({ ...sampleSummary, total: 400 }));
+
+    const text = getTextContent(await client.callTool({ name: "search_by_area", arguments: { ...areaArgs, page: 8 } }));
+
+    expect(text).toContain("Page 8 of 8");
+    expect(text).toContain("More pages: no");
+    expect(text).not.toContain("~");
+  });
+
+  it("falls back to the rows' estimated total with ~ and no last page number when the summary fails", async () => {
+    mockGetTransactions.mockResolvedValueOnce(withCredits(pageOf(50, { page: 1, limit: 50, total: 10000, pages: 200, estimated: true })));
+    mockGetTransactionsSummary.mockRejectedValueOnce(new Error("timeout"));
+
+    const text = getTextContent(await client.callTool({ name: "search_by_area", arguments: { ...areaArgs, page: 1 } }));
+
+    expect(text).toMatch(/Page 1 \(50 per page; total ~10.?000\)\. More pages: yes - next: page=2\./);
+    expect(text).not.toMatch(/Page 1 of/);
+    expect(text).toContain("transaction results below follow the requested page.");
+  });
+
+  it("uses the exact rows' total without ~ when the summary fails but the count is not estimated", async () => {
+    mockGetTransactions.mockResolvedValueOnce(withCredits(pageOf(20, { page: 2, limit: 50, total: 70, pages: 2 })));
+    mockGetTransactionsSummary.mockRejectedValueOnce(new Error("timeout"));
+
+    const text = getTextContent(await client.callTool({ name: "search_by_area", arguments: { ...areaArgs, page: 2 } }));
+
+    expect(text).toContain("Page 2 of 2 (50 per page; total 70). More pages: no.");
+  });
+
+  it("accepts page 10 (the cap) and rejects page 11 before calling the API", async () => {
+    mockGetTransactions.mockResolvedValueOnce(withCredits(pageOf(50, { page: 10, limit: 50, total: 900, pages: 18 })));
+    mockGetTransactionsSummary.mockResolvedValueOnce(withCredits({ ...sampleSummary, total: 900 }));
+    const ok = await client.callTool({ name: "search_by_area", arguments: { ...areaArgs, page: 10 } });
+    expect(ok.isError).toBeFalsy();
+    expect(mockGetTransactions).toHaveBeenCalledWith(expect.objectContaining({ page: 10 }), "test-api-key");
+    expect(getTextContent(ok)).toContain("Page 10 of 10");
+    expect(getTextContent(ok)).toContain("More pages: no.");
+
+    mockGetTransactions.mockClear();
+    const bad = await client.callTool({ name: "search_by_area", arguments: { ...areaArgs, page: 11 } });
+    expect(bad.isError).toBe(true);
+    expect(mockGetTransactions).not.toHaveBeenCalled();
+  });
+
+  it("rejects page 0 and a fractional page at the schema", async () => {
+    for (const page of [0, 1.5]) {
+      const bad = await client.callTool({ name: "search_by_area", arguments: { ...areaArgs, page } });
+      expect(bad.isError).toBe(true);
+    }
+    expect(mockGetTransactions).not.toHaveBeenCalled();
+  });
+
+  it("reports a page past the last page", async () => {
+    mockGetTransactions.mockResolvedValueOnce(withCredits({ data: [], pagination: { page: 9, limit: 50, total: 400, pages: 8 } }));
+    mockGetTransactionsSummary.mockResolvedValueOnce(withCredits({ ...sampleSummary, total: 400 }));
+
+    const text = getTextContent(await client.callTool({ name: "search_by_area", arguments: { ...areaArgs, page: 9 } }));
+
+    expect(text).toContain("Page 9 is past the last page (8).");
+  });
+
+  it("summaryOnly wins over page: summary call only, no paging text", async () => {
+    mockGetTransactionsSummary.mockResolvedValueOnce(withCredits({ ...sampleSummary, total: 400 }));
+
+    const text = getTextContent(await client.callTool({ name: "search_by_area", arguments: { ...areaArgs, page: 3, summaryOnly: true } }));
+
+    expect(mockGetTransactions).not.toHaveBeenCalled();
+    expect(text).toMatch(/Total transactions: 400/);
+    expect(text).not.toContain("More pages");
+  });
+
+  it("without page sends no page param, keeps the limit and adds no paging text", async () => {
+    mockGetTransactions.mockResolvedValueOnce(withCredits(sampleTransactionsResponse));
+    mockGetTransactionsSummary.mockResolvedValueOnce(withCredits(sampleSummary));
+
+    const text = getTextContent(await client.callTool({ name: "search_by_area", arguments: areaArgs }));
+
+    const sent = mockGetTransactions.mock.calls[0]![0] as { page?: number; limit?: number };
+    expect(sent.page).toBeUndefined();
+    expect(sent.limit).toBe(20);
+    expect(text).not.toContain("More pages");
+    expect(text).toMatch(/^1\. /m);
+  });
+});
+
+// ── Tests: summaryOnly mode ────────────────────────────────────────
+
+describe("summaryOnly mode", () => {
+  const NOW = new Date("2026-10-23T12:00:00Z");
+  const summaryCredits: CreditInfo = { balance: 47, cost: 1 };
+  const windowSummary: TransactionsSummary = {
+    median_price_m2: 15200,
+    avg_area: 58.3,
+    min_date: "2003-01-02",
+    max_date: "2026-10-20",
+    total: 1234,
+    median_price_m2_window: "15321.50",
+    median_window: { from: "2024-10-23", to: "2026-10-23", n: 845, months: 24 },
+  };
+  const summaryCall = () => mockGetTransactionsSummary.mock.calls[0]![0] as Record<string, unknown>;
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  describe("summaryWindowMonths", () => {
+    const at = (iso: string) => new Date(`${iso}T12:00:00Z`);
+
+    it("defaults to 24 months without dateFrom", () => {
+      expect(summaryWindowMonths(undefined, at("2026-10-23"))).toBe(24);
+      expect(summaryWindowMonths("", at("2026-10-23"))).toBe(24);
+    });
+
+    it("keeps the 24-month window without dateFrom whatever dateTo is, old, future or malformed", () => {
+      expect(summaryWindowMonths(undefined, at("2026-10-23"), "2025-06-01")).toBe(24);
+      expect(summaryWindowMonths(undefined, at("2026-10-23"), "2026-12-31")).toBe(24);
+      expect(summaryWindowMonths(undefined, at("2026-10-23"), "2024-10-22")).toBe(24);
+      expect(summaryWindowMonths(undefined, at("2026-10-23"), "2015-06-30")).toBe(24);
+      expect(summaryWindowMonths(undefined, at("2026-10-23"), "abc")).toBe(24);
+    });
+
+    it("counts months from dateFrom to a past dateTo, the window anchor", () => {
+      expect(summaryWindowMonths("2020-01-01", at("2026-10-23"), "2021-01-01")).toBe(12);
+      expect(summaryWindowMonths("2015-01-01", at("2026-10-23"), "2015-12-31")).toBe(12);
+      expect(summaryWindowMonths("2020-01-02", at("2026-10-23"), "2021-01-01")).toBe(12);
+      expect(summaryWindowMonths("2019-12-31", at("2026-10-23"), "2021-01-01")).toBe(13);
+    });
+
+    it("treats a future or malformed dateTo like no dateTo", () => {
+      expect(summaryWindowMonths("2020-01-01", at("2026-10-23"), "2027-01-01")).toBe(82);
+      expect(summaryWindowMonths("2020-01-01", at("2026-10-23"), "2026-10-23")).toBe(82);
+      expect(summaryWindowMonths("2020-01-01", at("2026-10-23"), "2026-02-30")).toBe(82);
+      expect(summaryWindowMonths("2020-01-01", at("2026-10-23"))).toBe(82);
+    });
+
+    it("returns 1 when dateFrom is on or after a past dateTo", () => {
+      expect(summaryWindowMonths("2021-06-01", at("2026-10-23"), "2020-01-01")).toBe(1);
+      expect(summaryWindowMonths("2020-01-01", at("2026-10-23"), "2020-01-01")).toBe(1);
+    });
+
+    it("clamps the day against the dateTo anchor, not today", () => {
+      // 2024-02-29 minus 12 months is 2023-02-28 (not today's day 23).
+      expect(summaryWindowMonths("2023-02-28", at("2026-10-23"), "2024-02-29")).toBe(12);
+      expect(summaryWindowMonths("2023-02-27", at("2026-10-23"), "2024-02-29")).toBe(13);
+      expect(summaryWindowMonths("2023-03-01", at("2026-10-23"), "2024-02-29")).toBe(12);
+    });
+
+    it("allows exactly 120 months before a past dateTo and drops the window beyond", () => {
+      expect(summaryWindowMonths("2010-06-15", at("2026-10-23"), "2020-06-15")).toBe(120);
+      expect(summaryWindowMonths("2010-06-14", at("2026-10-23"), "2020-06-15")).toBeUndefined();
+      expect(summaryWindowMonths("2003-01-01", at("2026-10-23"), "2015-12-31")).toBeUndefined();
+    });
+
+    it("clamps today and future dateFrom to 1 month", () => {
+      expect(summaryWindowMonths("2026-10-23", at("2026-10-23"))).toBe(1);
+      expect(summaryWindowMonths("2026-10-22", at("2026-10-23"))).toBe(1);
+      expect(summaryWindowMonths("2027-01-01", at("2026-10-23"))).toBe(1);
+    });
+
+    it("rounds up so the window starts on or before dateFrom", () => {
+      expect(summaryWindowMonths("2026-09-23", at("2026-10-23"))).toBe(1);
+      expect(summaryWindowMonths("2026-09-22", at("2026-10-23"))).toBe(2);
+      expect(summaryWindowMonths("2024-10-23", at("2026-10-23"))).toBe(24);
+      expect(summaryWindowMonths("2024-10-22", at("2026-10-23"))).toBe(25);
+    });
+
+    it("clamps the day to the target month length", () => {
+      // 31 Mar minus 1 month = 28 Feb (2026), so 28 Feb is covered by 1 month and 27 Feb needs 2.
+      expect(summaryWindowMonths("2026-02-28", at("2026-03-31"))).toBe(1);
+      expect(summaryWindowMonths("2026-02-27", at("2026-03-31"))).toBe(2);
+      // 29 Feb 2028 minus 12 months = 28 Feb 2027.
+      expect(summaryWindowMonths("2027-02-28", at("2028-02-29"))).toBe(12);
+      expect(summaryWindowMonths("2027-02-27", at("2028-02-29"))).toBe(13);
+      // 31 Mar minus 2 months = 31 Jan; 30 Mar minus 2 months = 30 Jan.
+      expect(summaryWindowMonths("2026-01-31", at("2026-03-31"))).toBe(2);
+      expect(summaryWindowMonths("2026-01-30", at("2026-03-31"))).toBe(3);
+      expect(summaryWindowMonths("2026-01-31", at("2026-03-30"))).toBe(2);
+    });
+
+    it("allows exactly 120 months and drops the window beyond", () => {
+      expect(summaryWindowMonths("2016-10-23", at("2026-10-23"))).toBe(120);
+      expect(summaryWindowMonths("2016-10-22", at("2026-10-23"))).toBeUndefined();
+    });
+
+    it("returns no window for a malformed or impossible date", () => {
+      expect(summaryWindowMonths("abc", at("2026-10-23"))).toBeUndefined();
+      expect(summaryWindowMonths("2026-13-01", at("2026-10-23"))).toBeUndefined();
+      expect(summaryWindowMonths("2026-02-30", at("2026-10-23"))).toBeUndefined();
+      expect(summaryWindowMonths("2026-1-5", at("2026-10-23"))).toBeUndefined();
+    });
+
+    it("uses the system clock by default", () => {
+      vi.setSystemTime(NOW);
+      expect(summaryWindowMonths("2024-10-23")).toBe(24);
+    });
+  });
+
+  describe("search_transactions", () => {
+    it("calls only the summary endpoint and returns stats without rows", async () => {
+      mockGetTransactionsSummary.mockResolvedValueOnce({ data: windowSummary, creditInfo: summaryCredits });
+
+      const result = await client.callTool({
+        name: "search_transactions",
+        arguments: { location: "Mokotów", propertyType: "unit", limit: 5, sort: "price", page: 2, summaryOnly: true },
+      });
+      const text = getTextContent(result);
+
+      expect(mockGetTransactions).not.toHaveBeenCalled();
+      expect(mockGetTransactionsSummary).toHaveBeenCalledTimes(1);
+      expect(summaryCall()).toMatchObject({ district: "Mokotów", propertyType: 4, medianWindowMonths: 24 });
+      expect(text).toMatch(/Total transactions: 1.?234/);
+      expect(text).toMatch(/Median price\/m\u00B2: .*15.?322.* \(n=845, 2024-10-23\u20132026-10-23\)/);
+      expect(text).toContain("Period: 2003-01-02 \u2013 2026-10-20");
+      expect(text).toContain("Avg area:");
+      expect(text).not.toMatch(/^1\. /m);
+      expect(text).not.toContain("id:");
+      expect(text).toContain("API tokens: 47 remaining as of this call (query cost: 1)");
+    });
+
+    it("derives the window from dateFrom and prints dateFrom as the period start", async () => {
+      vi.setSystemTime(NOW);
+      mockGetTransactionsSummary.mockResolvedValueOnce({
+        data: { ...windowSummary, median_window: { from: "2023-12-23", to: "2026-10-23", n: 700, months: 34 } },
+        creditInfo: summaryCredits,
+      });
+
+      const result = await client.callTool({
+        name: "search_transactions",
+        arguments: { location: "Mokotów", dateFrom: "2024-01-15", summaryOnly: true },
+      });
+
+      expect(summaryCall().medianWindowMonths).toBe(34);
+      expect(getTextContent(result)).toContain("n=700, 2024-01-15\u20132026-10-23");
+    });
+
+    it("requests no window for a range over 10 years and says the sample size is not reported", async () => {
+      vi.setSystemTime(NOW);
+      mockGetTransactionsSummary.mockResolvedValueOnce({ data: { ...windowSummary, median_price_m2_window: undefined, median_window: undefined }, creditInfo: summaryCredits });
+
+      const result = await client.callTool({
+        name: "search_transactions",
+        arguments: { location: "Mokotów", dateFrom: "2010-01-01", summaryOnly: true },
+      });
+      const text = getTextContent(result);
+
+      expect(summaryCall().medianWindowMonths).toBeUndefined();
+      expect(text).toContain("n not reported for ranges over 10 years");
+      expect(text).toMatch(/Median price\/m\u00B2: .*15.?200/);
+    });
+
+    it("asks for the 24-month window for an old dateTo without dateFrom and prints the API window", async () => {
+      vi.setSystemTime(NOW);
+      mockGetTransactionsSummary.mockResolvedValueOnce({
+        data: { ...windowSummary, median_window: { from: "2018-12-31", to: "2020-12-31", n: 320, months: 24 } },
+        creditInfo: summaryCredits,
+      });
+
+      const result = await client.callTool({
+        name: "search_transactions",
+        arguments: { location: "Mokotów", dateTo: "2020-12-31", summaryOnly: true },
+      });
+      const text = getTextContent(result);
+
+      expect(summaryCall()).toMatchObject({ dateTo: "2020-12-31", medianWindowMonths: 24 });
+      expect(text).toContain("n=320, 2018-12-31–2020-12-31");
+      expect(text).not.toContain("n not reported");
+    });
+
+    it("keeps the 24-month window for a dateTo inside it", async () => {
+      vi.setSystemTime(NOW);
+      mockGetTransactionsSummary.mockResolvedValueOnce({
+        data: { ...windowSummary, median_window: { from: "2023-06-30", to: "2025-06-30", n: 210, months: 24 } },
+        creditInfo: summaryCredits,
+      });
+
+      const result = await client.callTool({
+        name: "search_by_area",
+        arguments: { latitude: 52.23, longitude: 21.01, radiusKm: 2, dateTo: "2025-06-30", summaryOnly: true },
+      });
+
+      expect(summaryCall()).toMatchObject({ dateTo: "2025-06-30", medianWindowMonths: 24 });
+      expect(getTextContent(result)).toContain("n=210, 2023-06-30–2025-06-30");
+    });
+
+    it("counts the window months from dateFrom to a past dateTo", async () => {
+      vi.setSystemTime(NOW);
+      mockGetTransactionsSummary.mockResolvedValueOnce({
+        data: { ...windowSummary, median_window: { from: "2020-01-01", to: "2021-01-01", n: 90, months: 12 } },
+        creditInfo: summaryCredits,
+      });
+
+      const result = await client.callTool({
+        name: "search_transactions",
+        arguments: { location: "Mokotów", dateFrom: "2020-01-01", dateTo: "2021-01-01", summaryOnly: true },
+      });
+
+      expect(summaryCall().medianWindowMonths).toBe(12);
+      expect(getTextContent(result)).toContain("n=90, 2020-01-01–2021-01-01");
+    });
+
+    it("keeps a window for a year long ago and prints the sample size", async () => {
+      vi.setSystemTime(NOW);
+      mockGetTransactionsSummary.mockResolvedValueOnce({
+        data: { ...windowSummary, median_window: { from: "2014-12-31", to: "2015-12-31", n: 55, months: 12 } },
+        creditInfo: summaryCredits,
+      });
+
+      const result = await client.callTool({
+        name: "search_transactions",
+        arguments: { location: "Mokotów", dateFrom: "2015-01-01", dateTo: "2015-12-31", summaryOnly: true },
+      });
+      const text = getTextContent(result);
+
+      expect(summaryCall().medianWindowMonths).toBe(12);
+      expect(text).toContain("n=55, 2015-01-01–2015-12-31");
+      expect(text).not.toContain("over 10 years");
+    });
+
+    it("requests no window when the range is over 10 years before dateTo", async () => {
+      vi.setSystemTime(NOW);
+      mockGetTransactionsSummary.mockResolvedValueOnce({ data: { ...windowSummary, median_price_m2_window: undefined, median_window: undefined }, creditInfo: summaryCredits });
+
+      const result = await client.callTool({
+        name: "search_transactions",
+        arguments: { location: "Mokotów", dateFrom: "2003-01-01", dateTo: "2015-12-31", summaryOnly: true },
+      });
+
+      expect(summaryCall().medianWindowMonths).toBeUndefined();
+      expect(getTextContent(result)).toContain("n not reported for ranges over 10 years");
+    });
+
+    it("says there is no median when the window holds fewer than 5 sales", async () => {
+      mockGetTransactionsSummary.mockResolvedValueOnce({
+        data: { ...windowSummary, median_price_m2_window: null, median_window: { from: "2024-10-23", to: "2026-10-23", n: 3, months: 24 } },
+        creditInfo: summaryCredits,
+      });
+
+      const result = await client.callTool({ name: "search_transactions", arguments: { location: "Mokotów", summaryOnly: true } });
+
+      expect(getTextContent(result)).toContain("no median - fewer than 5 sales (n=3, 2024-10-23\u20132026-10-23)");
+    });
+
+    it("renders an empty result with the district suggestions from the summary", async () => {
+      mockGetTransactionsSummary.mockResolvedValueOnce({
+        data: { ...windowSummary, total: 0, median_price_m2: null, avg_area: null, min_date: null, max_date: null, suggestions: ["Wieliczka"] },
+        creditInfo: summaryCredits,
+      });
+
+      const result = await client.callTool({ name: "search_transactions", arguments: { location: "Wieliczkaa", summaryOnly: true } });
+
+      expect(getTextContent(result)).toContain('No location named "Wieliczkaa". Did you mean: Wieliczka?');
+      expect(mockGetTransactions).not.toHaveBeenCalled();
+    });
+
+    it("surfaces a summary API error instead of swallowing it", async () => {
+      mockGetTransactionsSummary.mockRejectedValueOnce(new Error("API error: HTTP 400 At least one filter is required for summary"));
+
+      const result = await client.callTool({ name: "search_transactions", arguments: { summaryOnly: true } });
+
+      expect(result.isError).toBe(true);
+      expect(getTextContent(result)).toContain("At least one filter is required");
+    });
+
+    it("keeps the land-use hint and the mpzp warning", async () => {
+      mockGetTransactionsSummary.mockResolvedValueOnce({ data: windowSummary, creditInfo: summaryCredits });
+
+      const result = await client.callTool({
+        name: "search_transactions",
+        arguments: { location: "Mokotów", propertyType: "land", mpzpDesignation: "ZZZ", summaryOnly: true },
+      });
+      const text = getTextContent(result);
+
+      expect(text).toContain("Tip: these land results mix");
+      expect(text).toContain("unrecognised mpzpDesignation");
+    });
+
+    it("summaryOnly=false keeps the rows + summary behaviour", async () => {
+      mockGetTransactions.mockResolvedValueOnce(withCredits(sampleTransactionsResponse));
+      mockGetTransactionsSummary.mockResolvedValueOnce(withCredits(sampleSummary));
+
+      const result = await client.callTool({ name: "search_transactions", arguments: { location: "Mokotów", summaryOnly: false } });
+
+      expect(mockGetTransactions).toHaveBeenCalledTimes(1);
+      expect(mockGetTransactionsSummary).toHaveBeenCalledTimes(1);
+      expect(getTextContent(result)).toContain("Puławska");
+    });
+  });
+
+  describe("search_by_area", () => {
+    const areaArgs = { latitude: 52.23, longitude: 21.01, radiusKm: 1 };
+
+    it("calls only the summary endpoint with the bbox and returns stats without rows", async () => {
+      mockGetTransactionsSummary.mockResolvedValueOnce({ data: windowSummary, creditInfo: summaryCredits });
+
+      const result = await client.callTool({ name: "search_by_area", arguments: { ...areaArgs, propertyType: "unit", summaryOnly: true } });
+      const text = getTextContent(result);
+
+      expect(mockGetTransactions).not.toHaveBeenCalled();
+      expect(mockGetTransactionsSummary).toHaveBeenCalledTimes(1);
+      const call = summaryCall() as { bbox: string; medianWindowMonths: number };
+      expect(call.bbox.split(",")).toHaveLength(4);
+      expect(call).toMatchObject({ propertyType: 4, medianWindowMonths: 24 });
+      expect(text).toMatch(/Total transactions: 1.?234/);
+      expect(text).toContain("n=845");
+      expect(text).toContain("Period: 2003-01-02 \u2013 2026-10-20");
+      expect(text).not.toMatch(/^1\. /m);
+      expect(text).not.toContain("id:");
+      expect(text).toContain("API tokens: 47 remaining as of this call (query cost: 1)");
+    });
+
+    it("derives the window from dateFrom", async () => {
+      vi.setSystemTime(NOW);
+      mockGetTransactionsSummary.mockResolvedValueOnce({ data: windowSummary, creditInfo: summaryCredits });
+
+      await client.callTool({ name: "search_by_area", arguments: { ...areaArgs, dateFrom: "2025-10-22", summaryOnly: true } });
+
+      expect(summaryCall().medianWindowMonths).toBe(13);
+    });
+
+    it("renders an empty bbox result without district suggestions", async () => {
+      mockGetTransactionsSummary.mockResolvedValueOnce({
+        data: { ...windowSummary, total: 0, median_price_m2: null, avg_area: null, min_date: null, max_date: null },
+        creditInfo: summaryCredits,
+      });
+
+      const result = await client.callTool({ name: "search_by_area", arguments: { ...areaArgs, summaryOnly: true } });
+
+      expect(getTextContent(result)).toBe(`No transactions found matching the criteria.\n---\nAPI tokens: 47 remaining as of this call (query cost: 1)`);
+    });
+
+    it("summaryOnly omitted keeps the rows + summary behaviour", async () => {
+      mockGetTransactions.mockResolvedValueOnce(withCredits(sampleTransactionsResponse));
+      mockGetTransactionsSummary.mockResolvedValueOnce(withCredits(sampleSummary));
+
+      await client.callTool({ name: "search_by_area", arguments: areaArgs });
+
+      expect(mockGetTransactions).toHaveBeenCalledTimes(1);
+      expect(mockGetTransactionsSummary).toHaveBeenCalledTimes(1);
+    });
+  });
+});
+
+// ── Tests: credit footer of the list + summary tools ───────────────
+
+describe.each([
+  ["search_transactions", { location: "Mokotów" }],
+  ["search_by_area", { latitude: 52.23, longitude: 21.01, radiusKm: 2 }],
+])("%s credit footer", (toolName, args) => {
+  const callTool = async () => getTextContent(await client.callTool({ name: toolName, arguments: args }));
+
+  it("sums the list and summary charges (2 + 1 = 3) and shows the lower balance", async () => {
+    mockGetTransactions.mockResolvedValueOnce(withInfo(sampleTransactionsResponse, { balance: 48, cost: 2 }));
+    mockGetTransactionsSummary.mockResolvedValueOnce(withInfo(sampleSummary, { balance: 47, cost: 1 }));
+
+    expect(await callTool()).toContain("API tokens: 47 remaining as of this call (query cost: 3)");
+  });
+
+  it("charges only the list when the summary fails, and says the summary is unavailable", async () => {
+    mockGetTransactions.mockResolvedValueOnce(withInfo(sampleTransactionsResponse, { balance: 48, cost: 2 }));
+    mockGetTransactionsSummary.mockRejectedValueOnce(new Error("timeout"));
+
+    const text = await callTool();
+
+    expect(text).toContain("Summary statistics unavailable");
+    expect(text).toContain("API tokens: 48 remaining as of this call (query cost: 2)");
+  });
+
+  it("shows only the list cost, with no refund claim, when the summary is rejected by a network timeout", async () => {
+    const abort = new Error("The operation was aborted");
+    abort.name = "AbortError";
+    mockGetTransactions.mockResolvedValueOnce(withInfo(sampleTransactionsResponse, { balance: 48, cost: 2 }));
+    mockGetTransactionsSummary.mockRejectedValueOnce(abort);
+
+    const text = await callTool();
+
+    expect(text).toContain("Summary statistics unavailable");
+    expect(text).toContain("API tokens: 48 remaining as of this call (query cost: 2)");
+    expect(text).not.toMatch(/refund/i);
+  });
+
+  it("shows the same balance whichever parallel call finishes last", async () => {
+    // Real headers differ by finish order: the call that is charged second sees the lower balance.
+    mockGetTransactions.mockImplementationOnce(() => resolvesAfter(1, withInfo(sampleTransactionsResponse, { balance: 48, cost: 2 })));
+    mockGetTransactionsSummary.mockImplementationOnce(() => resolvesAfter(15, withInfo(sampleSummary, { balance: 47, cost: 1 })));
+    const listFirst = await callTool();
+
+    mockGetTransactions.mockImplementationOnce(() => resolvesAfter(15, withInfo(sampleTransactionsResponse, { balance: 47, cost: 2 })));
+    mockGetTransactionsSummary.mockImplementationOnce(() => resolvesAfter(1, withInfo(sampleSummary, { balance: 49, cost: 1 })));
+    const summaryFirst = await callTool();
+
+    const footer = "API tokens: 47 remaining as of this call (query cost: 3)";
+    expect(listFirst).toContain(footer);
+    expect(summaryFirst).toContain(footer);
+  });
+
+  it("counts a refunded list call net and reports the refund", async () => {
+    mockGetTransactions.mockResolvedValueOnce(withInfo(sampleTransactionsResponse, { balance: 50, cost: 2, refunded: 2 }));
+    mockGetTransactionsSummary.mockResolvedValueOnce(withInfo(sampleSummary, { balance: 49, cost: 1 }));
+
+    expect(await callTool()).toContain("API tokens: 49 remaining as of this call (query cost: 1, 2 refunded)");
+  });
+
+  it("omits the footer when neither call carries credit headers", async () => {
+    mockGetTransactions.mockResolvedValueOnce(withInfo(sampleTransactionsResponse, null));
+    mockGetTransactionsSummary.mockResolvedValueOnce(withInfo(sampleSummary, null));
+
+    const text = await callTool();
+
+    expect(text).toContain("Puławska");
+    expect(text).not.toContain("API tokens");
+  });
+
+  it("uses the call that has headers when the other has none", async () => {
+    mockGetTransactions.mockResolvedValueOnce(withInfo(sampleTransactionsResponse, null));
+    mockGetTransactionsSummary.mockResolvedValueOnce(withInfo(sampleSummary, { balance: 47, cost: 1 }));
+
+    expect(await callTool()).toContain("API tokens: 47 remaining as of this call (query cost: 1)");
+  });
+
+  it("warns about a low balance and names the free tools", async () => {
+    mockGetTransactions.mockResolvedValueOnce(withInfo(sampleTransactionsResponse, { balance: 44, cost: 2 }));
+    mockGetTransactionsSummary.mockResolvedValueOnce(withInfo(sampleSummary, { balance: 43, cost: 1 }));
+
+    expect(await callTool()).toContain(
+      "Low balance: 43 tokens left - a parcel report costs 45; free tools: list_locations, search_parcels, resolve_parcel",
+    );
   });
 });
 
@@ -1314,6 +2279,313 @@ describe("estimate_value", () => {
   });
 });
 
+// ── Tests: estimate_land_value ─────────────────────────────────────
+
+const sampleLandValuation: LandValuationResponse = {
+  locked: false,
+  location: { country_code: "PL", lat: 52.3326, lng: 20.879, county_code: "1465" },
+  metric: "estimated_land_value",
+  currency: "PLN",
+  segment: { property_type: "land", land_type: "plot", area_m2: 1500, area_source: "caller", mpzp_designation: null },
+  result: {
+    estimated_value: 942000,
+    price_per_m2: 628,
+    price_per_ha: 6280000,
+    value_range_likely: { low: 840000, high: 1050000 },
+    value_range_wide: { low: 720000, high: 1230000 },
+    confidence: 0.61,
+    confidence_band: "medium",
+  },
+  inputs: {
+    comps_total: 18,
+    radius_m: 2000,
+    window_months: 24,
+    comparables: [
+      { distance_m: 320, transaction_date: "2025-07-04", area_m2: 1200, price_per_m2: 640, mpzp_designations: ["budownictwoMieszkanioweJednorodzinne"], district: "Stare Babice" },
+    ],
+  },
+  quality: {
+    coverage: "covered",
+    as_of: "2025-10-30",
+    ess: 9.2,
+    note: "Indicative market-value estimate for undeveloped land. NOT a certified appraisal (operat szacunkowy).",
+  },
+};
+
+describe("estimate_land_value", () => {
+  it("passes lat/lng + area + landType and formats the estimate (comps included by default)", async () => {
+    mockGetLandValuation.mockResolvedValueOnce(withCredits(sampleLandValuation));
+
+    const result = await client.callTool({ name: "estimate_land_value", arguments: { lat: 52.3326, lng: 20.879, area: 1500 } });
+    const text = getTextContent(result);
+
+    expect(mockGetLandValuation).toHaveBeenCalledWith(
+      { lat: 52.3326, lng: 20.879, parcelId: undefined, area: 1500, landType: undefined, mpzpDesignation: undefined, includeComps: true },
+      "test-api-key",
+    );
+    expect(text).toContain("Building plot value estimate");
+    expect(text).toContain("Confidence: medium");
+    expect(text).toContain("Stare Babice");
+    expect(text).toContain("operat szacunkowy");
+    expect(text).toContain("API tokens: 48 remaining");
+  });
+
+  it("passes parcelId with no area (resolved from the cadastre) + optional landType", async () => {
+    mockGetLandValuation.mockResolvedValueOnce(withCredits(sampleLandValuation));
+
+    await client.callTool({ name: "estimate_land_value", arguments: { parcelId: "146502_8.0403.10", landType: "agricultural" } });
+
+    expect(mockGetLandValuation).toHaveBeenCalledWith(
+      { lat: undefined, lng: undefined, parcelId: "146502_8.0403.10", area: undefined, landType: "agricultural", mpzpDesignation: undefined, includeComps: true },
+      "test-api-key",
+    );
+  });
+
+  it("rejects zero location modes without calling the API", async () => {
+    const result = await client.callTool({ name: "estimate_land_value", arguments: { area: 1500 } });
+    expect(getTextContent(result)).toContain("exactly one location");
+    expect(mockGetLandValuation).not.toHaveBeenCalled();
+  });
+
+  it("rejects both lat/lng and parcelId without calling the API", async () => {
+    const result = await client.callTool({
+      name: "estimate_land_value",
+      arguments: { lat: 52.3, lng: 20.8, parcelId: "146502_8.0403.10", area: 1500 },
+    });
+    expect(getTextContent(result)).toContain("exactly one location");
+    expect(mockGetLandValuation).not.toHaveBeenCalled();
+  });
+
+  it("rejects a lone lat without lng", async () => {
+    const result = await client.callTool({ name: "estimate_land_value", arguments: { lat: 52.3, area: 1500 } });
+    expect(getTextContent(result)).toContain("lat and lng must be provided together");
+    expect(mockGetLandValuation).not.toHaveBeenCalled();
+  });
+
+  it("requires area on the lat/lng path, without calling the API", async () => {
+    const result = await client.callTool({ name: "estimate_land_value", arguments: { lat: 52.3326, lng: 20.879 } });
+    expect(getTextContent(result)).toContain("area");
+    expect(mockGetLandValuation).not.toHaveBeenCalled();
+  });
+
+  it("surfaces no_data as a refunded miss (no estimate)", async () => {
+    mockGetLandValuation.mockResolvedValueOnce(withCredits({
+      ...sampleLandValuation,
+      location: { country_code: "PL", lat: 53.4, lng: 18.2, county_code: null },
+      result: {
+        estimated_value: null, price_per_m2: null, price_per_ha: null,
+        value_range_likely: { low: null, high: null }, value_range_wide: { low: null, high: null },
+        confidence: null, confidence_band: null,
+      },
+      inputs: { comps_total: 1, radius_m: null, window_months: 24, comparables: null },
+      quality: { ...sampleLandValuation.quality, coverage: "no_data", as_of: null, ess: null },
+    } satisfies LandValuationResponse));
+
+    const result = await client.callTool({ name: "estimate_land_value", arguments: { lat: 53.4, lng: 18.2, area: 3000 } });
+    const text = getTextContent(result);
+    expect(text).toContain("No estimate");
+    expect(text).toContain("refunded");
+  });
+
+  // A 503 carrying the feature-off mode degrades into a plain message and must NOT be reported to
+  // error tracking.
+  it("degrades a feature-off 503 into a plain unavailable message without reporting", async () => {
+    mockGetLandValuation.mockRejectedValueOnce(
+      new ApiHttpError("Service unavailable", { status: 503, authMode: "api_key", mode: "avm-disabled" }),
+    );
+
+    const result = await client.callTool({ name: "estimate_land_value", arguments: { lat: 52.3326, lng: 20.879, area: 1500 } });
+    expect(result.isError).toBe(true);
+    const text = getTextContent(result);
+    expect(text).toContain("temporarily unavailable");
+    expect(text).not.toContain("-disabled");
+    expect(mockSentryCaptureException).not.toHaveBeenCalled();
+  });
+
+  // Any other 503 stays on the normal error path (reported, generic message).
+  it("reports a 503 without the feature-off mode on the normal error path", async () => {
+    mockGetLandValuation.mockRejectedValueOnce(
+      new ApiHttpError("Service unavailable - the data is temporarily unavailable. Try again shortly.", { status: 503, authMode: "api_key" }),
+    );
+
+    const result = await client.callTool({ name: "estimate_land_value", arguments: { lat: 52.3326, lng: 20.879, area: 1500 } });
+    expect(result.isError).toBe(true);
+    expect(getTextContent(result)).not.toContain("temporarily unavailable — this feature");
+    expect(mockSentryCaptureException).toHaveBeenCalled();
+  });
+});
+
+// ── Tests: get_permits_in_area ─────────────────────────────────────
+
+const samplePermitsArea: PermitsAreaResponse = {
+  locked: false,
+  query: { lat: 52.0928, lng: 21.0225, radius_km: 2, date_from: "2024-10-16", intent: "all", works_type: "new_construction" },
+  data: [
+    {
+      record_kind: "permit", intent_type: "new_building", object_category: "XIII", works_type: "new_construction",
+      status: null, decision_date: "2026-03-02", intake_date: "2025-11-20", authority: "Starosta Powiatu Piaseczyńskiego",
+      address_street: "ul. Osiedlowa", address_number: "50A", address_city: "Józefosław", volume_m3: 18234.4,
+    },
+  ],
+  truncated: false,
+  aggregate: {
+    case_count: 1,
+    by_year: [{ year: 2026, by_category: [{ object_category: "XIII", case_count: 1, volume_m3_sum: 18234.4, volume_m3_known: 1 }] }],
+  },
+  parcels_in_radius: 4821,
+  corpus_coverage: { basis: "cadastral_partial", held_parcels: null, source_parcels: null, held_pct: null, counties: null, as_of: "2026-09-01", note: "n/a" },
+  freshness: { as_of: "2026-10-10T04:00:00.000Z", latest_decision_date: "2026-09-28" },
+  note: "Cases are matched through the parcel geometry we hold.",
+};
+
+describe("get_permits_in_area", () => {
+  it("passes the circle and filters through and formats the area report with the credit footer", async () => {
+    mockGetPermitsInArea.mockResolvedValueOnce(withCredits(samplePermitsArea));
+
+    const result = await client.callTool({
+      name: "get_permits_in_area",
+      arguments: { lat: 52.0928, lng: 21.0225, radiusKm: 1.5, intent: "multi_family", limit: 20 },
+    });
+    const text = getTextContent(result);
+
+    expect(mockGetPermitsInArea).toHaveBeenCalledWith(
+      {
+        lat: 52.0928, lng: 21.0225, radiusKm: 1.5, dateFrom: undefined, dateTo: undefined, intent: "multi_family",
+        categories: undefined, excludeCategories: undefined, worksType: undefined, limit: 20, cursor: undefined, aggregateOnly: undefined,
+      },
+      "test-api-key",
+    );
+    expect(text).toContain("Parcels we hold in this circle: 4,821");
+    expect(text).toContain("2026 | XIII multi-family | 1");
+    expect(text).toContain("ul. Osiedlowa 50A");
+    expect(text).toContain("Note: Cases are matched through the parcel geometry we hold.");
+    expect(text).toContain("API tokens: 48 remaining");
+  });
+
+  it("rejects a radius above 2 km and a point outside Poland before calling the API", async () => {
+    const tooWide = await client.callTool({ name: "get_permits_in_area", arguments: { lat: 52.1, lng: 21.0, radiusKm: 3 } });
+    expect(tooWide.isError).toBe(true);
+    const abroad = await client.callTool({ name: "get_permits_in_area", arguments: { lat: 48.85, lng: 2.35 } });
+    expect(abroad.isError).toBe(true);
+    expect(mockGetPermitsInArea).not.toHaveBeenCalled();
+  });
+
+  it("rejects a malformed dateFrom and an unknown intent before calling the API", async () => {
+    const badDate = await client.callTool({ name: "get_permits_in_area", arguments: { lat: 52.1, lng: 21.0, dateFrom: "01.02.2024" } });
+    expect(badDate.isError).toBe(true);
+    const badIntent = await client.callTool({ name: "get_permits_in_area", arguments: { lat: 52.1, lng: 21.0, intent: "commercial" } });
+    expect(badIntent.isError).toBe(true);
+    expect(mockGetPermitsInArea).not.toHaveBeenCalled();
+  });
+
+  it("passes dateTo, category arrays, cursor and aggregateOnly to the client unchanged", async () => {
+    mockGetPermitsInArea.mockResolvedValueOnce(withCredits({
+      ...samplePermitsArea,
+      truncated: true,
+      pagination: { limit: 20, has_more: true, next_cursor: "next_PAGE-1" },
+    }));
+
+    const result = await client.callTool({
+      name: "get_permits_in_area",
+      arguments: {
+        lat: 52.0928, lng: 21.0225, dateFrom: "2020-01-01", dateTo: "2024-12-31",
+        categories: ["XIII", "I"], excludeCategories: ["XXVI"], cursor: "prev_PAGE-0", limit: 20,
+      },
+    });
+
+    expect(mockGetPermitsInArea).toHaveBeenCalledWith(
+      expect.objectContaining({
+        dateFrom: "2020-01-01", dateTo: "2024-12-31", categories: ["XIII", "I"], excludeCategories: ["XXVI"], cursor: "prev_PAGE-0",
+      }),
+      "test-api-key",
+    );
+    const text = getTextContent(result);
+    expect(text).toContain('Next page: pass cursor="next_PAGE-1"');
+    expect(text).toContain("next page: 1 listed"); // a cursor was sent, so this is a continuation page
+  });
+
+  it("passes aggregateOnly through and prints the aggregate without a 'no cases' claim", async () => {
+    mockGetPermitsInArea.mockResolvedValueOnce(withCredits({
+      ...samplePermitsArea,
+      data: [],
+      query: { ...samplePermitsArea.query, aggregate_only: true },
+    }));
+
+    const result = await client.callTool({
+      name: "get_permits_in_area",
+      arguments: { lat: 52.0928, lng: 21.0225, aggregateOnly: true },
+    });
+
+    expect(mockGetPermitsInArea).toHaveBeenCalledWith(expect.objectContaining({ aggregateOnly: true }), "test-api-key");
+    const text = getTextContent(result);
+    expect(text).toContain("2026 | XIII multi-family | 1");
+    expect(text).toContain("The case list was not requested (aggregateOnly)");
+    expect(text).not.toContain("No cases matched");
+  });
+
+  it("rejects an unknown or lower-case category and an empty category array before calling the API", async () => {
+    for (const categories of [["XXXI"], ["xiii"], []]) {
+      const result = await client.callTool({ name: "get_permits_in_area", arguments: { lat: 52.1, lng: 21.0, categories } });
+      expect(result.isError).toBe(true);
+    }
+    const excluded = await client.callTool({ name: "get_permits_in_area", arguments: { lat: 52.1, lng: 21.0, excludeCategories: ["IL"] } });
+    expect(excluded.isError).toBe(true);
+    const badDateTo = await client.callTool({ name: "get_permits_in_area", arguments: { lat: 52.1, lng: 21.0, dateTo: "31.12.2025" } });
+    expect(badDateTo.isError).toBe(true);
+    expect(mockGetPermitsInArea).not.toHaveBeenCalled();
+  });
+
+  it("refuses an empty cursor and one longer than the API accepts before calling the API", async () => {
+    for (const cursor of ["", "A".repeat(301)]) {
+      const result = await client.callTool({ name: "get_permits_in_area", arguments: { lat: 52.1, lng: 21.0, cursor } });
+      expect(result.isError).toBe(true);
+    }
+    mockGetPermitsInArea.mockResolvedValueOnce(withCredits(samplePermitsArea));
+    const edge = await client.callTool({ name: "get_permits_in_area", arguments: { lat: 52.1, lng: 21.0, cursor: "A".repeat(300) } });
+    expect(edge.isError).toBeFalsy();
+    expect(mockGetPermitsInArea).toHaveBeenCalledTimes(1);
+  });
+
+  it("a radius above 2 km is refused with a hint to make several calls, not a bare schema error", async () => {
+    const result = await client.callTool({ name: "get_permits_in_area", arguments: { lat: 52.1, lng: 21.0, radiusKm: 5 } });
+    expect(result.isError).toBe(true);
+    const text = getTextContent(result);
+    expect(text).toContain("several calls with neighbouring centre points");
+    expect(mockGetPermitsInArea).not.toHaveBeenCalled();
+  });
+
+  it("requires lat and lng", async () => {
+    const result = await client.callTool({ name: "get_permits_in_area", arguments: { radiusKm: 1 } });
+    expect(result.isError).toBe(true);
+    expect(mockGetPermitsInArea).not.toHaveBeenCalled();
+  });
+
+  // A 503 carrying the feature-off mode: plain message, and NOT reported to error tracking.
+  it("degrades a feature-off 503 into a plain unavailable message without reporting", async () => {
+    mockGetPermitsInArea.mockRejectedValueOnce(
+      new ApiHttpError("Service unavailable", { status: 503, authMode: "api_key", mode: "area-disabled" }),
+    );
+
+    const result = await client.callTool({ name: "get_permits_in_area", arguments: { lat: 52.0928, lng: 21.0225 } });
+    expect(result.isError).toBe(true);
+    const text = getTextContent(result);
+    expect(text).toContain("temporarily unavailable");
+    expect(text).not.toContain("-disabled");
+    expect(mockSentryCaptureException).not.toHaveBeenCalled();
+  });
+
+  it("reports a 503 without the feature-off mode on the normal error path", async () => {
+    mockGetPermitsInArea.mockRejectedValueOnce(
+      new ApiHttpError("Service unavailable - the data is temporarily unavailable. Try again shortly.", { status: 503, authMode: "api_key" }),
+    );
+
+    const result = await client.callTool({ name: "get_permits_in_area", arguments: { lat: 52.0928, lng: 21.0225 } });
+    expect(result.isError).toBe(true);
+    expect(getTextContent(result)).not.toContain("this feature is briefly switched off");
+    expect(mockSentryCaptureException).toHaveBeenCalled();
+  });
+});
+
 // ── Tests: search_by_polygon ───────────────────────────────────────
 
 describe("search_by_polygon", () => {
@@ -1380,6 +2652,20 @@ describe("search_by_polygon", () => {
     );
   });
 
+  it("forwards excludeFractionalShares to the spatial body when set", async () => {
+    mockSearchByPolygon.mockResolvedValueOnce(withCredits(sampleSpatialResponse));
+
+    await client.callTool({
+      name: "search_by_polygon",
+      arguments: { polygon, propertyType: "land", excludeFractionalShares: true },
+    });
+
+    expect(mockSearchByPolygon).toHaveBeenCalledWith(
+      expect.objectContaining({ excludeFractionalShares: true }),
+      "test-api-key",
+    );
+  });
+
   it("rejects malformed buildingStoreys tokens at the schema", async () => {
     const result = await client.callTool({
       name: "search_by_polygon",
@@ -1410,6 +2696,86 @@ describe("search_by_polygon", () => {
   });
 });
 
+describe("search_by_polygon - page", () => {
+  const polygon = {
+    type: "Polygon" as const,
+    coordinates: [[[21.0, 52.2], [21.01, 52.2], [21.01, 52.21], [21.0, 52.21], [21.0, 52.2]]],
+  };
+  const spatialOf = (n: number, total: number): SpatialSearchResponse => ({
+    ...sampleSpatialResponse,
+    features: Array.from({ length: n }, (_, i) => ({
+      ...sampleSpatialResponse.features[0]!,
+      properties: { ...sampleSpatialResponse.features[0]!.properties, id: `sp-${String(i + 1).padStart(3, "0")}` },
+    })),
+    truncated: total > n,
+    total,
+  });
+
+  it("asks for rows 1..page*50 (page wins over limit) and shows rows 51-100 on page 2", async () => {
+    mockSearchByPolygon.mockResolvedValueOnce(withCredits(spatialOf(100, 130)));
+
+    const text = getTextContent(await client.callTool({ name: "search_by_polygon", arguments: { polygon, page: 2, limit: 7 } }));
+
+    expect(mockSearchByPolygon).toHaveBeenCalledWith(expect.objectContaining({ limit: 100 }), "test-api-key");
+    expect(text).toContain("Page 2 of 3 (50 per page; total 130). More pages: yes - next: page=3.");
+    expect(text).toContain("Each page is a separate call billed like the first (5 API tokens).");
+    expect(text).toMatch(/^51\. /m);
+    expect(text).toMatch(/^100\. /m);
+    expect(text).toContain("id: sp-051");
+    expect(text).not.toContain("id: sp-050");
+    expect(text).not.toContain("truncated");
+  });
+
+  it("says no more pages on the last page", async () => {
+    mockSearchByPolygon.mockResolvedValueOnce(withCredits(spatialOf(130, 130)));
+
+    const text = getTextContent(await client.callTool({ name: "search_by_polygon", arguments: { polygon, page: 3 } }));
+
+    expect(mockSearchByPolygon).toHaveBeenCalledWith(expect.objectContaining({ limit: 150 }), "test-api-key");
+    expect(text).toContain("Page 3 of 3 (50 per page; total 130). More pages: no.");
+    expect(text).toMatch(/^130\. /m);
+  });
+
+  it("accepts page 20 (the cap, limit 1000) and rejects page 21 before calling the API", async () => {
+    mockSearchByPolygon.mockResolvedValueOnce(withCredits(spatialOf(1000, 2500)));
+    const ok = await client.callTool({ name: "search_by_polygon", arguments: { polygon, page: 20 } });
+    expect(ok.isError).toBeFalsy();
+    expect(mockSearchByPolygon).toHaveBeenCalledWith(expect.objectContaining({ limit: 1000 }), "test-api-key");
+    expect(getTextContent(ok)).toContain("Page 20 of 20");
+    expect(getTextContent(ok)).toContain("Page limit reached (max 20)");
+
+    mockSearchByPolygon.mockClear();
+    const bad = await client.callTool({ name: "search_by_polygon", arguments: { polygon, page: 21 } });
+    expect(bad.isError).toBe(true);
+    expect(mockSearchByPolygon).not.toHaveBeenCalled();
+  });
+
+  it("reports a page past the last page", async () => {
+    mockSearchByPolygon.mockResolvedValueOnce(withCredits(spatialOf(130, 130)));
+
+    const text = getTextContent(await client.callTool({ name: "search_by_polygon", arguments: { polygon, page: 4 } }));
+
+    expect(text).toContain("Page 4 is past the last page (3).");
+  });
+
+  it("without page passes limit through and adds no paging text", async () => {
+    mockSearchByPolygon.mockResolvedValueOnce(withCredits(sampleSpatialResponse));
+
+    const text = getTextContent(await client.callTool({ name: "search_by_polygon", arguments: { polygon, limit: 50 } }));
+
+    expect(mockSearchByPolygon).toHaveBeenCalledWith(expect.objectContaining({ limit: 50 }), "test-api-key");
+    expect(text).not.toContain("More pages");
+  });
+
+  it("states the per-tool page range in the parameter description", async () => {
+    const { tools } = await client.listTools();
+    const pageDesc = (name: string) =>
+      (tools.find((t) => t.name === name)?.inputSchema.properties?.page as { description?: string } | undefined)?.description ?? "";
+    expect(pageDesc("search_by_area")).toContain("1-10");
+    expect(pageDesc("search_by_polygon")).toContain("1-20");
+  });
+});
+
 // ── Tests: optional tools (CENOGRAM_EXPERIMENTAL_TOOLS=1) ──
 // These 4 tools are gated off by default; the default suite above asserts their absence.
 // Here we flip the flag and build a SEPARATE server/client so the nested describes
@@ -1435,9 +2801,9 @@ describe("optional tools (flag on)", () => {
     else process.env.CENOGRAM_EXPERIMENTAL_TOOLS = prevFlag;
   });
 
-  it("registers all 34 tools including the 6 optional tools", async () => {
+  it("registers all 36 tools including the 6 optional tools", async () => {
     const { tools } = await client.listTools();
-    expect(tools).toHaveLength(34);
+    expect(tools).toHaveLength(36);
     const names = tools.map((t) => t.name);
     expect(names).toEqual(expect.arrayContaining([
       "get_rental_yield",
@@ -1773,7 +3139,7 @@ describe("compare_locations", () => {
     expect(mockCompareLocations).not.toHaveBeenCalled();
   });
 
-  it("rejects whitespace-only string filters (mirror of server's safeString)", async () => {
+  it("rejects whitespace-only string filters (mirror of the server guard)", async () => {
     const result = await client.callTool({
       name: "compare_locations",
       arguments: { districts: "Mokotów,Wola", street: "   ", dateFrom: "  " },
@@ -1852,17 +3218,21 @@ describe("get_demographics", () => {
     meta: { variables_count: 3, categories: ["demographics", "economy", "education"], levels_included: ["powiat", "wojewodztwo"], data_source: "GUS BDL (Bank Danych Lokalnych)", as_of: "2024" },
   };
 
-  it("returns a friendly message when neither location nor teryt is given", async () => {
+  it("returns an error pointing at list_locations when neither location nor teryt is given", async () => {
     const result = await client.callTool({ name: "get_demographics", arguments: {} });
     const text = getTextContent(result);
+    expect(result.isError).toBe(true);
     expect(text).toContain("location");
     expect(text).toContain("teryt");
+    expect(text).toContain("Use list_locations(search=...) to find codes");
     expect(mockGetDemographics).not.toHaveBeenCalled();
   });
 
-  it("rejects a malformed teryt before the API call", async () => {
+  it("rejects a malformed teryt before the API call, as an error", async () => {
     const result = await client.callTool({ name: "get_demographics", arguments: { teryt: "146" } });
+    expect(result.isError).toBe(true);
     expect(getTextContent(result)).toContain("Invalid teryt");
+    expect(getTextContent(result)).toContain("Use list_locations(search=...) to find codes");
     expect(mockGetDemographics).not.toHaveBeenCalled();
   });
 
@@ -1925,17 +3295,21 @@ describe("get_infrastructure_signals", () => {
     meta: { coverage_note: "Tenders come from the national public procurement bulletin, which carries below-EU-threshold contracts only (from 2021).", as_of: "2026-07-07" },
   };
 
-  it("returns a friendly message when neither location nor teryt is given", async () => {
+  it("returns an error pointing at list_locations when neither location nor teryt is given", async () => {
     const result = await client.callTool({ name: "get_infrastructure_signals", arguments: {} });
     const text = getTextContent(result);
+    expect(result.isError).toBe(true);
     expect(text).toContain("location");
     expect(text).toContain("teryt");
+    expect(text).toContain("Use list_locations(search=...) to find codes");
     expect(mockGetInfrastructureSignals).not.toHaveBeenCalled();
   });
 
-  it("rejects a malformed teryt before the API call (no credit spent)", async () => {
+  it("rejects a malformed teryt before the API call (no credit spent), as an error", async () => {
     const result = await client.callTool({ name: "get_infrastructure_signals", arguments: { teryt: "146" } });
+    expect(result.isError).toBe(true);
     expect(getTextContent(result)).toContain("Invalid teryt");
+    expect(getTextContent(result)).toContain("Use list_locations(search=...) to find codes");
     expect(mockGetInfrastructureSignals).not.toHaveBeenCalled();
   });
 
@@ -1986,6 +3360,72 @@ describe("get_infrastructure_signals", () => {
     const text = getTextContent(await client.callTool({ name: "get_infrastructure_signals", arguments: { teryt: "026402" } }));
     expect(text).toContain("No infrastructure signals are recorded");
     expect(text).toContain("does NOT mean the municipality is not investing");
+  });
+});
+
+// ── Tests: transactionId alias on every per-transaction tool ───────
+
+describe.each([
+  ["get_building_breakdown", mockGetBuildingBreakdown],
+  ["get_transaction_flood", mockGetTransactionFlood],
+  ["get_transaction_heritage", mockGetTransactionHeritage],
+  ["get_transaction_landslide", mockGetTransactionLandslide],
+  ["get_transaction_subsurface", mockGetTransactionSubsurface],
+  ["get_transaction_roads", mockGetTransactionRoads],
+  ["get_transaction_surroundings", mockGetTransactionSurroundings],
+  ["get_transaction_transit", mockGetTransactionTransit],
+  ["get_transaction_permits", mockGetTransactionPermits],
+  ["get_transaction_planning", mockGetTransactionPlanning],
+  ["get_transaction_farmland", mockGetTransactionFarmland],
+  ["get_transaction_nature", mockGetTransactionNature],
+] as const)("%s id parameter", (toolName, mockFn) => {
+  const ID = "11111111-2222-3333-4444-555555555555";
+  const OTHER_ID = "99999999-8888-7777-6666-555555555555";
+
+  // Formatters may reject the minimal body; only the id routing is under test, so the reply text is not asserted.
+  const arrange = () => mockFn.mockResolvedValueOnce(withCredits({ data: [], truncated: false }));
+
+  it("accepts transaction_id", async () => {
+    arrange();
+    await client.callTool({ name: toolName, arguments: { transaction_id: ID } });
+    expect(mockFn).toHaveBeenCalledWith(ID, "test-api-key");
+  });
+
+  it("accepts the camelCase alias transactionId (not stripped or rejected by the schema)", async () => {
+    arrange();
+    const result = await client.callTool({ name: toolName, arguments: { transactionId: ID } });
+    expect(mockFn).toHaveBeenCalledWith(ID, "test-api-key");
+    expect(getTextContent(result)).not.toContain("is required");
+    expect(getTextContent(result)).not.toContain("Invalid arguments");
+  });
+
+  it("prefers transaction_id when both spellings are sent", async () => {
+    arrange();
+    await client.callTool({ name: toolName, arguments: { transaction_id: ID, transactionId: OTHER_ID } });
+    expect(mockFn).toHaveBeenCalledTimes(1);
+    expect(mockFn).toHaveBeenCalledWith(ID, "test-api-key");
+  });
+
+  it("answers with an error and makes no API call when neither is sent", async () => {
+    const result = await client.callTool({ name: toolName, arguments: {} });
+    expect(result.isError).toBe(true);
+    expect(getTextContent(result)).toBe("transaction_id is required - copy the id from a search_transactions result");
+    expect(mockFn).not.toHaveBeenCalled();
+  });
+
+  it("still rejects a malformed alias before the API call", async () => {
+    const result = await client.callTool({ name: toolName, arguments: { transactionId: "not-a-uuid" } });
+    expect(result.isError).toBe(true);
+    expect(getTextContent(result)).toContain("UUID");
+    expect(mockFn).not.toHaveBeenCalled();
+  });
+
+  it("lists both fields as optional in the tool schema", async () => {
+    const { tools } = await client.listTools();
+    const schema = tools.find((t) => t.name === toolName)?.inputSchema;
+    expect(Object.keys(schema?.properties ?? {})).toEqual(expect.arrayContaining(["transaction_id", "transactionId"]));
+    expect(schema?.required ?? []).not.toContain("transaction_id");
+    expect(schema?.required ?? []).not.toContain("transactionId");
   });
 });
 
@@ -2078,7 +3518,7 @@ describe("get_building_breakdown", () => {
     expect(mockGetBuildingBreakdown).not.toHaveBeenCalled();
   });
 
-  it("never names the source register", async () => {
+  it("uses only neutral vocabulary", async () => {
     mockGetBuildingBreakdown.mockResolvedValueOnce(withCredits({
       data: [{ building_type: 110, footprint_area_m2: "250.00", footprint_area_alt_m2: "280.00", footprint_divergent: true, storeys: 3, est_total_area_m2: "750.00", match_confidence: "high" }],
       truncated: false,
@@ -2099,7 +3539,7 @@ describe("get_transaction_flood", () => {
   it("renders a per-parcel flood breakdown with credit footer", async () => {
     mockGetTransactionFlood.mockResolvedValueOnce(withCredits({
       data: [
-        // Input mirrors the API's already-scrubbed shape (neutral EN labels, no source-register fingerprint).
+        // Input mirrors the API response shape (neutral EN labels).
         {
           flood_risk: "high", severity_rank: 1, worst_scenario: "river flood, 1-in-10-year", source: "river",
           depth_class: null, pct_in_zone: "45.00", nearest_zone_m: 0,
@@ -2147,7 +3587,7 @@ describe("get_transaction_heritage", () => {
   it("renders a per-parcel heritage breakdown with credit footer", async () => {
     mockGetTransactionHeritage.mockResolvedValueOnce(withCredits({
       data: [
-        // Input mirrors the API's already-scrubbed shape (neutral EN categories, no source-register fingerprint).
+        // Input mirrors the API response shape (neutral EN categories).
         {
           heritage_status: "listed", severity_rank: 1, pct_in_zone: "45.00", site_count: 1,
           sites: [{ category: "building", name: "Townhouse", function: "residential", period: "19th c.", entry_date: "1967-05-12" }],
@@ -2194,7 +3634,7 @@ describe("get_transaction_landslide", () => {
   it("renders a per-parcel landslide breakdown with credit footer", async () => {
     mockGetTransactionLandslide.mockResolvedValueOnce(withCredits({
       data: [
-        // Input mirrors the API's already-scrubbed shape (neutral EN kinds, no source-register fingerprint).
+        // Input mirrors the API response shape (neutral EN kinds).
         {
           landslide_risk: "landslide", severity_rank: 1, pct_in_zone: "45.00",
           zones: [{ kind: "landslide", source_version_date: "2021-03-15" }],
@@ -2240,7 +3680,7 @@ describe("get_transaction_nature", () => {
   it("renders a per-parcel nature breakdown with credit footer", async () => {
     mockGetTransactionNature.mockResolvedValueOnce(withCredits({
       data: [
-        // Already-scrubbed shape (canonical EN forms + official names; no source-register fingerprint).
+        // API response shape (canonical EN forms + official names).
         {
           forest_distance_m: 0, forest_overlap_pct: "35.00", protection_rank: 1,
           building_restriction: "statutory_ban", protected_overlap_pct: "60.00",
@@ -2568,6 +4008,134 @@ describe("search_by_polygon validation", () => {
   });
 });
 
+// ── Tests: list_locations RCN label coverage ──────────────────────
+
+describe("list_locations RCN label coverage", () => {
+  const testville = { code: "990101", name: "Testville", typeName: "gmina miejsko-wiejska", level: "municipality", parent_name: "sampleski", rcn_district: true, match: "exact" };
+  const coverageRow = (c: Record<string, unknown>) => ({
+    rcn_district: true, transactions: 2, price_samples: 2, date_from: "2024-01-10", date_to: "2024-02-25", gmina: null, ...c,
+  });
+  const coverageResponse = (rows: Array<Record<string, unknown>>) => withCredits({ data: rows, meta: { total: rows.length } });
+
+  it("shows the label range and the part-of-gmina warning from one batched call", async () => {
+    mockGetDistricts.mockResolvedValueOnce(withCredits(["Testville", "Miasteczko"]));
+    mockSearchLocations.mockReset();
+    mockSearchLocations.mockResolvedValueOnce(withCredits([testville]));
+    mockGetDistrictCoverage.mockResolvedValueOnce(coverageResponse([
+      coverageRow({ name: "Testville", gmina: { teryt: "990101", name: "Testville", transactions: 120 } }),
+      coverageRow({ name: "Miasteczko", transactions: 40, date_from: "2020-01-01", date_to: "2026-02-03" }),
+    ]));
+
+    const result = await client.callTool({ name: "list_locations", arguments: { search: "Miast" } });
+    const text = getTextContent(result);
+
+    expect(mockGetDistrictCoverage).toHaveBeenCalledTimes(1);
+    // TERYT-side RCN label first, then the RCN-only name; each name once.
+    expect(mockGetDistrictCoverage).toHaveBeenCalledWith(["Testville", "Miasteczko"], "test-api-key");
+    expect(text).toContain('RCN label "Testville": 2 transactions, 2024-01..2024-02');
+    expect(text).toContain("Only part of gmina Testville (120 transactions); full data: teryt=990101");
+    expect(text).toContain('RCN label "Miasteczko": 40 transactions, 2020-01..2026-02');
+    expect(text).not.toContain('RCN label "Miasteczko": 40 transactions, 2020-01..2026-02\n      Only part');
+  });
+
+  it("sends each name once even when several rows share it", async () => {
+    mockGetDistricts.mockResolvedValueOnce(withCredits(["Ełk"]));
+    mockSearchLocations.mockReset();
+    mockSearchLocations.mockResolvedValueOnce(withCredits([
+      { ...testville, code: "280501", name: "Ełk" },
+      { ...testville, code: "280502", name: "Ełk" },
+    ]));
+
+    await client.callTool({ name: "list_locations", arguments: { search: "Ełk" } });
+
+    expect(mockGetDistrictCoverage).toHaveBeenCalledTimes(1);
+    expect(mockGetDistrictCoverage).toHaveBeenCalledWith(["Ełk"], "test-api-key");
+  });
+
+  it("makes no coverage call when no RCN label is displayed", async () => {
+    mockGetDistricts.mockResolvedValueOnce(withCredits([]));
+    mockSearchLocations.mockReset();
+    mockSearchLocations.mockResolvedValueOnce(withCredits([
+      { code: "9901", name: "sampleski", typeName: "powiat", level: "county", parent_name: "pomorskie", rcn_district: false, match: "exact" },
+    ]));
+
+    const result = await client.callTool({ name: "list_locations", arguments: { search: "sampleski" } });
+
+    expect(mockGetDistrictCoverage).not.toHaveBeenCalled();
+    expect(getTextContent(result)).toContain("9901 - sampleski");
+  });
+
+  it("makes no coverage call for a hierarchy browse or an empty result", async () => {
+    mockGetLocations.mockResolvedValueOnce(withCredits([] as LocationItem[]));
+    await client.callTool({ name: "list_locations", arguments: { parent: "14" } });
+    mockGetDistricts.mockResolvedValueOnce(withCredits([]));
+    await client.callTool({ name: "list_locations", arguments: { search: "Atlantyda" } });
+
+    expect(mockGetDistrictCoverage).not.toHaveBeenCalled();
+  });
+
+  it("prints no location= call for a label with zero transactions", async () => {
+    mockGetDistricts.mockResolvedValueOnce(withCredits(["Pusta"]));
+    mockSearchLocations.mockReset();
+    mockSearchLocations.mockResolvedValueOnce(withCredits([testville]));
+    mockGetDistrictCoverage.mockResolvedValueOnce(coverageResponse([
+      coverageRow({ name: "Testville", transactions: 0, price_samples: 0, date_from: null, date_to: null }),
+      coverageRow({ name: "Pusta", transactions: 0, price_samples: 0, date_from: null, date_to: null }),
+    ]));
+
+    const text = getTextContent(await client.callTool({ name: "list_locations", arguments: { search: "Pu" } }));
+
+    expect(text).toContain('RCN label "Testville": no transactions');
+    expect(text).toContain('RCN label "Pusta": no transactions');
+    expect(text).not.toContain("location=");
+    expect(text).toContain('search_transactions(teryt="990101")');
+  });
+
+  it("omits get_price_statistics for a label without a price sample", async () => {
+    mockGetDistricts.mockResolvedValueOnce(withCredits([]));
+    mockSearchLocations.mockReset();
+    mockSearchLocations.mockResolvedValueOnce(withCredits([testville]));
+    mockGetDistrictCoverage.mockResolvedValueOnce(coverageResponse([coverageRow({ name: "Testville", price_samples: 0 })]));
+
+    const text = getTextContent(await client.callTool({ name: "list_locations", arguments: { search: "Testville" } }));
+
+    expect(text).toContain('search_transactions(location="Testville")');
+    expect(text).not.toContain("get_price_statistics");
+  });
+
+  it("prints the plain result when the coverage endpoint fails (older API)", async () => {
+    const run = async () => {
+      mockGetDistricts.mockResolvedValueOnce(withCredits(["Miasteczko"]));
+      mockSearchLocations.mockReset();
+      mockSearchLocations.mockResolvedValueOnce(withCredits([testville]));
+      return getTextContent(await client.callTool({ name: "list_locations", arguments: { search: "Miast" } }));
+    };
+    const baseline = await run();
+    mockGetDistrictCoverage.mockRejectedValueOnce(new ApiHttpError("Not Found", { status: 404, authMode: "api_key" }));
+
+    const text = await run();
+
+    expect(mockGetDistrictCoverage).toHaveBeenCalledTimes(2);
+    expect(text).toBe(baseline);
+    expect(text).not.toContain("RCN label");
+    expect(text).toContain('get_price_statistics(location="Testville")');
+  });
+
+  it("caps the lookup at 200 names and skips names the route would reject", async () => {
+    const many = Array.from({ length: 230 }, (_, i) => `Miasto ${i}`);
+    mockGetDistricts.mockResolvedValueOnce(withCredits([`Miasto ${"x".repeat(101)}`, "Miasto, Zła", ...many]));
+    mockSearchLocations.mockReset();
+    mockSearchLocations.mockResolvedValueOnce(withCredits([]));
+
+    // 232 matches in the RCN section; with no exact hit the section is not capped.
+    await client.callTool({ name: "list_locations", arguments: { search: "Miasto" } });
+
+    const sent = mockGetDistrictCoverage.mock.calls[0]![0] as string[];
+    expect(sent).toHaveLength(200);
+    expect(sent.every((n) => n.length <= 100 && !n.includes(","))).toBe(true);
+  });
+});
+
 // ── Tests: list_locations with TERYT hierarchy ────────────────────
 
 describe("list_locations with TERYT hierarchy", () => {
@@ -2779,6 +4347,130 @@ describe("list_locations with TERYT hierarchy", () => {
 
     expect(text).toContain("Mokotów");
     expect(text).not.toContain("146505 - Mokotów");
+  });
+
+  describe("search ranking and neighbourhood note", () => {
+    const NOTE_FOR = (name: string) => `No administrative unit is named ${name}. If ${name} is a neighbourhood (osiedle) of a city`;
+
+    it("puts the exact gmina first under 'Best matches' and collapses the diacritic-fold infixes", async () => {
+      mockGetDistricts.mockResolvedValueOnce(withCredits(["Ełk"]));
+      mockSearchLocations.mockReset();
+      mockSearchLocations.mockResolvedValueOnce(withCredits([
+        { code: "280501", name: "Ełk", typeName: "gmina miejska", level: "municipality", parent_name: "ełcki", rcn_district: true, match: "exact" },
+        { code: "280502", name: "Ełk", typeName: "gmina wiejska", level: "municipality", parent_name: "ełcki", rcn_district: true, match: "exact" },
+        { code: "30", name: "Wielkopolskie", typeName: null, level: "voivodeship", parent_name: null, rcn_district: false, match: "infix" },
+        { code: "3001", name: "Gorzów Wielkopolski", typeName: "powiat", level: "county", parent_name: "lubuskie", rcn_district: false, match: "infix" },
+      ]));
+
+      const result = await client.callTool({ name: "list_locations", arguments: { search: "Ełk" } });
+      const text = getTextContent(result);
+
+      expect(text.split("\n")[2]).toBe("Best matches:");
+      expect(text.split("\n")[3]).toContain("280501 - Ełk (gmina miejska)");
+      expect(text).toContain("2 more partial matches (e.g. Wielkopolskie, Gorzów Wielkopolski)");
+      expect(text).not.toContain("30 - Wielkopolskie");
+      // The RCN name equals a TERYT name, so it is printed once, on the TERYT side.
+      expect(text).not.toContain("RCN district names without a TERYT code");
+      expect(text).not.toContain("No administrative unit is named");
+    });
+
+    it("an empty result carries the neighbourhood note", async () => {
+      mockGetDistricts.mockResolvedValueOnce(withCredits(["Mokotów"]));
+
+      const result = await client.callTool({ name: "list_locations", arguments: { search: "Atlantyda" } });
+      const text = getTextContent(result);
+
+      expect(text).toContain('No locations found matching "Atlantyda".');
+      expect(text).toContain(NOTE_FOR("Atlantyda"));
+      expect(text).toContain("search_by_area");
+      expect(text).toContain("resolve_parcel with a precinct name plus parcel number");
+    });
+
+    it("a result of precincts only (Bronowice) carries the neighbourhood note", async () => {
+      mockGetDistricts.mockResolvedValueOnce(withCredits([]));
+      mockSearchLocations.mockReset();
+      mockSearchLocations.mockResolvedValueOnce(withCredits([
+        { code: "061801_1.0004", name: "Bronowice", typeName: null, level: "precinct", parent_name: "Puławy", rcn_district: false, match: "exact" },
+        { code: "066201_1.0007", name: "Bronowice", typeName: null, level: "precinct", parent_name: "Lublin", rcn_district: false, match: "exact" },
+      ]));
+
+      const result = await client.callTool({ name: "list_locations", arguments: { search: "Bronowice" } });
+      const text = getTextContent(result);
+
+      expect(text).toContain("061801_1.0004 - Bronowice");
+      expect(text).toContain(NOTE_FOR("Bronowice"));
+    });
+
+    it("a response without `match` (older API) keeps today's grouping", async () => {
+      mockGetDistricts.mockResolvedValueOnce(withCredits([]));
+      mockSearchLocations.mockReset();
+      mockSearchLocations.mockResolvedValueOnce(withCredits([
+        { code: "30", name: "Wielkopolskie", typeName: null, level: "voivodeship", parent_name: null, rcn_district: false },
+        { code: "280501", name: "Ełk", typeName: "gmina miejska", level: "municipality", parent_name: "ełcki", rcn_district: true },
+      ]));
+
+      const result = await client.callTool({ name: "list_locations", arguments: { search: "Ełk" } });
+      const text = getTextContent(result);
+
+      expect(text).not.toContain("Best matches");
+      expect(text).not.toContain("partial match");
+      expect(text.indexOf("Voivodeships:")).toBeLessThan(text.indexOf("Municipalities:"));
+      expect(text).toContain("30 - Wielkopolskie");
+    });
+
+    it("ranks the RCN-only names exact → prefix → infix and caps them at 10 when one is exact", async () => {
+      const infix = Array.from({ length: 12 }, (_, i) => `Zawola ${String(i).padStart(2, "0")}`);
+      mockGetDistricts.mockResolvedValueOnce(withCredits([...infix, "Wolarnia", "Wola"]));
+
+      const result = await client.callTool({ name: "list_locations", arguments: { search: "Wola" } });
+      const text = getTextContent(result);
+
+      const names = [...text.matchAll(/^ {2}- (.+)$/gm)].map((m) => m[1]);
+      expect(names).toHaveLength(10);
+      expect(names.slice(0, 3)).toEqual(["Wola", "Wolarnia", "Zawola 00"]);
+      expect(text).toContain("4 more RCN district names not shown — type more letters to narrow");
+    });
+
+    it("does not cap the RCN-only names when none is exact", async () => {
+      const infix = Array.from({ length: 12 }, (_, i) => `Zawola ${String(i).padStart(2, "0")}`);
+      mockGetDistricts.mockResolvedValueOnce(withCredits(infix));
+
+      const result = await client.callTool({ name: "list_locations", arguments: { search: "Wola" } });
+      const text = getTextContent(result);
+
+      expect([...text.matchAll(/^ {2}- (.+)$/gm)]).toHaveLength(12);
+      expect(text).not.toContain("not shown");
+    });
+
+    it("an exact TERYT hit caps a long partial-name tail from the RCN list", async () => {
+      const infix = Array.from({ length: 14 }, (_, i) => `Zawola ${String(i).padStart(2, "0")}`);
+      mockGetDistricts.mockResolvedValueOnce(withCredits(infix));
+      mockSearchLocations.mockReset();
+      mockSearchLocations.mockResolvedValueOnce(withCredits([
+        { code: "146510", name: "Wola", typeName: "gmina miejska", level: "municipality", parent_name: "Warszawa", rcn_district: true, match: "exact" },
+      ]));
+
+      const result = await client.callTool({ name: "list_locations", arguments: { search: "Wola" } });
+      const text = getTextContent(result);
+
+      expect([...text.matchAll(/^ {2}- (.+)$/gm)]).toHaveLength(10);
+      expect(text).toContain("4 more RCN district names not shown");
+    });
+
+    it("never caps a city key's sub-districts, even beside an exact TERYT hit", async () => {
+      mockSearchLocations.mockReset();
+      mockSearchLocations.mockResolvedValueOnce(withCredits([
+        { code: "1465", name: "Warszawa", typeName: "powiat", level: "county", parent_name: "mazowieckie", rcn_district: true, match: "exact" },
+      ]));
+      mockGetLocations.mockRejectedValueOnce(new Error("API error: HTTP 500"));
+
+      const result = await client.callTool({ name: "list_locations", arguments: { search: "Warszawa" } });
+      const text = getTextContent(result);
+
+      expect(text).toContain("Żoliborz");
+      expect(text).toContain("Praga-Południe");
+      expect(text).not.toContain("not shown");
+    });
   });
 
   it("search shorter than 2 chars skips the TERYT branch (RCN only, no new 400)", async () => {
@@ -3614,9 +5306,9 @@ describe("list_parcels_in_area", () => {
         pagination: { limit: 250, has_more: false },
         corpus_coverage: {
           basis: "cadastral_partial",
-          held_parcels: 163,
+          held_parcels: 942,
           source_parcels: 1000,
-          held_pct: 16.3,
+          held_pct: 94.2,
           counties: 1,
           as_of: "2026-09-09T08:00:00.000Z",
           note: "note",
@@ -3625,8 +5317,8 @@ describe("list_parcels_in_area", () => {
 
       const text = await call({ teryt: "1465" });
 
-      expect(text).toContain("we hold 163 of the 1,000 parcels");
-      expect(text).toContain("16.3%");
+      expect(text).toContain("we hold 942 of the 1,000 parcels");
+      expect(text).toContain("94.2%");
       // The share is useless without the day it was taken: a measurement from yesterday and one from
       // half a year ago read identically otherwise.
       expect(text).toContain("measured 2026-09-09");
@@ -3933,5 +5625,91 @@ describe("get_parcel_land_class", () => {
 
     expect(result.isError).toBe(true);
     expect(mockGetParcelLandClass).not.toHaveBeenCalled();
+  });
+});
+
+// ── Tests: mpzpDesignation soft validation ─────────────────────────
+
+describe("mpzpDesignation soft validation", () => {
+  const polygon = {
+    type: "Polygon" as const,
+    coordinates: [[[21.0, 52.2], [21.01, 52.2], [21.01, 52.21], [21.0, 52.21], [21.0, 52.2]]],
+  };
+  const emptyTx = { ...sampleTransactionsResponse, data: [] };
+
+  // One call per tool with the given mpzpDesignation; every tool must hit the API either way.
+  const runners: Record<string, (mpzp: string, empty?: boolean) => Promise<string>> = {
+    search_transactions: async (mpzp, empty) => {
+      mockGetTransactions.mockResolvedValueOnce(withCredits(empty ? emptyTx : sampleTransactionsResponse));
+      mockGetTransactionsSummary.mockResolvedValueOnce(withCredits(sampleSummary));
+      const r = await client.callTool({ name: "search_transactions", arguments: { location: "Mokotów", mpzpDesignation: mpzp } });
+      expect(mockGetTransactions).toHaveBeenCalledWith(expect.objectContaining({ mpzpDesignation: mpzp }), "test-api-key");
+      return getTextContent(r);
+    },
+    search_by_area: async (mpzp, empty) => {
+      mockGetTransactions.mockResolvedValueOnce(withCredits(empty ? emptyTx : sampleTransactionsResponse));
+      mockGetTransactionsSummary.mockResolvedValueOnce(withCredits(sampleSummary));
+      const r = await client.callTool({
+        name: "search_by_area",
+        arguments: { latitude: 52.23, longitude: 21.01, radiusKm: 2, mpzpDesignation: mpzp },
+      });
+      expect(mockGetTransactions).toHaveBeenCalledWith(expect.objectContaining({ mpzpDesignation: mpzp }), "test-api-key");
+      return getTextContent(r);
+    },
+    search_by_polygon: async (mpzp, empty) => {
+      mockSearchByPolygon.mockResolvedValueOnce(
+        withCredits(empty ? { ...sampleSpatialResponse, features: [], total: 0 } : sampleSpatialResponse),
+      );
+      const r = await client.callTool({ name: "search_by_polygon", arguments: { polygon, mpzpDesignation: mpzp } });
+      expect(mockSearchByPolygon).toHaveBeenCalledWith(expect.objectContaining({ mpzpDesignation: mpzp }), "test-api-key");
+      return getTextContent(r);
+    },
+    compare_locations: async (mpzp) => {
+      mockCompareLocations.mockResolvedValueOnce(withCredits(sampleCompareResponse));
+      const r = await client.callTool({ name: "compare_locations", arguments: { districts: "Mokotów,Wola", mpzpDesignation: mpzp } });
+      expect(mockCompareLocations).toHaveBeenCalledWith(expect.objectContaining({ mpzpDesignation: mpzp }), "test-api-key");
+      return getTextContent(r);
+    },
+  };
+
+  for (const [tool, run] of Object.entries(runners)) {
+    describe(tool, () => {
+      it("warns with the known-code list on an unrecognised token", async () => {
+        const text = await run("xyz");
+        expect(text).toContain("unrecognised mpzpDesignation");
+        expect(text).toContain("'xyz'");
+        expect(text).toContain("budownictwoMieszkanioweWielorodzinne");
+        expect(text).toContain("terenWodPowierzchniowychMorskich");
+      });
+
+      it("warns on an empty result too", async () => {
+        const text = await run("xyz", true);
+        expect(text).toContain("unrecognised mpzpDesignation");
+        expect(text).toContain("Known codes:");
+      });
+
+      it("does not warn for two known codes (OR) or 'unknown'", async () => {
+        expect(await run("MN,MW")).not.toContain("unrecognised mpzpDesignation");
+        vi.clearAllMocks();
+        expect(await run("UNKNOWN")).not.toContain("unrecognised mpzpDesignation");
+      });
+
+      it("warns only for the unknown token in a mixed list", async () => {
+        const text = await run("MN, xyz ,unknown");
+        expect(text).toContain("unrecognised mpzpDesignation value(s): 'xyz'.");
+        expect(text).not.toContain("'MN'");
+      });
+    });
+  }
+
+  it("search_by_area forwards mpzpDesignation to the API unchanged", async () => {
+    mockGetTransactions.mockResolvedValueOnce(withCredits(sampleTransactionsResponse));
+    mockGetTransactionsSummary.mockResolvedValueOnce(withCredits(sampleSummary));
+    await client.callTool({
+      name: "search_by_area",
+      arguments: { latitude: 52.23, longitude: 21.01, radiusKm: 2, mpzpDesignation: "MN,MW" },
+    });
+    expect(mockGetTransactions).toHaveBeenCalledWith(expect.objectContaining({ mpzpDesignation: "MN,MW" }), "test-api-key");
+    expect(mockGetTransactionsSummary).toHaveBeenCalledWith(expect.objectContaining({ mpzpDesignation: "MN,MW" }), "test-api-key");
   });
 });

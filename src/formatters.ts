@@ -1,5 +1,21 @@
-import type { Transaction, TransactionsResponse, TransactionsSummary, StatsResponse, PricePerM2Row, HistogramBin, ParcelSearchResponse, ParcelResolveResponse, ParcelListRow, ParcelListResponse, StreetListResponse, ParcelFeature, ParcelFeatureCollection, CorpusCoverage, SpatialSearchResponse, SpatialFeature, CompareResponse, LocationItem, LocationSearchItem, RentalYieldResponse, RentalYieldLocationsResponse, PriceSpreadResponse, PriceSpreadLocationsResponse, FloodRiskResponse, FloodRiskLocationsResponse, ValuationResponse, ValuationComparable, Percentiles, TxWindow, BuildingBreakdownResponse, BuildingAgeEstimate, FloodBreakdownResponse, HeritageBreakdownResponse, LandslideBreakdownResponse, NatureBreakdownResponse, SubsurfaceBreakdownResponse, SurroundingsResponse, SurroundingsRow, RoadsBreakdownResponse, RoadsBreakdownRow, TransitBreakdownResponse, PermitsResponse, PlanningResponse, PlanningRow, FarmlandResponse, DemographicsResponse, DemographicsIndicator, InfrastructureSignalsResponse, ParcelReportResponse, ParcelLandClassResponse, ReportSection, ReportMarketContext, ReportMarketLevel, ReportLocationContext } from "./api-client.js";
-import { PROPERTY_TYPES, MARKET_TYPES, BUILDING_TYPES, OWNERSHIP_TYPES, PARTY_TYPES, LAND_USES } from "./mappings.js";
+import type { Transaction, TransactionsResponse, TransactionsSummary, StatsResponse, PricePerM2Row, HistogramBin, ParcelSearchResponse, ParcelResolveResponse, ParcelListRow, ParcelListResponse, StreetListResponse, ParcelFeature, ParcelFeatureCollection, CorpusCoverage, SpatialSearchResponse, SpatialFeature, CompareResponse, LocationItem, LocationSearchItem, DistrictCoverageItem, RentalYieldResponse, RentalYieldLocationsResponse, PriceSpreadResponse, PriceSpreadLocationsResponse, FloodRiskResponse, FloodRiskLocationsResponse, ValuationResponse, ValuationComparable, LandValuationResponse, LandValuationComparable, Percentiles, TxWindow, BuildingBreakdownResponse, BuildingAgeEstimate, FloodBreakdownResponse, HeritageBreakdownResponse, LandslideBreakdownResponse, NatureBreakdownResponse, SubsurfaceBreakdownResponse, SurroundingsResponse, SurroundingsRow, RoadsBreakdownResponse, RoadsBreakdownRow, TransitBreakdownResponse, PermitsResponse, PermitsAreaResponse, PlanningResponse, PlanningRow, FarmlandResponse, DemographicsResponse, DemographicsIndicator, InfrastructureSignalsResponse, ParcelReportResponse, ParcelLandClassResponse, ReportSection, ReportMarketContext, ReportMarketLevel, ReportMarketByType, ReportMarketTypeLevel, ReportLocationContext, ReportDesignationContext, ReportShape } from "./api-client.js";
+import { terytArgForTool, type TerytTool } from "./teryt-calls.js";
+import { PROPERTY_TYPES, MARKET_TYPES, TRANSACTION_TYPES, BUILDING_TYPES, OWNERSHIP_TYPES, PARTY_TYPES, LAND_USES, PLAN_DESIGNATION_SOURCE_NOTE, MPZP_DESIGNATION_LABELS, MPZP_DESIGNATION_SENTINELS, formatDesignationTokens, stripDiacritics } from "./mappings.js";
+
+// market_type is frequently NULL (not recorded in the deed). Render that as an explicit
+// "not classified" rather than a literal "Market null", which reads as a data bug to the model.
+function marketLabel(marketType: number | null | undefined): string {
+  if (marketType == null) return "Market: not classified in the deed";
+  return MARKET_TYPES[marketType] || `Market ${marketType}`;
+}
+
+// One plan-designation code, with the sentinel codes (recorded absence / "other") disambiguated so
+// they are not read as a real zoning symbol. Non-sentinel codes render raw (they are filter values).
+function planDesignationCode(code: string): string {
+  if (!MPZP_DESIGNATION_SENTINELS.has(code)) return code;
+  const label = MPZP_DESIGNATION_LABELS[code];
+  return label ? `${code} (${label})` : code;
+}
 
 // Cross-link shown once on a transaction list when ≥1 row carries building data — tells the LLM the
 // transaction id can be expanded into a per-building split via the dedicated tool.
@@ -31,7 +47,7 @@ const HERITAGE_STATUS_NOTE: Record<string, string> = {
   zone: "within a protected urban layout or monument surroundings",
 };
 
-// Indicative-data disclaimer rendered with heritage output. Neutral — no source register is named.
+// Indicative-data disclaimer rendered with heritage output.
 const HERITAGE_DISCLAIMER =
   "Indicative data — the regional heritage conservator makes the final, binding determination.";
 
@@ -121,6 +137,22 @@ function formatPLNExact(value: number | null | undefined): string {
   }).format(value);
 }
 
+// Price/m² for sub-100 land: 2 decimals + a rough zł/ha computed from the deed price and parcel
+// area (so it survives the ha-rounding). "≈" prefix when the area came rounded from hectares and we
+// hold no precise cadastral figure (±50 m² from the source). Separate from formatPLN on purpose —
+// its whole-złoty rounding is exactly what collapses sub-100 land prices to a single digit.
+function formatLandPricePerM2Exact(
+  exact: number,
+  priceGross: number,
+  parcelAreaM2: number | null,
+  approximate: boolean,
+): string {
+  const prefix = approximate ? "≈ " : "";
+  const perHa = parcelAreaM2 != null && parcelAreaM2 > 0 ? (priceGross / parcelAreaM2) * 10000 : null;
+  const haPart = perHa != null ? ` (≈ ${formatPLN(perHa)}/ha)` : "";
+  return `Price/m²: ${prefix}${formatPLNExact(exact)}${haPart}`;
+}
+
 // ── Shared transaction formatting ──────────────────────────────────
 
 interface FormattableFields {
@@ -130,10 +162,15 @@ interface FormattableFields {
   id?: string;
   transaction_date: string;
   property_type: number;
-  market_type: number;
+  transaction_type?: number | null;
+  market_type: number | null;
   price_gross: number;
   usable_area_m2: number | null;
   price_per_m2: number | null;
+  // 2-decimal price/m² for sub-100 land + precise parcel area for ha-rounded rows. Optional: list
+  // rows carry them, spatial features do not, so the renderer gates on presence. NUMERIC → string.
+  price_per_m2_exact?: number | string | null;
+  parcel_area_cadastral?: number | string | null;
   rooms: number | null;
   floor: number | null;
   district: string | null;
@@ -145,12 +182,16 @@ interface FormattableFields {
   building_number: string | null;
   city: string | null;
   parcel_area: number | null;
+  parcel_id?: string | null;
   parcel_number?: string | null;
+  // mpzp_designation = main parcel; mpzp_designations = union over all parcels (what the filter matches).
+  mpzp_designation?: string | null;
+  mpzp_designations?: string[] | null;
   county_name?: string | null;
   voivodeship_name?: string | null;
   share_basis?: "full" | "fraction" | "ambiguous" | null;
   // Provenance signals + raw deed fields. Signals drive computed-markers on
-  // parcel_area / property_type; raw fields render (gated) in the extra block. See api-client Transaction.
+  // parcel_area / property_type; raw fields render in the extra block. See api-client Transaction.
   parcel_count?: number | null;
   area_is_ha_converted?: boolean | null;
   property_type_inferred?: boolean | null;
@@ -168,7 +209,7 @@ interface FormattableFields {
   // garage-building footprint (the source records the whole building, not the spot) → price/m² is omitted.
   is_garage?: boolean | null;
   area_basis?: "unit" | "building" | null;
-  // Building attrs. Neutral names (no source register). Gate on building_count first
+  // Building attrs. Gate on building_count first
   // (NULL = no buildings, not 0). Footprint/est are NUMERIC → string over the wire (formatArea coerces).
   building_count?: number | null;
   footprint_area_m2?: number | null;
@@ -214,8 +255,22 @@ function formatTransactionCore(f: FormattableFields): string {
   if (f.property_type_reclassed) typeLabel += " [shown as a unit — registry recorded land, the deed is a residential unit]";
   else if (f.property_type_inferred) typeLabel += " [type inferred from transaction structure — not stated in the registry]";
   meta.push(typeLabel);
-  meta.push(MARKET_TYPES[f.market_type] || `Market ${f.market_type}`);
+  // Transaction procedure (free market, auction, foreclosure, …) only when recorded.
+  if (f.transaction_type != null) meta.push(`Transaction: ${TRANSACTION_TYPES[f.transaction_type] || `Type ${f.transaction_type}`}`);
+  meta.push(marketLabel(f.market_type));
   parts.push(meta.join(" | "));
+
+  // Plan designation (MPZP), own line before the hazard blocks. Prefer the union over all parcels
+  // (mpzp_designations) — that is what the filter matches; fall back to the main-parcel scalar.
+  // Codes are raw filter values; sentinels get a label; absence → no line at all (no "none").
+  const designations = (f.mpzp_designations && f.mpzp_designations.length > 0)
+    ? f.mpzp_designations
+    : (f.mpzp_designation ? f.mpzp_designation.split(";").map((c) => c.trim()).filter(Boolean) : []);
+  if (designations.length > 0) {
+    // parcel_count >= 2: the union spans several parcels, so it is not tied to the main parcel_id.
+    const acrossTag = f.parcel_count != null && f.parcel_count >= 2 ? ` (across all ${f.parcel_count} parcels)` : "";
+    parts.push(`Plan designation [${PLAN_DESIGNATION_SOURCE_NOTE}]: ${designations.map(planDesignationCode).join(", ")}${acrossTag}`);
+  }
 
   // Price line
   const price: string[] = [];
@@ -226,7 +281,17 @@ function formatTransactionCore(f: FormattableFields): string {
     const areaNote = f.area_basis === "building" ? " [whole garage building, not the parking space]" : "";
     price.push(`Area: ${formatArea(f.usable_area_m2)}${areaNote}`);
   }
-  if (f.price_per_m2 != null) price.push(`Price/m\u00B2: ${formatPLN(f.price_per_m2)}`);
+  // Price/m\u00B2: omit for fractional-share rows (the price is the whole deed, not the share). For
+  // sub-100 land show 2 decimals + a rough z\u0142/ha; otherwise the whole-z\u0142oty figure as before.
+  if (f.share_basis !== "fraction") {
+    const exact = f.price_per_m2_exact != null ? Number(f.price_per_m2_exact) : null;
+    if (exact != null && Number.isFinite(exact)) {
+      const approximate = f.area_is_ha_converted === true && f.parcel_area_cadastral == null;
+      price.push(formatLandPricePerM2Exact(exact, f.price_gross, f.parcel_area, approximate));
+    } else if (f.price_per_m2 != null) {
+      price.push(`Price/m\u00B2: ${formatPLN(f.price_per_m2)}`);
+    }
+  }
   if (f.parcel_area != null && f.usable_area_m2 == null) {
     // parcel_area is raw unless we computed it: summed across plots (parcel_count >= 2)
     // and/or converted from hectares the county reports in ha. Neutral marker(s), combined if both.
@@ -235,6 +300,11 @@ function formatTransactionCore(f: FormattableFields): string {
     if (f.area_is_ha_converted) pNotes.push("converted from hectares — county reports area in ha");
     const pTag = pNotes.length > 0 ? ` [${pNotes.join("; ")}]` : "";
     price.push(`Parcel: ${formatArea(f.parcel_area)}${pTag}`);
+    // Precise cadastral area for an ha-rounded single-parcel row — tighter than the ha figure above.
+    const cadastral = f.parcel_area_cadastral != null ? Number(f.parcel_area_cadastral) : null;
+    if (cadastral != null && Number.isFinite(cadastral)) {
+      price.push(`Cadastral area: ${formatArea(cadastral)} [from parcel outline, more precise than the ha-rounded figure]`);
+    }
   }
   // Fractional-share flag: neutral signal that this price reflects a partial
   // ownership share (share \u2260 whole), so it is excluded from the market median. NOT "sale of a
@@ -244,7 +314,7 @@ function formatTransactionCore(f: FormattableFields): string {
 
   // Building attrs. Footprint + storeys + estimated total floor area, when present.
   // Gate on building_count FIRST (NULL = no buildings, not 0). Storeys is given only for
-  // single-building transactions. Neutral wording — no source register named.
+  // single-building transactions.
   if (f.building_count != null) {
     const bld: string[] = [];
     if (f.footprint_area_m2 != null) bld.push(`Building footprint: ${formatArea(f.footprint_area_m2)}`);
@@ -283,14 +353,21 @@ function formatTransactionCore(f: FormattableFields): string {
   // Extra details
   const extra: string[] = [];
   if (f.parcel_number) extra.push(`Plot no: ${f.parcel_number}`);
+  // parcel_id of the main (best) parcel, so the model can jump straight to get_parcel_report. For a
+  // multi-parcel transaction it is one of several — flag it, not "largest" (it is not chosen by
+  // area; the row does not claim parcel chronology).
+  if (f.parcel_id) {
+    const mainTag = f.parcel_count != null && f.parcel_count >= 2 ? ` [main parcel of ${f.parcel_count}]` : "";
+    extra.push(`parcel_id: ${f.parcel_id}${mainTag}`);
+  }
   if (f.rooms != null) extra.push(`Rooms: ${f.rooms}`);
   if (f.floor != null) extra.push(`Floor: ${f.floor}`);
   // ── Raw deed fields — straight from the notarial deed, no provenance marker.
-  // Gated to suppress noise/NULLs and mirror the web drawer.
+  // Printed only when non-NULL.
   if (f.ownership_type != null) extra.push(`Ownership: ${OWNERSHIP_TYPES[f.ownership_type] || `Type ${f.ownership_type}`}`);
   // ownership_share adds the share magnitude over share_basis — only meaningful for fractional rows
   // (gate on share_basis, NOT on parsing "1/2"; a "1/1" full share would be noise).
-  if (f.share_basis === "fraction" && f.ownership_share) extra.push(`Share: ${f.ownership_share}`);
+  if (f.share_basis === "fraction" && f.ownership_share) extra.push(`Share: ${f.ownership_share} — price covers the whole deed, not this share`);
   if (f.seller_type != null) extra.push(`Seller: ${PARTY_TYPES[f.seller_type] || `Party type ${f.seller_type}`}`);
   if (f.buyer_type != null) extra.push(`Buyer: ${PARTY_TYPES[f.buyer_type] || `Party type ${f.buyer_type}`}`);
   if (f.land_use) extra.push(`Land use: ${LAND_USES[f.land_use] || f.land_use}`);
@@ -327,28 +404,151 @@ export function formatTransaction(tx: Transaction): string {
   });
 }
 
+// One deed often lands in the registry as several rows carrying the SAME total price. A number
+// groups them when present; otherwise county|district|date|price does, with district in the key to
+// avoid merging different same-day deeds in a county. Null = a row that can never be grouped (units,
+// or no price). Formatter-only heuristic over the current page.
+function deedGroupKey(tx: Transaction): string | null {
+  if (tx.property_type === 4) return null;
+  if (tx.price_gross == null) return null;
+  // Deed numbers are per-office/year, NOT globally unique \u2014 scope by county so identical numbers
+  // from different counties are not merged into one deed.
+  if (tx.transaction_number != null && tx.transaction_number !== "") return `tn:${tx.county_name ?? ""}|${tx.transaction_number}`;
+  return `fb:${tx.county_name ?? ""}|${tx.district ?? ""}|${tx.transaction_date}|${tx.price_gross}`;
+}
+
+// Footer nudge appended by the land-search tools: a land query with no land-use filter mixes
+// farmland, roads and building plots into one median. Empty for anything but land-without-landUse.
+export function landUseHint(propertyType: string | undefined, landUse: string | undefined): string {
+  if (propertyType !== "land" || (landUse != null && landUse !== "")) return "";
+  return "\n\nTip: these land results mix different land-use categories (e.g. farmland, roads, building plots), so a single median blends them. Add a landUse filter to compare like with like.";
+}
+
+// Shared by the row list and the summary-only reply, so both word an empty result identically.
+function formatEmptyTransactions(rawSuggestions: string[] | undefined, location?: string): string {
+  const asked = location?.trim();
+  const suggestions = (rawSuggestions ?? []).filter((s) => typeof s === "string" && s !== "");
+  // A suggestion equal to the name asked for means the district exists and other filters emptied the page.
+  if (asked && suggestions.length > 0 && !suggestions.some((s) => stripDiacritics(s.toLowerCase()) === stripDiacritics(asked.toLowerCase()))) {
+    return `No location named "${asked}". Did you mean: ${suggestions.join(", ")}? Or call list_locations(search=${JSON.stringify(asked)}) for TERYT codes.`;
+  }
+  return "No transactions found matching the criteria.";
+}
+
+// summaryOnly reply: aggregates from /summary, no rows. The median is the window one (always requested
+// in this mode) with its own n; valid dateFrom/dateTo narrow the printed window bounds to the filtered range.
+export function formatTransactionSummaryOnly(
+  summary: TransactionsSummary,
+  location?: string,
+  dateFrom?: string,
+  dateTo?: string,
+): string {
+  if (summary.total === 0) return formatEmptyTransactions(summary.suggestions, location);
+
+  const lines: string[] = [`Total transactions: ${formatNumber(summary.total)}`];
+  const w = summary.median_window;
+  if (w) {
+    const windowVal = summary.median_price_m2_window != null ? Number(summary.median_price_m2_window) : null;
+    const from = dateFrom && w.from && dateFrom > w.from ? dateFrom : w.from;
+    const to = dateTo && w.to && dateTo < w.to ? dateTo : w.to;
+    const sample = `n=${w.n}, ${from}\u2013${to}`;
+    lines.push(windowVal != null && Number.isFinite(windowVal)
+      ? `Median price/m\u00B2: ${formatPLN(windowVal)} (${sample})`
+      : `Median price/m\u00B2: no median - fewer than 5 sales (${sample})`);
+  } else if (summary.median_price_m2 != null) {
+    // No window came back: dateFrom more than 10 years before the window anchor, or an older API.
+    const note = dateFrom ? "n not reported for ranges over 10 years" : dateTo ? "n not reported for this date range" : "n not reported";
+    lines.push(`Median price/m\u00B2: ${formatPLN(summary.median_price_m2)} (${note})`);
+  } else {
+    lines.push("Median price/m\u00B2: no median - fewer than 5 sales");
+  }
+  if (summary.min_date && summary.max_date) lines.push(`Period: ${summary.min_date} \u2013 ${summary.max_date}`);
+  if (summary.avg_area != null) lines.push(`Avg area: ${formatArea(summary.avg_area)}`);
+  return lines.join("\n");
+}
+
+// Present only when the caller asked for a page. maxPage is the tool's cap; estimated = total is approximate.
+export interface PagingInfo {
+  page: number;
+  pageSize: number;
+  total: number;
+  estimated?: boolean;
+  maxPage: number;
+  costNote: string;
+}
+
+function lastPageOf(p: PagingInfo): number {
+  return Math.min(Math.max(1, Math.ceil(p.total / p.pageSize)), p.maxPage);
+}
+
+// An approximate total has no trustworthy last page, so "more" falls back to "this page came back full".
+function formatPagingLines(p: PagingInfo, rowsOnPage: number): string {
+  const hasMoreRows = p.estimated ? rowsOnPage === p.pageSize : p.total > p.page * p.pageSize;
+  const more = hasMoreRows && p.page < p.maxPage;
+  const totalStr = `${p.estimated ? "~" : ""}${formatNumber(p.total)}`;
+  const position = p.estimated ? `Page ${p.page}` : `Page ${p.page} of ${lastPageOf(p)}`;
+  let line = `${position} (${p.pageSize} per page; total ${totalStr}). More pages: ${more ? `yes - next: page=${p.page + 1}` : "no"}.`;
+  if (hasMoreRows && !more) line += ` Page limit reached (max ${p.maxPage}) - narrow the search to see the remaining rows.`;
+  return `${line}\n${p.costNote}`;
+}
+
+function formatPastLastPage(p: PagingInfo): string {
+  return `Page ${p.page} is past the last page${p.estimated ? "" : ` (${lastPageOf(p)})`}.`;
+}
+
 export function formatTransactionList(
   res: TransactionsResponse,
   summary?: TransactionsSummary | null,
+  location?: string,
+  paging?: PagingInfo,
 ): string {
   const { data, pagination } = res;
   if (data.length === 0) {
-    return "No transactions found matching the criteria.";
+    return paging && paging.total > 0 ? formatPastLastPage(paging) : formatEmptyTransactions(res.suggestions, location);
   }
 
   const lines: string[] = [];
   const totalStr = summary ? formatNumber(summary.total) : formatNumber(pagination.total);
-  lines.push(`Found ${totalStr} transactions (showing ${data.length}):\n`);
+  lines.push(`Found ${totalStr} transactions (showing ${data.length}):${paging ? `\n${formatPagingLines(paging, data.length)}` : ""}\n`);
+  // Numbering continues across pages (page 2 starts at 51).
+  const offset = paging ? (paging.page - 1) * paging.pageSize : 0;
 
+  // Count rows per deed group on this page, then flag every row of a group of 2+ so the model does
+  // not read N rows of one shared total as N comparable sales.
+  const groupCounts = new Map<string, number>();
+  for (const tx of data) {
+    const k = deedGroupKey(tx);
+    if (k) groupCounts.set(k, (groupCounts.get(k) ?? 0) + 1);
+  }
   data.forEach((tx, i) => {
-    lines.push(`${i + 1}. ${formatTransaction(tx)}`);
+    let row = `${offset + i + 1}. ${formatTransaction(tx)}`;
+    const k = deedGroupKey(tx);
+    const n = k ? (groupCounts.get(k) ?? 0) : 0;
+    if (n >= 2) row += `\n   [likely one deed with ${n - 1} other record(s) on this page \u2014 total price shared, price/m\u00B2 not comparable]`;
+    lines.push(row);
   });
 
   if (summary) {
     const parts: string[] = [];
-    if (summary.median_price_m2 != null) parts.push(`Median price/m\u00B2: ${formatPLN(summary.median_price_m2)}`);
+    // Trailing-window median (when requested) leads with the window + all-time side by side; when the
+    // window has too few rows (median_price_m2_window null) only the all-time figure with its dates.
+    if (summary.median_window) {
+      const allTime = summary.median_price_m2 != null ? formatPLN(summary.median_price_m2) : "N/A";
+      const allRange = summary.min_date && summary.max_date ? `${summary.min_date}\u2013${summary.max_date}` : "unknown range";
+      const w = summary.median_window;
+      // months echoes the requested window length (fallback 24 for an older API that omits it).
+      const months = w.months ?? 24;
+      const windowVal = summary.median_price_m2_window != null ? Number(summary.median_price_m2_window) : null;
+      if (windowVal != null && Number.isFinite(windowVal)) {
+        parts.push(`Median price/m\u00B2 (last ${months} months, ${w.from}\u2013${w.to}, n=${w.n}): ${formatPLN(windowVal)} | all-time (${allRange}): ${allTime}`);
+      } else {
+        parts.push(`Median price/m\u00B2 all-time (${allRange}): ${allTime} [no window median \u2014 fewer than 5 sales in the last ${months} months]`);
+      }
+    } else if (summary.median_price_m2 != null) {
+      parts.push(`Median price/m\u00B2: ${formatPLN(summary.median_price_m2)}`);
+    }
     if (summary.avg_area != null) parts.push(`Avg area: ${formatArea(summary.avg_area)}`);
-    if (summary.min_date && summary.max_date) parts.push(`Date range: ${summary.min_date} \u2013 ${summary.max_date}`);
+    if (!summary.median_window && summary.min_date && summary.max_date) parts.push(`Date range: ${summary.min_date} \u2013 ${summary.max_date}`);
     if (parts.length > 0) lines.push(`\nSummary: ${parts.join(" | ")}`);
   }
 
@@ -412,21 +612,57 @@ export function formatMarketOverview(stats: StatsResponse): string {
   return lines.join("\n");
 }
 
+// Window the medians were computed over; bounds are the REQUESTED ones (YYYY-MM-DD).
+export interface PriceStatsPeriod {
+  kind: "last_24_months" | "full_history" | "custom";
+  dateFrom?: string;
+  dateTo?: string;
+}
+
+const PERIOD_LABELS: Record<PriceStatsPeriod["kind"], string> = {
+  last_24_months: "last 24 months",
+  full_history: "full history",
+  custom: "custom range",
+};
+
+function describePeriod(rows: PricePerM2Row[], period: PriceStatsPeriod): string {
+  // Unbounded side: fall back to the actual span the API reports (absent on an older API).
+  const mins = rows.map((r) => r.min_date).filter((d): d is string => !!d).sort();
+  const maxs = rows.map((r) => r.max_date).filter((d): d is string => !!d).sort();
+  const from = period.dateFrom ?? mins[0];
+  const to = period.dateTo ?? maxs[maxs.length - 1];
+  const range = from && to ? `${from} to ${to}` : to ? `up to ${to}` : from ? `from ${from}` : "all available dates";
+  return `${range} (${PERIOD_LABELS[period.kind]})`;
+}
+
 export function formatPriceStats(
   rows: PricePerM2Row[],
   location?: string,
+  period?: PriceStatsPeriod,
 ): string {
   if (rows.length === 0) {
-    return location
-      ? `No price statistics found for "${location}". Note: this endpoint only covers residential units (apartments), and matches on name only. Call list_locations(search=...) to confirm the name is a valid RCN district (rcn_district).`
+    const notFound = location
+      ? `No price statistics found for "${location}". Note: this endpoint only covers residential units (apartments), and matches on name only.`
       : "No price statistics available.";
+    const verify = location
+      ? " Call list_locations(search=...) to confirm the name is a valid RCN district (rcn_district)."
+      : "";
+    if (!period) return notFound + verify;
+    const hint = period.kind === "full_history"
+      ? ""
+      : period.kind === "custom"
+        ? " A narrower range can leave a small place empty - widen or drop dateFrom/dateTo."
+        : ' A shorter period can leave a small place empty - try period="all" for full history.';
+    // Period line first: the period is the likelier cause of an empty result than the name.
+    return `${notFound}\nRequested period: ${describePeriod(rows, period)}.${hint}${verify ? `\n${verify.trim()}` : ""}`;
   }
 
   const header = location
     ? `Price statistics for "${location}" (residential units only):\n`
     : "Price statistics by location (residential units only):\n";
+  const periodLine = period ? `Period: ${describePeriod(rows, period)}\n` : "";
 
-  const lines: string[] = [header];
+  const lines: string[] = [header + periodLine];
 
   // Sort by median descending
   const sorted = [...rows].sort((a, b) => b.median_price_m2 - a.median_price_m2);
@@ -488,8 +724,7 @@ export function formatParcelResults(res: ParcelSearchResponse, query: string): s
     const district = p.district ?? "Unknown";
     const area = p.area_m2 != null ? formatArea(p.area_m2) : "N/A";
     const location = `${p.lat.toFixed(4)}\u00B0N, ${p.lng.toFixed(4)}\u00B0E`;
-    // parcel_id is gated identity. MCP token callers always receive it; guard anyway so a
-    // stripped response never renders the literal "undefined".
+    // parcel_id may be withheld; render a sentence so a stripped response never shows "undefined".
     lines.push(`${i + 1}. ${p.parcel_id ?? "(parcel number requires a paid plan)"}`);
     lines.push(`   District: ${district} | Area: ${area} | Location: ${location}`);
   }
@@ -498,7 +733,7 @@ export function formatParcelResults(res: ParcelSearchResponse, query: string): s
 
 // ── Parcel collection formatting ───────────────────────────────────
 
-// Gated identity renders as a sentence, never as "null" or "undefined": a reader who meets an empty
+// A withheld identity renders as a sentence, never as "null" or "undefined": a reader who meets an empty
 // slot concludes the parcel has no number, which is a different (and false) statement.
 const PARCEL_IDENTITY_WITHHELD = "(parcel number requires a paid plan)";
 
@@ -682,20 +917,12 @@ export function formatParcelList(res: ParcelListResponse, scope: string, credits
  * answers and the caller cannot tell them apart from the shape alone. The unavailable case never
  * reaches this function — it is answered as an error, on purpose.
  *
- * ⚠ No tool calls this — the catalogue answers over REST only, for the reasons written where its
- * registration would have gone. It is kept here because the route is live.
+ * No tool calls this; it stays typed and tested.
  */
 export function formatStreetList(res: StreetListResponse, q: string, scope: string): string {
   if (res.data.length === 0) {
-    // TWO things produce an empty list here and the answer names both, because it cannot tell which
-    // one happened. Naming only one is what the earlier wording did — it led with "a rural area can
-    // come back empty", which is false in its premise for a city and sends the caller off after a
-    // precinct number instead of a shorter fragment. An answer may not assert something about a set
-    // it has not checked.
-    //
-    // A third reason used to belong here and no longer does: matching now reads ANYWHERE inside the
-    // name, so a name stored with its generic member in front of it ("ulica X", "aleja X") answers
-    // to "X". That was the single largest source of empty answers and it is gone.
+    // Two different causes produce an empty list and the answer cannot tell which happened, so it
+    // names both rather than asserting something about a set it has not checked.
     return `No street name in ${scope} matches "${q}". The scope is valid and nothing we hold there contains that fragment — two different things can put you here, and this answer cannot tell them apart:\n`
       + `  1. We hold no street addresses in this area at all. Coverage follows the addresses themselves and is thin outside towns, so rural parcels are often there while their streets are not — for one of those, resolve_parcel with the precinct name and the parcel number is the way in, not a street.\n`
       + `  2. There is genuinely no such street here.\n`
@@ -751,6 +978,27 @@ export function formatParcelFeatures(res: ParcelFeatureCollection, scope: string
 
 // ── Parcel resolve formatting ──────────────────────────────────────
 
+const ROAD_PARCEL_NOTE =
+  "This is a road parcel (cadastral use: roads) — the point probably fell on the street. The plot you want is likely adjacent: nudge the point or call list_parcels_in_area(lat, lng, radiusKm=0.05).";
+
+// Several parcels carrying one number after a "name + number" lookup: say how to tell them apart, without
+// promising a precinct name the caller was not given.
+function sameNumberNote(res: ParcelResolveResponse): string | null {
+  const ms = res.matches;
+  if (res.query.mode !== "q" || ms.length < 2) return null;
+  const numbers = new Set(ms.map((m) => m.parcel_number));
+  const number = ms[0]!.parcel_number;
+  if (numbers.size !== 1 || number == null) return null;
+  const codes = ms.map((m) => m.precinct_code);
+  const visible = codes.every((c) => typeof c === "string" && c !== "") && new Set(codes).size === ms.length;
+  if (!visible) return `${ms.length} parcels carry number ${number} in this locality — tell them apart by area and location below.`;
+  const names = ms.map((m) => m.precinct_name);
+  if (names.every((n) => typeof n === "string" && n !== "") && new Set(names).size === ms.length) {
+    return `${ms.length} parcels carry number ${number} in different precincts — ask the user which one, or retry with resolve_parcel(q="<precinct name> <number>").`;
+  }
+  return `${ms.length} parcels carry number ${number} in different precincts that share a name or have none on record — tell them apart by the precinct codes, districts and locations below, and ask the user which one.`;
+}
+
 export function formatParcelResolve(res: ParcelResolveResponse): string {
   // not_computed FIRST: it is not a miss. The lookup did not finish (a live confirmation failed, or the
   // name sits on more precincts than one search covers), so telling the caller to check the spelling would
@@ -763,6 +1011,8 @@ export function formatParcelResolve(res: ParcelResolveResponse): string {
   }
 
   const lines: string[] = [`Found ${res.matches.length} parcel${res.matches.length === 1 ? "" : "s"}:\n`];
+  const sameNumber = sameNumberNote(res);
+  if (sameNumber) lines.push(`${sameNumber}\n`);
   for (const [i, m] of res.matches.entries()) {
     // parcel_id may be null per the server contract; guard so a null identity never renders literally.
     const id = m.parcel_id ?? "(parcel id requires a paid plan)";
@@ -771,6 +1021,10 @@ export function formatParcelResolve(res: ParcelResolveResponse): string {
     const location = m.centroid ? `${m.centroid.lat.toFixed(4)}°N, ${m.centroid.lng.toFixed(4)}°E` : "no geometry";
     lines.push(`${i + 1}. ${id}`);
     lines.push(`   District: ${district} | Area: ${area} | Location: ${location}`);
+    if (res.matches.length >= 2 && m.precinct_code) {
+      lines.push(`   Precinct: ${m.precinct_name ?? "name not on record"} (${m.precinct_code})`);
+    }
+    if (res.query.mode === "latlng" && m.road_parcel === true) lines.push(`   ${ROAD_PARCEL_NOTE}`);
   }
   if (res.truncated) {
     lines.push(`\nMore matches exist than shown — narrow the locality name or provide the full parcel id.`);
@@ -795,30 +1049,37 @@ function formatSpatialFeature(f: SpatialFeature): string {
   });
 }
 
-export function formatSpatialResults(res: SpatialSearchResponse): string {
-  if (res.features.length === 0) {
-    return `No transactions found in the specified polygon (total: ${res.total}).`;
+export function formatSpatialResults(res: SpatialSearchResponse, paging?: PagingInfo): string {
+  // With paging the response holds rows 1..page*pageSize; the requested page is its tail slice.
+  const offset = paging ? (paging.page - 1) * paging.pageSize : 0;
+  const features = paging ? res.features.slice(offset, offset + paging.pageSize) : res.features;
+  if (features.length === 0) {
+    return paging && paging.total > 0
+      ? formatPastLastPage(paging)
+      : `No transactions found in the specified polygon (total: ${res.total}).`;
   }
 
   const lines: string[] = [];
   const displayCap = 50;
-  const showing = Math.min(res.features.length, displayCap);
+  const showing = Math.min(features.length, displayCap);
   lines.push(`Found ${formatNumber(res.total)} transactions in polygon (showing ${showing}):`);
-  if (res.truncated) {
+  if (paging) {
+    lines.push(formatPagingLines(paging, features.length));
+  } else if (res.truncated) {
     lines.push(`Results truncated by API limit. Narrow your polygon or add filters to see all.`);
   }
   lines.push("");
 
-  const shown = res.features.slice(0, displayCap);
+  const shown = features.slice(0, displayCap);
   for (const [i, f] of shown.entries()) {
-    lines.push(`${i + 1}. ${formatSpatialFeature(f)}`);
+    lines.push(`${offset + i + 1}. ${formatSpatialFeature(f)}`);
   }
-  if (res.features.length > displayCap) {
-    lines.push(`\n...and ${res.features.length - displayCap} more in response (not displayed). Use a smaller limit or narrower polygon.`);
+  if (features.length > displayCap) {
+    lines.push(`\n...and ${features.length - displayCap} more in response (not displayed). Use a smaller limit or narrower polygon.`);
   }
 
   // Same cross-link as the list formatter, so polygon/area callers also discover get_building_breakdown.
-  if (res.features.some((f) => f.properties.building_count != null)) {
+  if (features.some((f) => f.properties.building_count != null)) {
     lines.push(`\n${BUILDING_BREAKDOWN_TIP}`);
   }
 
@@ -850,21 +1111,15 @@ export function formatBuildingAge(age: BuildingAgeEstimate | undefined): string 
         return clause("an estimate came back without the interval it has to carry, so there is no honest year to state");
       }
       const range = age.year_from === age.year_to ? `${age.year_from}` : `${age.year_from}-${age.year_to}`;
-      // The range comes first and the single year after it. That order is the message: the range is the
-      // part that was measured against real first sales, the single year is the least certain number
-      // here, and a reader who sees a year first will quote the year.
+      // Range first, single year after it: a reader who sees a year first will quote the year.
       const point = age.year_point != null ? `, point estimate ~${age.year_point} (least certain)` : "";
-      // Spelled out, not shortened to "high confidence": this grades how well the building was tied to
-      // a construction record, and our own measurement found it does NOT order the error on the year —
-      // the top grade carries the worst hard error on one of the two routes. A reader (human or model)
-      // who meets a bare grade next to a pair of years reads it as certainty about the years and passes
-      // that on to an appraisal, so the clause has to name what is being graded and what is not.
+      // Names what the grade measures (the permit match, not the year) so a grade next to a year range
+      // is not read as certainty about the year.
       const conf = age.confidence ? `, ${age.confidence} confidence in the permit match (not in the year)` : "";
       return `built range ${range}${point} [estimate from permit records, not a registry date${conf}]${works}`;
     }
     case "older_than_register":
-      // Deliberately says what we could not establish, not that the building is old: the same empty
-      // result also appears when a split or merge renumbered the land after the works were registered.
+      // Says what could not be established, not that the building is old.
       return clause("no construction record for this land falls inside our coverage, which starts in 2016 — the works may predate it, or the land may have been renumbered since");
     case "ambiguous_permits":
     case "ambiguous_buildings":
@@ -906,9 +1161,8 @@ export function formatBuildingBreakdown(res: BuildingBreakdownResponse): string 
     cells.push(typeLabel);
 
     if (b.footprint_area_m2 != null) {
-      // Surface the second measurement only when the two diverge (>10%) — a neutral "two independent
-      // measurements disagree" signal, no source register named. When they agree, the canonical
-      // footprint already represents both, so the alt is noise.
+      // Show the alternative footprint only when the two measurements diverge noticeably; when they
+      // agree, the canonical footprint already represents both.
       const alt = b.footprint_divergent === true && b.footprint_area_alt_m2 != null
         ? ` (alt. measurement ${formatArea(b.footprint_area_alt_m2)} — diverge)`
         : "";
@@ -1046,6 +1300,11 @@ export function formatHeritageBreakdown(res: HeritageBreakdownResponse): string 
 
 // ── Landslide-zone breakdown formatting (per-transaction, per-parcel) ───
 
+// Interpretation guard shared by the breakdown and the parcel report: an intersection at map scale
+// 1:10,000 means the parcel overlaps a mapped hazard area, NOT that the parcel itself is a landslide.
+export const LANDSLIDE_OVERLAP_NOTE =
+  "Note: based on official landslide-hazard maps (1:10,000 scale). An intersection means the parcel overlaps a mapped hazard area, not that the parcel itself is a landslide.";
+
 export function formatLandslideBreakdown(res: LandslideBreakdownResponse): string {
   const { data, truncated } = res;
   // TWO-STATE: empty covers both "no linked parcel intersects a mapped zone" and "unknown/garbage id"
@@ -1092,9 +1351,7 @@ export function formatLandslideBreakdown(res: LandslideBreakdownResponse): strin
     lines.push("", "Showing the first 500 parcels (the transaction is linked to more).");
   }
 
-  // Interpretation guard: intersection at map scale 1:10,000 = the parcel overlaps a mapped hazard
-  // area — NOT a statement that the parcel itself is a landslide.
-  lines.push("", "Note: based on official landslide-hazard maps (1:10,000 scale). An intersection means the parcel overlaps a mapped hazard area, not that the parcel itself is a landslide.");
+  lines.push("", LANDSLIDE_OVERLAP_NOTE);
 
   return lines.join("\n");
 }
@@ -1201,7 +1458,7 @@ export function formatNatureBreakdown(res: NatureBreakdownResponse): string {
 // ── Subsurface breakdown formatting (per-transaction, per-parcel) ───
 
 // Mineral class → what it means for the parcel (distinction 1, the one that makes a "mining terrain" line
-// meaningful: a gravel pit is not a coal mine). Neutral EN; the source register is never named.
+// meaningful: a gravel pit is not a coal mine). Neutral wording.
 const MINERAL_CLASS_NOTE: Record<string, string> = {
   subsidence: "extraction with surface deformation — the actual mining-damage risk",
   surface: "open-pit working — mostly local impact (neighbourhood, noise)",
@@ -1211,7 +1468,7 @@ const MINERAL_CLASS_NOTE: Record<string, string> = {
 
 // Carries all three load-bearing distinctions in one closing note: (1) mining terrain = advisory signal,
 // approximate location, verify with the mining-supervision authority; (2) a reservoir's extent alone is
-// not a restriction; (3) absence is never 'safe'. No source register or institution is named.
+// not a restriction; (3) absence is never 'safe'.
 const SUBSURFACE_NOTE =
   "Note: a mining terrain is a legally defined zone of anticipated mining influence; its mapped location is approximate — an intersection is an advisory signal to verify with the competent mining-supervision authority (named per terrain as the oversight authority), not a legal determination. Some terrains with status 'active' carry a valid_until already in the past, because the register entry can lag behind the expiry of a concession. A groundwater reservoir's extent alone imposes NO restriction; a restriction would come only from an established protection zone, which is not published here. Absence of a match is never asserted as 'safe': the mining register covers concession areas, so historic or shallow workings may not appear, and an absent reservoir does not mean there is no groundwater beneath the parcel.";
 
@@ -1289,7 +1546,7 @@ export function formatSubsurfaceBreakdown(res: SubsurfaceBreakdownResponse): str
       }
     }
 
-    // Defense-in-depth: the API CHECK guarantees each row carries ≥1 dimension, but never emit a bare
+    // Defense-in-depth: the API guarantees each row carries ≥1 dimension, but never emit a bare
     // "N." row if a future shape change ever produced a both-null row — skip it and keep numbering contiguous.
     if (cells.length === 0) continue;
     n += 1;
@@ -1325,6 +1582,35 @@ const SURROUNDINGS_CATEGORIES: { key: keyof SurroundingsRow; label: string; radi
   { key: "power_line_ehv_distance_m", label: "extra-high-voltage overhead power line", radiusLabel: "1 km" },
 ];
 
+// A finite number, or a non-empty numeric string, else null. Unlike Number(), it rejects ""/false/[]
+// (which Number() coerces to 0), so a garbage wire value drops its cell instead of rendering as 0.
+function finiteMeasure(v: unknown): number | null {
+  if (typeof v === "number") return Number.isFinite(v) ? v : null;
+  if (typeof v === "string" && v.trim() !== "") {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
+}
+
+// Narrows fields itself so any record (tx breakdown or parcel report) passes without a cast. An ABSENT
+// key is dropped; only a null carries "none within …" (absence is no claim); garbage drops the cell.
+export function surroundingsCells(r: Record<string, unknown>): string[] {
+  const cells: string[] = [];
+  for (const { key, label, radiusLabel } of SURROUNDINGS_CATEGORIES) {
+    if (!(key in r)) continue;
+    const raw = r[key];
+    if (raw == null) {
+      cells.push(`${label}: none within ${radiusLabel}`);
+      continue;
+    }
+    const dist = finiteMeasure(raw);
+    if (dist == null) continue; // garbage value under a present key — no cell, never "0 m"
+    cells.push(dist === 0 ? `${label}: on or adjoining the plot` : `${label}: ~${Math.round(dist)} m`);
+  }
+  return cells;
+}
+
 export function formatSurroundings(res: SurroundingsResponse): string {
   const { data, truncated } = res;
   // TWO-STATE: empty covers both "the transaction has no linked plots" and "unknown/garbage id"
@@ -1344,21 +1630,7 @@ export function formatSurroundings(res: SurroundingsResponse): string {
       return;
     }
 
-    // A category whose key is absent from the row is DROPPED, not rendered as "none within …": the
-    // service withholds a field it cannot yet answer for, and turning that silence into a negative
-    // statement is the one mistake this whole two-state contract exists to avoid.
-    const cells = SURROUNDINGS_CATEGORIES.filter(({ key }) => key in r).map(({ key, label, radiusLabel }) => {
-      const raw = r[key];
-      const dist = raw == null ? null : Number(raw);
-      if (dist == null || !Number.isFinite(dist)) {
-        // Absence within the search radius — never rendered as "none exists".
-        return `${label}: none within ${radiusLabel}`;
-      }
-      if (dist === 0) return `${label}: on or adjoining the plot`;
-      return `${label}: ~${Math.round(dist)} m`;
-    });
-
-    lines.push(`${i + 1}. ${cells.join(" | ")}`);
+    lines.push(`${i + 1}. ${surroundingsCells(r as unknown as Record<string, unknown>).join(" | ")}`);
   });
 
   if (truncated) {
@@ -1436,8 +1708,7 @@ export function formatRoads(res: RoadsBreakdownResponse): string {
     lines.push("", "Showing the first 500 plots (the transaction is linked to more).");
   }
 
-  // Freshness signal, same shape as farmland. The road layer is loaded county by county, so the snapshot
-  // date is more load-bearing here than for a nationally refreshed layer, not less.
+  // Freshness signal, same shape as farmland; the snapshot date is load-bearing for this layer.
   // The OLDEST date across the plots, not the first one found: a transaction can span counties loaded on
   // different dates, and the freshest of them would overstate how current the whole answer is.
   const dates = data
@@ -1472,8 +1743,8 @@ export function formatTransitBreakdown(res: TransitBreakdownResponse): string {
     "",
   ];
 
-  // Invariant: every row has ≥1 non-null mode (enforced upstream by a data-layer CHECK constraint and
-  // the endpoint's two-state filter), so `cells` is never empty here — no bare "N. " line can be emitted.
+  // Invariant: every row has ≥1 non-null mode (enforced upstream), so
+  // `cells` is never empty here — no bare "N. " line can be emitted.
   data.forEach((r, i) => {
     const cells: string[] = [];
     if (r.rail_distance_m != null) cells.push(`Rail: ${r.rail_distance_m} m${r.rail_stop_name ? ` (${r.rail_stop_name})` : ""}`);
@@ -1494,22 +1765,57 @@ export function formatTransitBreakdown(res: TransitBreakdownResponse): string {
 
 // ── Building-permit breakdown formatting (per-transaction, per-parcel) ──
 
-// Neutral disclaimer for an empty permits result. Identity-safe (no source-registry name) and
-// TWO-STATE: an empty list is never rendered as "nothing was ever planned". Covers both
-// "no registered case for any linked parcel" and "unknown/garbage id" (REST returns 200 + []
-// for both) — one message fits both without leaking which case it was.
-//
-// This constant carries the whole disclaimer on its own: `res.note` from the API is not rendered
-// anywhere in formatPermitsBreakdown, so an empty result shows nothing but this string. Hence the
-// wording states what is held — permits once a decision has been issued, notifications only where
-// they were accepted without objection — and never characterises the outcome of a decision, which
-// is not part of the data at all.
+// `res.note` from the API is not rendered for an empty result, so these constants carry the whole
+// disclaimer: what is held, never the outcome of a decision (not part of the data).
+const PERMITS_SCOPE_TAIL =
+  "Permits are held once a decision has been issued, and notifications only where they were accepted without objection; cases registered since 2016 are matched by the parcel's current identifier — an empty list is never a statement that nothing was ever planned.";
+
+// No `coverage` (older service): the id may or may not exist, so the message covers both.
 const PERMITS_EMPTY_NOTE =
-  "No building permit or works notification is on record for this transaction's parcels (or the id was not found). Permits are held once a decision has been issued, and notifications only where they were accepted without objection; cases registered since 2016 are matched by the parcel's current identifier — an empty list is never a statement that nothing was ever planned.";
+  `No building permit or works notification is on record for this transaction's parcels (or the id was not found). ${PERMITS_SCOPE_TAIL}`;
+
+const PERMITS_NO_RECORDS_NOTE =
+  `No building permit or works notification is on record for this transaction's parcels. ${PERMITS_SCOPE_TAIL}`;
+
+const PERMITS_NOT_FOUND_NOTE =
+  "Transaction id not found: no transaction with this id is held, so there was nothing to check for building permits. Copy the id from a search_transactions, search_by_area or search_by_polygon result.";
+
+// Fixed field allow-list (never a spread) so an unexpected key — e.g. personal data — cannot leak. Narrows
+// fields itself so any record (tx breakdown or parcel report) passes without a cast; garbage drops its cell.
+export function permitCells(r: Record<string, unknown>): string[] {
+  const cells: string[] = [];
+  const str = (v: unknown): string | undefined => (typeof v === "string" && v ? v : undefined);
+  const recordKind = str(r.record_kind);
+  if (recordKind) cells.push(recordKind);
+  const intentType = str(r.intent_type);
+  if (intentType) cells.push(`intent: ${intentType}`);
+  const worksType = str(r.works_type);
+  if (worksType) cells.push(`works: ${worksType}`);
+  const objectCategory = str(r.object_category);
+  const categoryLabel = str(r.category_label);
+  if (objectCategory) cells.push(`category: ${categoryLabel ? `${objectCategory} ${categoryLabel}` : objectCategory}`);
+  const status = str(r.status);
+  if (status) cells.push(`status: ${status}`);
+  // Prefer the decision date (permits); fall back to the intake date (notifications have no
+  // decision date). Both are YYYY-MM-DD strings.
+  const date = str(r.decision_date) ?? str(r.intake_date);
+  if (date) cells.push(`date: ${date}`);
+  const authority = str(r.authority);
+  if (authority) cells.push(`authority: ${authority}`);
+  // Investment address (street / number / city) — administrative fact, no parcel identity.
+  const addr = [str(r.address_street), str(r.address_number)].filter(Boolean).join(" ");
+  const addrFull = [addr, str(r.address_city)].filter(Boolean).join(", ");
+  if (addrFull) cells.push(`address: ${addrFull}`);
+  const volume = finiteMeasure(r.volume_m3);
+  if (volume != null) cells.push(`volume: ${Math.round(volume)} m³${r.volume_suspect === true ? " (suspect: likely several buildings filed as one case)" : ""}`);
+  return cells;
+}
 
 export function formatPermitsBreakdown(res: PermitsResponse): string {
   const { data, truncated } = res;
   if (data.length === 0) {
+    if (res.coverage === "not_covered") return PERMITS_NOT_FOUND_NOTE;
+    if (res.coverage === "covered_no_data") return PERMITS_NO_RECORDS_NOTE;
     return PERMITS_EMPTY_NOTE;
   }
 
@@ -1519,31 +1825,159 @@ export function formatPermitsBreakdown(res: PermitsResponse): string {
   ];
 
   data.forEach((r, i) => {
-    const cells: string[] = [];
-    cells.push(r.record_kind);
-    if (r.intent_type) cells.push(`intent: ${r.intent_type}`);
-    if (r.works_type) cells.push(`works: ${r.works_type}`);
-    if (r.object_category) cells.push(`category: ${r.object_category}`);
-    if (r.status) cells.push(`status: ${r.status}`);
-    // Prefer the decision date (permits); fall back to the intake date (notifications have no
-    // decision date). Both are YYYY-MM-DD strings.
-    const date = r.decision_date ?? r.intake_date;
-    if (date) cells.push(`date: ${date}`);
-    if (r.authority) cells.push(`authority: ${r.authority}`);
-    // Investment address (street / number / city) — administrative fact, no parcel identity.
-    const addr = [r.address_street, r.address_number].filter(Boolean).join(" ");
-    const addrFull = [addr, r.address_city].filter(Boolean).join(", ");
-    if (addrFull) cells.push(`address: ${addrFull}`);
-    if (r.volume_m3 != null && Number.isFinite(Number(r.volume_m3))) {
-      cells.push(`volume: ${Math.round(Number(r.volume_m3))} m³`);
-    }
-    lines.push(`${i + 1}. ${cells.join(" | ")}`);
+    lines.push(`${i + 1}. ${permitCells(r as unknown as Record<string, unknown>).join(" | ")}`);
   });
 
   if (truncated) {
     lines.push("", "Showing the first 500 records (the transaction's parcels have more).");
   }
 
+  return lines.join("\n");
+}
+
+// ── Building permits within a radius (collection) ──────────────────
+
+const PERMITS_AREA_CATEGORY_LABELS: Record<string, string> = {
+  XIII: "XIII multi-family",
+  I: "I single-family",
+};
+
+// The service's own label wins; the static map only serves an older service that sends none.
+function permitsAreaCategoryLabel(code: string | null | undefined, label?: string | null): string {
+  if (!code) return "uncategorised";
+  const text = typeof label === "string" ? label.trim() : "";
+  if (text) return `${code} ${text}`;
+  return PERMITS_AREA_CATEGORY_LABELS[code] ?? code;
+}
+
+function plural(n: number, word: string): string {
+  return `${n.toLocaleString("en-US")} ${word}${n === 1 ? "" : "s"}`;
+}
+
+// null when either count is missing (older service), so the caller prints no split rather than a wrong one.
+function permitKindSplit(permits: unknown, notifications: unknown): string | null {
+  const p = finiteOrNull(permits);
+  const n = finiteOrNull(notifications);
+  return p == null || n == null ? null : `${plural(p, "permit")}, ${plural(n, "notification")}`;
+}
+
+function permitDistanceCell(v: unknown): string | null {
+  const d = finiteOrNull(v);
+  return d == null || d < 0 ? null : `~${Math.round(d)} m`;
+}
+
+// The cursor is echoed into text the model reads, so only the opaque URL-safe alphabet gets through.
+function safeCursor(v: unknown): string | null {
+  return typeof v === "string" && v.length <= 500 && /^[A-Za-z0-9_-]+$/.test(v) ? v : null;
+}
+
+// Defensive branch for a locked-response shape we do not expect.
+const PERMITS_AREA_LOCKED_MESSAGE =
+  "Area permit data was not returned: this caller is not entitled to it (it is available to API-key and OAuth callers and to accounts on a paid plan or an active trial). Nothing was charged.";
+
+// Used only if the service omits its own note, so a result is never printed without a disclaimer.
+const PERMITS_AREA_FALLBACK_NOTE =
+  "Cases are building permits with an issued decision and notifications accepted without objection, registered since 2016 and matched through the parcel geometry we hold; pending cases and the outcome of a decision are not part of the data, so a short or empty list is never a statement that nothing is being built.";
+
+function dayOf(v: unknown): string | null {
+  return typeof v === "string" && v ? (v.split("T")[0] ?? null) : null;
+}
+
+// continued = the caller passed a cursor, so this is not the first page and "N of M shown" would mislead.
+export function formatPermitsInArea(res: PermitsAreaResponse, opts: { continued?: boolean } = {}): string {
+  if (res.locked === true) return PERMITS_AREA_LOCKED_MESSAGE;
+
+  const { query: q, data } = res;
+  const parcels = finiteOrNull(res.parcels_in_radius);
+  const total = finiteOrNull(res.aggregate?.case_count) ?? data.length;
+  const aggregateOnly = q.aggregate_only === true;
+  const window = q.date_to ? `from ${q.date_from} to ${q.date_to}` : `from ${q.date_from}`;
+  const lines: string[] = [
+    `Building permits and works notifications within ${q.radius_km} km of ${q.lat}, ${q.lng}: cases dated ${window} (decision date, or intake date for notifications). Intent: ${q.intent}; works: ${q.works_type}.`,
+  ];
+  const kept = Array.isArray(q.categories) && q.categories.length > 0 ? q.categories : null;
+  const removed = Array.isArray(q.exclude_categories) && q.exclude_categories.length > 0 ? q.exclude_categories : null;
+  if (kept || removed) {
+    lines.push([
+      kept ? `Categories kept: ${kept.join(", ")}` : null,
+      removed ? `categories removed: ${removed.join(", ")} (cases without a category stay)` : null,
+    ].filter(Boolean).join("; ") + ".");
+  }
+
+  if (parcels === 0) {
+    lines.push("Parcels we hold in this circle: 0. That is no data for this area, not an absence of permits; try a nearby centre point.");
+  } else if (parcels != null) {
+    lines.push(`Parcels we hold in this circle: ${parcels.toLocaleString("en-US")} (the base the cases are matched on).`);
+  }
+  const corpusAsOf = dayOf(res.corpus_coverage?.as_of);
+  if (res.corpus_coverage) {
+    lines.push(`Parcel corpus: near-complete but not the whole cadastral register${corpusAsOf ? `, coverage measured ${corpusAsOf}` : ""}.`);
+  }
+  const refreshed = dayOf(res.freshness?.as_of);
+  const newest = dayOf(res.freshness?.latest_decision_date);
+  if (refreshed || newest) {
+    lines.push([
+      refreshed ? `Source data last refreshed ${refreshed}` : null,
+      newest ? `newest decision in the circle ${newest}` : null,
+    ].filter(Boolean).join("; ") + ".");
+  }
+
+  const totalSplit = permitKindSplit(res.aggregate?.permit_count, res.aggregate?.notification_count);
+  lines.push("", `Matched cases: ${total.toLocaleString("en-US")}${totalSplit ? ` (${totalSplit})` : ""}`);
+  const byYear = res.aggregate?.by_year ?? [];
+  if (byYear.length > 0) {
+    lines.push("", "By year and category (counts ALL matched cases, not only the list below):", "Year | Category | Cases | Volume m³ (cases with a volume)");
+    for (const y of byYear) {
+      for (const c of y.by_category) {
+        const known = finiteOrNull(c.volume_m3_known) ?? 0;
+        const sum = finiteOrNull(c.volume_m3_sum);
+        const volume = sum != null && known > 0
+          ? `${Math.round(sum).toLocaleString("en-US")} (${known} of ${c.case_count})`
+          : `not stated (0 of ${c.case_count})`;
+        const split = permitKindSplit(c.permit_count, c.notification_count);
+        lines.push(`${y.year} | ${permitsAreaCategoryLabel(c.object_category, c.category_label)} | ${c.case_count}${split ? ` (${split})` : ""} | ${volume}`);
+      }
+    }
+  }
+  const suspect = finiteOrNull(res.aggregate?.volume_m3_suspect) ?? 0;
+  if (suspect > 0) {
+    lines.push("", `Suspect volumes: ${plural(suspect, "single-family case")} with a volume far above one house (usually several buildings filed as one case). The volume is shown as recorded and is included in the sums.`);
+  }
+
+  if (data.length === 0) {
+    if (total > 0) {
+      lines.push("", aggregateOnly
+        ? "The case list was not requested (aggregateOnly): the table above counts all matched cases. Call again without aggregateOnly for the list."
+        : "No cases are listed here, but the table above counts all matched cases.");
+    } else {
+      lines.push("", parcels === 0
+        ? "No cases listed: we hold no parcel data for this circle."
+        : "No cases matched in this window. That is not a statement that nothing is being built; see the note below.");
+    }
+  } else {
+    const scope = opts.continued
+      ? ` (next page: ${data.length} listed, ${total.toLocaleString("en-US")} matched in total)`
+      : res.truncated ? ` (${data.length} of ${total.toLocaleString("en-US")} shown)` : "";
+    lines.push("", `Cases, newest first${scope}:`);
+    const hasDistance = data.some((r) => permitDistanceCell(r.distance_m) != null);
+    lines.push(hasDistance
+      ? "The list is ordered by date, not by distance. ~N m is the distance from the centre of the circle to the parcel covered by the case (not to the building), rounded to 10 m; ~0 m means the point lies in or at the parcel. For what is closest, use a smaller radiusKm."
+      : "The list is ordered by date, not by distance; for what is closest, use a smaller radiusKm.");
+    data.forEach((r, i) => {
+      const cells = [permitDistanceCell(r.distance_m), ...permitCells(r as unknown as Record<string, unknown>)];
+      lines.push(`${i + 1}. ${cells.filter(Boolean).join(" | ")}`);
+    });
+    if (res.truncated || res.pagination?.has_more === true) {
+      lines.push("", "More cases matched than are listed; the table above already counts all of them.");
+      const cursor = safeCursor(res.pagination?.next_cursor);
+      lines.push(cursor
+        ? `Next page: pass cursor="${cursor}" with the same lat, lng, radiusKm, dateFrom, dateTo, intent, worksType, categories and excludeCategories (limit may differ). The cursor is opaque - pass it back unchanged - and the counts above cover all pages, so do not add them up.`
+        : "Narrow with dateFrom, dateTo, intent or categories, or raise limit (max 200).");
+    }
+  }
+
+  const note = typeof res.note === "string" && res.note.trim() ? res.note.trim() : PERMITS_AREA_FALLBACK_NOTE;
+  lines.push("", `Note: ${note}`);
   return lines.join("\n");
 }
 
@@ -1681,9 +2115,7 @@ export function formatPlanningBreakdown(res: PlanningResponse): string {
 export function formatFarmland(res: FarmlandResponse): string {
   const { data, truncated, parcels_total, parcels_with_data, as_of } = res;
   // TWO-STATE: empty covers both "no linked parcel has a matched eligible area" and "unknown/garbage id"
-  // (REST returns 200 + [] for both). We NEVER assert "not agricultural" — the reference layer has its
-  // own update cadence, small plots that are not actively farmed are simply absent, and older
-  // transactions can reference renumbered parcels. One neutral message fits both.
+  // (REST returns 200 + [] for both). We NEVER assert "not agricultural"; one neutral message fits both.
   if (data.length === 0) {
     const asOfNote = as_of ? ` (reference data as of ${as_of})` : "";
     return `No eligible agricultural area found for the linked parcels (or the id was not found)${asOfNote}. This is not a statement that the property is non-agricultural — absence of a match is never asserted as "not agricultural".`;
@@ -1786,49 +2218,127 @@ const SEARCH_LEVEL_LABEL: Record<string, string> = {
   precinct: "Precincts",
 };
 
+// Coverage of RCN labels keyed by coverageKey(name); absent for a name = nothing known, print as before.
+export type LocationCoverage = Map<string, DistrictCoverageItem>;
+
+export function coverageKey(name: string): string {
+  return stripDiacritics(name.trim().toLowerCase());
+}
+
+export function buildCoverageMap(items: DistrictCoverageItem[] | undefined): LocationCoverage {
+  const map: LocationCoverage = new Map();
+  for (const c of Array.isArray(items) ? items : []) {
+    if (c && typeof c.name === "string") map.set(coverageKey(c.name), c);
+  }
+  return map;
+}
+
+// Only a row the server recognised as an RCN district with a numeric count counts as knowledge: an
+// unknown name (rcn_district:false, zeros) must not suppress follow-up calls.
+function knownCoverage(coverage: LocationCoverage | undefined, name: string): DistrictCoverageItem | undefined {
+  const c = coverage?.get(coverageKey(name));
+  return c && c.rcn_district !== false && typeof c.transactions === "number" ? c : undefined;
+}
+
+function coverageLines(name: string, cov: DistrictCoverageItem | undefined): string[] {
+  if (!cov || typeof cov.transactions !== "number") return [];
+  if (cov.transactions === 0) return [`RCN label "${name}": no transactions`];
+  const range = typeof cov.date_from === "string" && typeof cov.date_to === "string"
+    ? `, ${cov.date_from.slice(0, 7)}..${cov.date_to.slice(0, 7)}`
+    : "";
+  const lines = [`RCN label "${name}": ${formatNumber(cov.transactions)} transaction${cov.transactions === 1 ? "" : "s"}${range}`];
+  const g = cov.gmina;
+  if (g && typeof g.transactions === "number" && cov.transactions < g.transactions) {
+    lines.push(`Only part of gmina ${g.name} (${formatNumber(g.transactions)} transactions); full data: teryt=${g.teryt}`);
+  }
+  return lines;
+}
+
 // Ready-to-use follow-up calls for one TERYT unit. What is valid depends on the level (the target
-// tools reject codes they cannot resolve) and on rcn_district (name-based calls only work when the
-// name is a valid location= value). Experimental catalogues (yield/spread/flood) are never printed —
-// they have their own coverage catalogues and list_locations does not stand in for them.
-function searchCallsForItem(it: LocationSearchItem): string[] {
+// tools reject codes they cannot resolve; rules shared with the location-error candidates) and on
+// rcn_district (name-based calls only work when the name is a valid location= value). Experimental
+// catalogues (yield/spread/flood) are never printed — they have their own coverage catalogues.
+// Known coverage trims the name-based calls: no deeds → none, no price sample → no price statistics.
+function searchCallsForItem(it: LocationSearchItem, cov?: DistrictCoverageItem): string[] {
   const code = it.code;
-  const calls: string[] = [
-    `search_transactions(teryt="${code}")`,
-    `list_parcels_in_area(teryt="${code}")`,
-  ];
+  const calls: string[] = [];
+  const addTerytCall = (tool: TerytTool) => {
+    const arg = terytArgForTool(tool, it, "skip");
+    if (arg) calls.push(`${tool}(teryt="${arg}")`);
+  };
+  addTerytCall("search_transactions");
+  addTerytCall("list_parcels_in_area");
   // Drill down into children — replaces the withdrawn auto-expansion.
   if (it.level === "county" || it.level === "municipality") {
     calls.push(`list_locations(parent="${code}")`);
   }
-  // get_demographics accepts voivodeship / county / municipality codes, not precinct codes.
-  if (it.level !== "precinct") {
-    calls.push(`get_demographics(teryt="${code}")`);
-  }
-  // get_infrastructure_signals accepts county and municipality codes only.
-  if (it.level === "county" || it.level === "municipality") {
-    calls.push(`get_infrastructure_signals(teryt="${code}")`);
-  }
+  addTerytCall("get_demographics");
+  addTerytCall("get_infrastructure_signals");
   // Name-based calls: valid only when this name is an RCN district label.
-  if (it.rcn_district) {
+  if (it.rcn_district && cov?.transactions !== 0) {
     calls.push(`search_transactions(location="${it.name}")`);
     calls.push(`compare_locations(districts="${it.name},…")`);
-    calls.push(`get_price_statistics(location="${it.name}")`);
+    if (cov?.price_samples !== 0) calls.push(`get_price_statistics(location="${it.name}")`);
   }
   return calls;
 }
 
-// Multi-level result: TERYT units (grouped by administrative level, each with the codes and the
-// exact follow-up calls) followed by RCN district names that carry no TERYT code. A name present on
-// the TERYT side is printed there only — the caller passes such names in rcnOnly already deduped.
+// Names a place that is not an administrative unit: no code exists for it, so the caller needs a point.
+export function formatNeighbourhoodNote(query: string): string {
+  const name = query.trim();
+  return `No administrative unit is named ${name}. If ${name} is a neighbourhood (osiedle) of a city, it is not addressable by name — ask the user for a point (address or coordinates) and use search_by_area, or resolve_parcel with a precinct name plus parcel number.`;
+}
+
+// Multi-level result: TERYT units followed by RCN district names that carry no TERYT code (the caller
+// passes such names in rcnOnly already deduped). Rows arrive ranked exact → prefix → infix: exact and
+// prefix hits lead as "Best matches"; with an exact hit the infix tail collapses to one line so it
+// cannot bury it. Rows without `match` (older API) keep the plain grouping by level.
 export function formatLocationSearch(
   items: LocationSearchItem[],
   rcnOnly: string[],
   query: string,
+  rcnHidden = 0,
+  coverage?: LocationCoverage,
 ): string {
   const lines: string[] = [`Location search for "${query}":`, ""];
 
+  const hasExact = items.some((it) => it.match === "exact");
+  const best: LocationSearchItem[] = [
+    ...items.filter((it) => it.match === "exact"),
+    ...items.filter((it) => it.match === "prefix"),
+  ];
+  const collapsed = hasExact ? items.filter((it) => it.match === "infix") : [];
+  const grouped = items.filter((it) => !best.includes(it) && !collapsed.includes(it));
+
+  const pushItem = (it: LocationSearchItem, withLevel: boolean) => {
+    const typeSuffix = it.typeName ? ` (${it.typeName})` : "";
+    const parentSuffix = it.parent_name ? `, ${it.parent_name}` : "";
+    lines.push(`  ${it.code} - ${it.name}${typeSuffix}${parentSuffix}${withLevel ? ` [${it.level}]` : ""}`);
+    const cov = it.rcn_district ? knownCoverage(coverage, it.name) : undefined;
+    for (const line of coverageLines(it.name, cov)) {
+      lines.push(`      ${line}`);
+    }
+    for (const call of searchCallsForItem(it, cov)) {
+      lines.push(`      ${call}`);
+    }
+  };
+
+  if (best.length > 0) {
+    lines.push("Best matches:");
+    for (const it of best) pushItem(it, true);
+    lines.push("");
+  }
+
+  if (collapsed.length > 0) {
+    const names = [...new Set(collapsed.map((it) => it.name))].slice(0, 3);
+    lines.push(
+      `${collapsed.length} more partial match${collapsed.length === 1 ? "" : "es"} (e.g. ${names.join(", ")}) — type more letters to narrow`,
+      "",
+    );
+  }
+
   const byLevel = new Map<string, LocationSearchItem[]>();
-  for (const it of items) {
+  for (const it of grouped) {
     const bucket = byLevel.get(it.level) ?? [];
     bucket.push(it);
     byLevel.set(it.level, bucket);
@@ -1839,14 +2349,7 @@ export function formatLocationSearch(
 
   for (const level of levels) {
     lines.push(`${SEARCH_LEVEL_LABEL[level] ?? level}:`);
-    for (const it of byLevel.get(level)!) {
-      const typeSuffix = it.typeName ? ` (${it.typeName})` : "";
-      const parentSuffix = it.parent_name ? `, ${it.parent_name}` : "";
-      lines.push(`  ${it.code} - ${it.name}${typeSuffix}${parentSuffix}`);
-      for (const call of searchCallsForItem(it)) {
-        lines.push(`      ${call}`);
-      }
-    }
+    for (const it of byLevel.get(level)!) pushItem(it, false);
     lines.push("");
   }
 
@@ -1854,14 +2357,34 @@ export function formatLocationSearch(
     lines.push("RCN district names without a TERYT code:");
     for (const name of rcnOnly) {
       lines.push(`  - ${name}`);
-      lines.push(`      search_transactions(location="${name}")`);
+      const cov = knownCoverage(coverage, name);
+      for (const line of coverageLines(name, cov)) {
+        lines.push(`      ${line}`);
+      }
+      if (cov?.transactions !== 0) lines.push(`      search_transactions(location="${name}")`);
+    }
+    if (rcnHidden > 0) {
+      lines.push(`  ${rcnHidden} more RCN district name${rcnHidden === 1 ? "" : "s"} not shown — type more letters to narrow`);
     }
     lines.push("");
   }
 
-  // Bare array response, no pagination envelope — signal the cap in prose (§ route contract).
+  // Bare array response, no pagination envelope — signal the cap in prose.
   if (items.length === 50) {
     lines.push("Showing the first 50 matches — type more letters to narrow the search.");
+  }
+
+  // Only precincts (cadastral units) came back and no RCN district bears the exact name: the query
+  // was likely an osiedle, which no unit here carries.
+  const queryNorm = stripDiacritics(query.trim().toLowerCase());
+  const onlyPrecincts =
+    items.length > 0 &&
+    items.every((it) => it.level === "precinct") &&
+    !rcnOnly.some((name) => stripDiacritics(name.toLowerCase()) === queryNorm) &&
+    !items.some((it) => it.rcn_district && stripDiacritics(it.name.toLowerCase()) === queryNorm);
+  if (onlyPrecincts) {
+    if (lines[lines.length - 1] !== "") lines.push("");
+    lines.push(formatNeighbourhoodNote(query));
   }
 
   return lines.join("\n").trimEnd();
@@ -2112,6 +2635,8 @@ export function formatRentalYield(r: RentalYieldResponse): string {
   const q = r.quality;
   const lines: string[] = [`Gross rental yield — ${r.location.name}${areaBucketSuffix(r.segment.area_bucket)}`, ""];
 
+  // The API note naming the area carries a REST path and is dropped below, so state the area here.
+  if (q.coverage === "no_rental_data") lines.push(`No asking-rent data for ${r.location.name}`);
   lines.push(
     r.result.gross_yield_pct != null
       ? `Gross yield: ${r.result.gross_yield_pct}% per year`
@@ -2193,6 +2718,8 @@ export function formatPriceSpread(r: PriceSpreadResponse): string {
   const spread = r.result.spread_pct;
   const lines: string[] = [`Asking-vs-transaction price spread — ${r.location.name}${areaBucketSuffix(r.segment.area_bucket)}`, ""];
 
+  // The API note naming the area carries a REST path and is dropped below, so state the area here.
+  if (q.coverage === "no_asking_data") lines.push(`No asking-offer data for ${r.location.name}`);
   lines.push(
     spread != null
       ? `Spread: ${spread > 0 ? "+" : ""}${spread}% (asking ${spread >= 0 ? "above" : "below"} transaction)`
@@ -2350,7 +2877,7 @@ export function formatValuation(r: ValuationResponse): string {
         : "the requested point";
   const lines: string[] = [`Apartment value estimate — ${formatArea(segment.area_m2)} ${where}`, ""];
 
-  // no_data / not_covered → no estimate. On no_data the 5-credit charge is refunded server-side.
+  // no_data / not_covered → no estimate.
   if (res.estimated_value == null) {
     // lat/lng are always echoed for a point query, so a no_data with BOTH null means the parcelId itself
     // never resolved — say so instead of blaming the neighbourhood for having too few sales.
@@ -2388,12 +2915,91 @@ export function formatValuation(r: ValuationResponse): string {
   return lines.join("\n");
 }
 
+// ── Land valuation formatting (comparable-sales undeveloped-land estimate) ──
+
+// One land comparable line. Raw mpzp_designations tokens are shown verbatim (the label dictionary
+// lives elsewhere); district appended only when present.
+function landCompLine(c: LandValuationComparable): string {
+  const parts = [`${formatNumber(c.distance_m)} m`, c.transaction_date, formatArea(c.area_m2), `${formatPLN(c.price_per_m2)}/m²`];
+  if (Array.isArray(c.mpzp_designations) && c.mpzp_designations.length > 0) parts.push(c.mpzp_designations.join(", "));
+  if (c.district) parts.push(c.district);
+  return `  - ${parts.join(" · ")}`;
+}
+
+// Render a comparable-sales land valuation. Agricultural land leads with zł/ha (how farmland is
+// priced), a building plot with zł/m². The disclaimer (q.note) is authored server-side, carried verbatim.
+export function formatLandValuation(r: LandValuationResponse): string {
+  const { result: res, inputs, quality: q, segment } = r ?? ({} as LandValuationResponse);
+  const loc = r?.location;
+  // Shape guard (defensive): a truncated or proxied body would otherwise throw a raw TypeError.
+  if (!res || !inputs || !q || !segment || !loc) {
+    return "Unexpected response from the Cenogram API — the land valuation could not be rendered. Try again shortly.";
+  }
+  const agricultural = segment.land_type === "agricultural";
+  const where =
+    loc.lat != null && loc.lng != null
+      ? `near ${loc.lat}, ${loc.lng}`
+      : loc.county_code
+        ? `county ${loc.county_code}`
+        : "the requested point";
+  const kind = agricultural ? "Agricultural land" : "Building plot";
+  const areaLabel = segment.area_m2 != null ? `${formatArea(segment.area_m2)} ` : "";
+  const lines: string[] = [`${kind} value estimate — ${areaLabel}${where}`, ""];
+
+  // locked → no estimate.
+  if (r.locked) {
+    lines.push("No estimate: this valuation needs a signed-in account (14-day free trial) or an API key. You were not charged.");
+    if (q.note) lines.push("", q.note);
+    return lines.join("\n");
+  }
+
+  // no_data → no estimate.
+  if (res.estimated_value == null) {
+    // lat/lng are echoed for a point query, so a no_data with BOTH null means the parcelId itself
+    // never resolved — say so instead of blaming the neighbourhood for having too few sales.
+    const parcelUnresolved = loc.lat == null && loc.lng == null;
+    lines.push(
+      parcelUnresolved
+        ? "No estimate: that parcel could not be resolved (unknown id, or no geometry on record). The credit is refunded — check the id, or address the land by lat/lng with an area."
+        : "No estimate: too few comparable transactions near this point, or the area could not be determined (credit refunded).",
+    );
+    if (q.note) lines.push("", q.note);
+    return lines.join("\n");
+  }
+
+  // Lead with the unit that fits the segment; show the other in parentheses.
+  const perHa = res.price_per_ha != null ? `${formatPLN(res.price_per_ha)}/ha` : null;
+  const perM2 = res.price_per_m2 != null ? `${formatPLN(res.price_per_m2)}/m²` : null;
+  const headlineUnit = agricultural ? perHa : perM2;
+  const secondUnit = agricultural ? perM2 : perHa;
+  const unitSuffix = headlineUnit ? ` (${headlineUnit}${secondUnit ? `, ${secondUnit}` : ""})` : "";
+  lines.push(`Estimated value: ${formatPLN(res.estimated_value)}${unitSuffix}`);
+  const likely = res.value_range_likely;
+  const wide = res.value_range_wide;
+  if (likely?.low != null && likely.high != null) lines.push(`Likely range: ${formatPLN(likely.low)} – ${formatPLN(likely.high)}`);
+  if (wide?.low != null && wide.high != null) lines.push(`Wide range: ${formatPLN(wide.low)} – ${formatPLN(wide.high)}`);
+  if (res.confidence_band) lines.push(`Confidence: ${res.confidence_band}${res.confidence != null ? ` (${res.confidence})` : ""}`);
+
+  lines.push("");
+  const radius = inputs.radius_m != null ? ` within ${formatNumber(inputs.radius_m)} m` : "";
+  lines.push(`Based on ${formatNumber(inputs.comps_total)} comparable transaction${inputs.comps_total === 1 ? "" : "s"}${radius}, last ${inputs.window_months} months.`);
+  if (q.as_of) lines.push(`Transaction data as of: ${q.as_of} (varies by county — publication lag)`);
+
+  if (Array.isArray(inputs.comparables) && inputs.comparables.length > 0) {
+    const shown = inputs.comparables.slice(0, 5);
+    lines.push("", `Comparables (nearest ${shown.length}):`);
+    for (const c of shown) lines.push(landCompLine(c));
+  }
+
+  if (q.note) lines.push("", q.note);
+  return lines.join("\n");
+}
+
 // ── Parcel report (composite dossier) ──────────────────────────────
 
 // Four-state gloss for a per-parcel section, kept EXPLICIT (the literal state token stays visible so the
-// model never has to guess): covered = a definitive positive, covered_no_data = checked and nothing found
-// (still billed), not_covered = outside our data (refunded), not_computed = could not finish (refunded,
-// retry). Any unexpected token renders verbatim.
+// model never has to guess): covered = a definitive positive, covered_no_data = checked and nothing found,
+// not_covered = outside our data, not_computed = could not finish (retry). Any unexpected token renders verbatim.
 function fourStateGloss(coverage: string): string {
   switch (coverage) {
     case "covered": return "covered";
@@ -2459,7 +3065,7 @@ function reportSectionDetail(name: string, s: ReportSection): string {
       return risk ? LANDSLIDE_RISK_NOTE[risk] ?? risk : "";
     }
     case "subsurface": {
-      // Neutral, source-register-free rendering (the register is never named). Two dimensions: a mining
+      // Neutral rendering. Two dimensions: a mining
       // terrain (status + the deformation-risk mineral class) and a major groundwater reservoir (documented
       // /undocumented). A reservoir's extent alone is not a restriction; absence is never rendered as "safe".
       if (!covered) return "";
@@ -2566,11 +3172,185 @@ function reportSectionDetail(name: string, s: ReportSection): string {
   }
 }
 
+// Indented detail lines under a covered section's header. Every field is
+// narrowed explicitly: garbage yields no line, never a throw. Only `covered`; unknown sections give [].
+function reportSectionDetailLines(name: string, s: ReportSection): string[] {
+  if (s.coverage !== "covered") return [];
+  const ind = (t: string): string => `    - ${t}`;
+  const str = (v: unknown): string | null => (typeof v === "string" && v ? v : null);
+  const roundPct = (v: unknown): number | null => {
+    const n = finiteMeasure(v); // stricter than toNum: ""/[]/false → null (no line), not 0
+    return n == null ? null : Math.round(n);
+  };
+  // Keep only object array items, so a stray null/number inside a list produces no line (never throws).
+  const objs = (v: unknown): Array<Record<string, unknown>> =>
+    Array.isArray(v) ? v.filter((x): x is Record<string, unknown> => !!x && typeof x === "object") : [];
+
+  switch (name) {
+    case "heritage": {
+      const lines: string[] = [];
+      const siteCells = (site: Record<string, unknown>): string[] => {
+        const cells: string[] = [];
+        const category = str(site.category);
+        if (category) cells.push(`category: ${category}`);
+        const nm = str(site.name);
+        if (nm) cells.push(nm);
+        const period = str(site.period);
+        if (period) cells.push(`period: ${period}`);
+        return cells;
+      };
+      // An item with no category/name/period carries nothing to print, so it is not an entry at all.
+      const sites = objs(s.sites).filter((site) => siteCells(site).length > 0);
+      const siteCount = finiteMeasure(s.site_count);
+      const CAP = 5;
+      if (sites.length > 0) {
+        for (const site of sites.slice(0, CAP)) {
+          const category = str(site.category);
+          // Area categories place the parcel INSIDE a protected area; object categories mark a listed
+          // object on/at it (the source classifies urban layout, surroundings and cultural landscape as areal).
+          const areal = category != null && ["urban_layout", "surroundings", "landscape"].includes(category);
+          const relation = areal ? "parcel lies within this protected area" : "listed object on/at the parcel";
+          lines.push(ind([relation, ...siteCells(site)].join(" | ")));
+        }
+        // Garbage or short site_count must never make the overflow negative and drop the line.
+        const total = Math.max(siteCount ?? 0, sites.length);
+        const more = total - Math.min(sites.length, CAP);
+        if (more > 0) lines.push(ind(`… and ${more} more entries`));
+      } else if (siteCount != null && siteCount > 0) {
+        lines.push(ind("entries not itemised for this parcel"));
+      }
+      const pz = roundPct(s.pct_in_zone);
+      if (pz != null) lines.push(ind(`${pz}% of the parcel inside protected areas`));
+      if (lines.length > 0) lines.push(ind(HERITAGE_DISCLAIMER));
+      return lines;
+    }
+    case "flood": {
+      const worst = str(s.worst_scenario);
+      if (!worst) return [];
+      const lines: string[] = [];
+      const source = str(s.source);
+      lines.push(ind(`worst scenario: ${worst}${source ? ` (source: ${source})` : ""}`));
+      // Remaining scenario labels, verbatim from the API; the worst one is already on the line above.
+      const others = objs(s.scenarios)
+        .map((sc) => str(sc.scenario))
+        .filter((x): x is string => x != null && x !== worst);
+      if (others.length > 0) lines.push(ind(`other scenarios: ${others.join("; ")}`));
+      return lines;
+    }
+    case "permits": {
+      const rows = objs(s.data);
+      if (rows.length === 0) return [];
+      const CAP = 5;
+      const lines: string[] = [];
+      for (const r of rows.slice(0, CAP)) {
+        const cells = permitCells(r);
+        if (cells.length > 0) lines.push(ind(cells.join(" | ")));
+      }
+      const extra = Math.max(0, rows.length - CAP);
+      if (extra > 0 || s.truncated === true) {
+        const parts: string[] = [];
+        if (extra > 0) parts.push(`… and ${extra} more (newest first)`);
+        if (s.truncated === true) parts.push("the source capped the list at 500");
+        lines.push(ind(parts.join("; ")));
+      }
+      return lines;
+    }
+    case "surroundings": {
+      const cells = surroundingsCells(s as unknown as Record<string, unknown>);
+      return cells.length > 0 ? [ind(cells.join(" | "))] : [];
+    }
+    case "nature": {
+      const lines: string[] = [];
+      const CAP = 5;
+      const areas = objs(s.protected_areas);
+      for (const a of areas.slice(0, CAP)) {
+        const label = [str(a.form), str(a.name)].filter(Boolean).join(": ");
+        const ov = roundPct(a.overlap_pct);
+        if (!label && ov == null) continue;
+        lines.push(ind(`${label || "protected area"}${ov != null ? ` (${ov}% of the parcel)` : ""}`));
+      }
+      const extra = Math.max(0, areas.length - CAP);
+      const forest = roundPct(s.forest_overlap_pct);
+      const parts: string[] = [];
+      if (extra > 0) parts.push(`… and ${extra} more areas`);
+      if (forest != null && forest > 0) parts.push(`forest covers ${forest}% of the parcel`);
+      if (parts.length > 0) lines.push(ind(parts.join("; ")));
+      if (s.building_restriction === "statutory_ban") {
+        const ban = BUILDING_RESTRICTION_NOTE.statutory_ban;
+        if (ban) lines.push(ind(ban));
+      }
+      return lines;
+    }
+    case "landslide": {
+      const lines: string[] = [];
+      const pz = roundPct(s.pct_in_zone);
+      const kinds = [...new Set(objs(s.zones).map((z) => str(z.kind)).filter((x): x is string => x != null))];
+      const parts: string[] = [];
+      if (pz != null) parts.push(`${pz}% of the parcel in mapped zones`);
+      if (kinds.length > 0) parts.push(`zones: ${kinds.join(", ")}`);
+      if (parts.length === 0) return []; // the note prints only together with a data line
+      lines.push(ind(parts.join("; ")));
+      lines.push(ind(LANDSLIDE_OVERLAP_NOTE));
+      return lines;
+    }
+    case "subsurface": {
+      const lines: string[] = [];
+      const CAP = 3;
+      // Build each item's text first: an item with no printable field is dropped (no empty line, no note).
+      const reservoirTexts = objs(s.groundwater_bodies).flatMap((b) => {
+        const cells: string[] = [];
+        const num = finiteMeasure(b.number);
+        if (num != null) cells.push(`no. ${num}`);
+        const nm = str(b.name);
+        if (nm) cells.push(nm);
+        const docStatus = str(b.documentation_status);
+        if (docStatus) cells.push(docStatus);
+        const ov = roundPct(b.overlap_pct);
+        if (ov != null) cells.push(`${ov}% of the parcel`);
+        return cells.length > 0 ? [`reservoir: ${cells.join(", ")}`] : [];
+      });
+      const terrainTexts = objs(s.mining_terrains).flatMap((t) => {
+        const cells: string[] = [];
+        const nm = str(t.name);
+        if (nm) cells.push(nm);
+        const status = str(t.status);
+        if (status) cells.push(status);
+        const cls = str(t.mineral_class);
+        if (cls) cells.push(cls);
+        const auth = str(t.oversight_authority);
+        if (auth) cells.push(`oversight: ${auth}`);
+        return cells.length > 0 ? [`mining terrain: ${cells.join(", ")}`] : [];
+      });
+      const pushList = (texts: string[], capped: unknown): void => {
+        for (const x of texts.slice(0, CAP)) lines.push(ind(x));
+        const extra = Math.max(0, texts.length - CAP);
+        if (extra > 0 || capped === true) {
+          const parts: string[] = [];
+          if (extra > 0) parts.push(`… and ${extra} more`);
+          if (capped === true) parts.push("list capped at source");
+          lines.push(ind(parts.join("; ")));
+        }
+      };
+      pushList(reservoirTexts, s.groundwater_bodies_capped);
+      pushList(terrainTexts, s.mining_terrains_capped);
+      // Two carrying sentences from the full subsurface note: extent is not a restriction; a terrain is
+      // an advisory signal. Mining note also fires on a bare mining_status with no itemised terrain.
+      if (reservoirTexts.length > 0) lines.push(ind("Note: a groundwater reservoir's extent alone is not a restriction."));
+      if (terrainTexts.length > 0 || str(s.mining_status) != null) {
+        lines.push(ind("Note: a mining terrain is an advisory signal — verify with the oversight authority."));
+      }
+      return lines;
+    }
+    default:
+      return [];
+  }
+}
+
 // One compact transaction line for the report's history section (newest-first, capped upstream at 20).
 function reportTxLine(r: Record<string, unknown>): string {
   const date = typeof r.transaction_date === "string" ? r.transaction_date.split("T")[0] : "?";
   const type = PROPERTY_TYPES[Number(r.property_type)] || `Type ${r.property_type}`;
-  const market = MARKET_TYPES[Number(r.market_type)] || `Market ${r.market_type}`;
+  const market = marketLabel(r.market_type == null ? null : Number(r.market_type));
   const price = formatPLN(toNum(r.price_gross));
   const area = toNum(r.usable_area_m2);
   const ppm2 = toNum(r.price_per_m2);
@@ -2578,14 +3358,26 @@ function reportTxLine(r: Record<string, unknown>): string {
   return `  - ${date} — ${type}, ${market} — ${price}${tail ? ` (${tail})` : ""}`;
 }
 
-// One market-context price level as a readable line. coverage is the statistical canon: suppressed hides
-// the median (too few sales), no_data means no sample.
-function reportMarketLine(label: string, lvl: ReportMarketLevel): string {
-  if (lvl.coverage === "no_data") return `  - ${label}: no data`;
-  if (lvl.median_price_per_m2 == null) return `  - ${label}: withheld (only ${lvl.n} sale(s) — too few to publish)`;
+// One market-context price value (no label): suppressed hides the median (too few sales), no_data
+// means no sample.
+function reportMarketValue(lvl: ReportMarketLevel): string {
+  if (lvl.coverage === "no_data") return "no data";
+  if (lvl.median_price_per_m2 == null) return `withheld (only ${lvl.n} sale(s) — too few to publish)`;
   const flag = lvl.coverage === "low_sample" ? " [small sample]" : "";
-  return `  - ${label}: ${formatPLN(lvl.median_price_per_m2)}/m2 (n=${lvl.n})${flag}`;
+  return `${formatPLN(lvl.median_price_per_m2)}/m2 (n=${lvl.n})${flag}`;
 }
+
+function reportMarketLine(label: string, lvl: ReportMarketLevel): string {
+  return `  - ${label}: ${reportMarketValue(lvl)}`;
+}
+
+// Per-type order and labels of the price context; keys match the service's by_property_type.
+const REPORT_MARKET_TYPES: Array<[keyof ReportMarketByType, string]> = [
+  ["land", "Land (undeveloped)"],
+  ["developed_land", "Developed land"],
+  ["building", "Building"],
+  ["unit", "Unit/apartment"],
+];
 
 // Human-readable billing outcome for the report's footer: the net numbers plus WHY (billing.rule).
 function reportBillingFooter(billing: { charged: number; refunded: number; rule: string }): string {
@@ -2616,10 +3408,165 @@ export const REPORT_LAYER_ORDER: Array<[string, string]> = [
   ["buildings", "Buildings"],
   ["permits", "Building activity"],
   ["farmland", "Agricultural land"],
-  ["land_class", "Land use & soil class"],
+  ["land_class", "Land use & soil class (cadastral, not a planning designation)"],
   ["nature", "Nature (forest & protected areas)"],
   ["roads", "Road access"],
 ];
+
+// Own-key lookup so a token like "toString" cannot resolve to an inherited property.
+function landUseLabel(raw: string): string {
+  return Object.prototype.hasOwnProperty.call(LAND_USES, raw) ? LAND_USES[raw]! : raw;
+}
+
+// Nearby designation signal. Every state that reaches the caller carries the disclaimer; the source line
+// appears whenever transactions were counted. "No signal" is stated, never rendered as "no restrictions".
+const NO_PLAN_TOKEN = "brakMPZPLubWZ";
+const DESIGNATION_SOURCE_LINE =
+  "Designations as recorded in RCN deed data for neighbouring parcels, not from the planning register; source deed not tracked and transaction dates do not date the designation.";
+const DESIGNATION_DISCLAIMER =
+  "A signal from the neighbourhood, not this parcel's planning status — confirm with an extract from the local plan (MPZP) or a zoning decision. Never a statement that the parcel can or cannot be built on.";
+
+function reportDesignationLines(d: ReportDesignationContext): string[] {
+  const radius = d.radius_m === 1000 ? "1 km" : d.radius_m != null ? `${d.radius_m} m` : null;
+  const period = d.date_from && d.date_to ? `${d.date_from.slice(0, 7)} – ${d.date_to.slice(0, 7)}` : null;
+  const scope = [radius ? `land transactions within ${radius}` : null, period].filter(Boolean).join(", ");
+  const lines: string[] = [`Nearby designation signal${scope ? ` (${scope})` : ""}:`];
+
+  const n = d.n_transactions;
+  const dom = d.dominant;
+  const own = (k: string) => formatDesignationTokens(k) || k;
+  if (d.reason === "no_transactions") {
+    lines.push(`  no land transactions within 1 km in the last ${d.window_years} years, so no signal (this is not evidence of no restrictions)`);
+  } else if (d.reason === "unavailable") {
+    lines.push("  designation context could not be computed right now");
+  } else if (d.reason === "no_location") {
+    lines.push("  no parcel location, so no designation context");
+  } else if (d.reason === "truncated") {
+    lines.push("  too many transactions nearby to summarise reliably; partial distribution only");
+  } else if (d.reason === "low_sample") {
+    lines.push(`  too few land transactions with a recorded designation nearby (n=${d.n_informative}), so no signal`);
+  } else if (dom) {
+    const conf = d.confidence ? ` (confidence: ${d.confidence})` : "";
+    lines.push(`  ${own(dom.designation)} in ${dom.n} of ${d.n_informative} transactions with a land-function designation${conf}`);
+  } else {
+    // A reason this client does not know, with no dominant value: say there is no signal rather than guess.
+    lines.push("  no designation signal for this location");
+  }
+
+  if (n > 0) {
+    const rest = d.distribution.filter((x) => x.designation !== dom?.designation && x.designation !== NO_PLAN_TOKEN);
+    const parts: string[] = [];
+    if (rest.length > 0) {
+      const prefix = dom ? "Also" : "Recorded";
+      parts.push(`${prefix}: ${rest.map((x) => `${own(x.designation)} (${x.n})`).join(", ")}${d.distribution_truncated ? ", …" : ""}`);
+    }
+    if (d.n_no_plan_recorded > 0) parts.push(`no local plan or WZ recorded: ${d.n_no_plan_recorded}`);
+    parts.push(`${n} transaction${n === 1 ? "" : "s"} in radius`);
+    lines.push(`  ${parts.join(" · ")}`);
+    lines.push(`  ${DESIGNATION_SOURCE_LINE}`);
+  }
+  lines.push(`  ${DESIGNATION_DISCLAIMER}`);
+  return lines;
+}
+
+// Parcel outline geometry. Read defensively: an older or odd payload (nulls, wrong types) must cost its own
+// line, never the report. Nothing here says whether anything may be built or divided.
+export const ORIENTATION_MIN_ELONGATION = 1.3;
+const SHAPE_CLASS_LABELS: Record<string, string> = {
+  rectangular: "close to a rectangle",
+  near_rectangular: "roughly rectangular",
+  elongated: "elongated",
+  irregular: "irregular outline",
+};
+const SHAPE_NO_DATA_LINES: Record<string, string> = {
+  empty_geometry: "the cadastral outline is empty or degenerate, so no shape figures",
+  no_geometry: "no outline is held for this parcel, so no shape figures",
+  unavailable: "shape could not be computed right now",
+};
+const SHAPE_INSET_CAVEAT =
+  "The 4 m and 3 m figures use the general distance only (4 m from a wall with windows or doors, 3 m from one without); local-plan building lines, road setbacks, neighbouring buildings and the special rules for building closer to a boundary are not applied, so an empty result is not a verdict on any building.";
+const SHAPE_DISCLAIMER =
+  "A geometric illustration of the cadastral outline, not a building-permit determination and not a statement about dividing the parcel; the local plan or a zoning decision, road access and setbacks decide.";
+
+const finite = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v);
+const metres = (v: number) => v.toFixed(1);
+const squareMetres = (v: number) => new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 }).format(v);
+
+// Long axis relative to grid north, folded to a line (0-179). Octant buckets of 45°, wrapping at 157.5°.
+export function orientationLabel(azimuthDeg: number): string {
+  const a = ((azimuthDeg % 180) + 180) % 180;
+  if (a < 22.5 || a >= 157.5) return "N-S";
+  if (a < 67.5) return "NE-SW";
+  if (a < 112.5) return "E-W";
+  return "NW-SE";
+}
+
+function reportShapeLines(sh: ReportShape): string[] {
+  const lines: string[] = ["Parcel shape (geometry of the cadastral outline only):"];
+  const s: Record<string, unknown> = typeof sh === "object" && sh !== null ? (sh as unknown as Record<string, unknown>) : {};
+
+  if (s.coverage !== "full") {
+    const text = typeof s.reason === "string" && Object.hasOwn(SHAPE_NO_DATA_LINES, s.reason) ? SHAPE_NO_DATA_LINES[s.reason] : undefined;
+    lines.push(`  ${text ?? "no shape figures for this parcel"}`);
+    return lines;
+  }
+
+  const cls = typeof s.shape_class === "string" && Object.hasOwn(SHAPE_CLASS_LABELS, s.shape_class) ? SHAPE_CLASS_LABELS[s.shape_class] : undefined;
+  if (cls) {
+    const extra: string[] = [];
+    if (finite(s.elongation)) extra.push(`length/width ${s.elongation.toFixed(2)}`);
+    if (finite(s.rectangularity)) extra.push(`fills ${(s.rectangularity * 100).toFixed(1)}% of its bounding rectangle`);
+    lines.push(`  Shape: ${cls}${extra.length > 0 ? ` (${extra.join(", ")})` : ""}`);
+  }
+
+  const size: string[] = [];
+  if (finite(s.area_m2_geom)) size.push(`outline area ~${squareMetres(s.area_m2_geom)} m² (measured from the outline, may differ from the recorded area)`);
+  if (finite(s.perimeter_m)) size.push(`perimeter ${metres(s.perimeter_m)} m`);
+  if (finite(s.compactness_polsby_popper)) size.push(`compactness ${s.compactness_polsby_popper.toFixed(2)} (1 = circle)`);
+  if (size.length > 0) lines.push(`  Size: ${size.join(", ")}`);
+
+  const circle = finite(s.max_inscribed_circle_diameter_m)
+    ? `widest circle that fits: ${metres(s.max_inscribed_circle_diameter_m)} m`
+    : "widest circle: not computed this time";
+  if (finite(s.mbr_width_m) && finite(s.mbr_length_m)) {
+    lines.push(`  Bounding rectangle ${metres(s.mbr_width_m)} × ${metres(s.mbr_length_m)} m (minimum-area rectangle, not the narrowest point); ${circle}`);
+  } else {
+    lines.push(`  ${circle.charAt(0).toUpperCase()}${circle.slice(1)}`);
+  }
+
+  if (finite(s.elongation) && s.elongation >= ORIENTATION_MIN_ELONGATION && finite(s.long_axis_azimuth_deg)) {
+    lines.push(`  Orientation: the long side runs roughly ${orientationLabel(s.long_axis_azimuth_deg)} (relative to grid north)`);
+  }
+  if (finite(s.part_count) && s.part_count > 1) lines.push(`  ${s.part_count} parts after geometry repair`);
+
+  const sides = s.outline_sides_m;
+  if (Array.isArray(sides) && sides.length >= 3 && sides.every(finite)) {
+    lines.push(`  Sides (m, clockwise from the northernmost corner): ${(sides as number[]).map(metres).join(", ")}`);
+  }
+
+  let insets = 0;
+  if (Array.isArray(s.boundary_inset)) {
+    for (const raw of s.boundary_inset as unknown[]) {
+      const i = typeof raw === "object" && raw !== null ? (raw as Record<string, unknown>) : {};
+      if (!finite(i.distance_m) || !finite(i.area_m2)) continue;
+      insets++;
+      if (i.area_m2 <= 0) {
+        lines.push(`  No area is ${i.distance_m} m or more from every boundary`);
+        continue;
+      }
+      const detail: string[] = [];
+      if (finite(i.part_count) && i.part_count > 1) detail.push(`${i.part_count} parts`);
+      if (finite(i.largest_part_mbr_width_m) && finite(i.largest_part_mbr_length_m)) {
+        detail.push(`largest part ${metres(i.largest_part_mbr_width_m)} × ${metres(i.largest_part_mbr_length_m)} m`);
+      }
+      if (finite(i.mic_diameter_m)) detail.push(`widest circle ${metres(i.mic_diameter_m)} m`);
+      lines.push(`  Area at least ${i.distance_m} m from every boundary: ~${squareMetres(i.area_m2)} m²${detail.length > 0 ? ` (${detail.join(", ")})` : ""}`);
+    }
+  }
+  if (insets > 0) lines.push(`  ${SHAPE_INSET_CAVEAT}`);
+  lines.push(`  ${SHAPE_DISCLAIMER}`);
+  return lines;
+}
 
 export function formatParcelReport(res: ParcelReportResponse): string {
   const p = res.parcel;
@@ -2644,10 +3591,11 @@ export function formatParcelReport(res: ParcelReportResponse): string {
   // Core identity + facts.
   const place = [p.district, p.county_name, p.voivodeship_name].filter(Boolean).join(", ");
   if (place) lines.push(place);
+  const planDesignation = p.mpzp_designation ? formatDesignationTokens(p.mpzp_designation) : "";
   const facts = [
     p.area_m2 != null ? `Area: ${formatArea(p.area_m2)}` : null,
-    p.land_use ? `Land use: ${p.land_use}` : null,
-    p.mpzp_designation ? `Plan designation: ${p.mpzp_designation}` : null,
+    p.land_use ? `Land use: ${landUseLabel(p.land_use)} (RCN land-use group, not a planning designation)` : null,
+    planDesignation ? `Plan designation [${PLAN_DESIGNATION_SOURCE_NOTE}; source deed and date not tracked]: ${planDesignation}` : null,
   ].filter(Boolean);
   if (facts.length > 0) lines.push(facts.join(" | "));
   const asOf = res.as_of ? ` (as of ${res.as_of.split("T")[0]})` : "";
@@ -2666,6 +3614,7 @@ export function formatParcelReport(res: ParcelReportResponse): string {
     if (s == null) continue;
     const detail = reportSectionDetail(key, s);
     lines.push(`- ${label}: ${fourStateGloss(s.coverage)}${detail ? ` — ${detail}` : ""}`);
+    for (const dl of reportSectionDetailLines(key, s)) lines.push(dl);
   }
 
   // Transaction history.
@@ -2681,13 +3630,41 @@ export function formatParcelReport(res: ParcelReportResponse): string {
 
   // Local price context (market_context — statistical canon).
   const m: ReportMarketContext = sections.market_context;
-  lines.push("", "Local price context (median zł/m², last 12 months):");
+  const perType = m.county.by_property_type != null || m.locality.by_property_type != null;
+  if (!perType) {
+    // Older service without the per-type split: the level medians mix every property type.
+    lines.push("", "Local price context (median zł/m², last 12 months, all property types mixed):");
+  } else {
+    const range = m.period ? `, ${m.period.from} – ${m.period.to}` : "";
+    lines.push("", `Local price context (median zł/m² per property type, last 12 months${range}):`);
+    lines.push("  market basis: shares and non-market deeds excluded");
+  }
   if (m.coverage === "no_data") {
     lines.push("  - no data for this location");
-  } else {
+  } else if (!perType) {
     lines.push(reportMarketLine("County", m.county));
     lines.push(reportMarketLine(m.locality.district ? `Locality (${m.locality.district})` : "Locality", m.locality));
+  } else {
+    const noData: ReportMarketTypeLevel = { coverage: "no_data", median_price_per_m2: null, n: 0 };
+    const gmina = m.locality.district ? `gmina ${m.locality.district}` : "gmina";
+    let printed = 0;
+    for (const [key, label] of REPORT_MARKET_TYPES) {
+      const c = m.county.by_property_type?.[key] ?? noData;
+      const g = m.locality.by_property_type?.[key] ?? noData;
+      if (c.coverage === "no_data" && g.coverage === "no_data") continue;
+      lines.push(`  - ${label}: county ${reportMarketValue(c)} · ${gmina} ${reportMarketValue(g)}`);
+      printed++;
+    }
+    if (printed === 0) lines.push("  - no per-type data");
   }
+
+  // Nearby designation signal. Optional on the wire: an older server omits the key, and the block is skipped.
+  const dc = sections.designation_context;
+  if (dc != null) lines.push("", ...reportDesignationLines(dc));
+
+  // Parcel shape. Optional on the wire: an older server omits the key, and the block is skipped.
+  const shape = sections.shape;
+  if (shape != null) lines.push("", ...reportShapeLines(shape));
 
   // Municipal context (location_context — demographics + infrastructure signals).
   const loc: ReportLocationContext = sections.location_context;
@@ -2726,8 +3703,7 @@ export function formatParcelReport(res: ParcelReportResponse): string {
  * entry" is the whole answer for a caller deciding whether to look elsewhere.
  */
 export function formatParcelLandClass(res: ParcelLandClassResponse): string {
-  // Fall back to the internal id before the paid-plan wording: a parcel addressed by an internal id only
-  // HAS no cadastral id, so telling a paying caller to upgrade would be plain wrong.
+  // Prefer a visible id; fall back to the internal one.
   const id = res.parcel.parcel_id ?? res.parcel.parcel_key ?? res.parcel.id ?? "(identifier withheld)";
   const asOfDay = typeof res.as_of === "string" ? res.as_of.split("T")[0] : null;
 
